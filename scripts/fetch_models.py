@@ -38,6 +38,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASE_URL = "https://github.com/deepinsight/insightface/releases/download/model-zoo"
+YUNET_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/main/models/"
+    "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -157,6 +161,18 @@ def fetch_pack(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
     return True
 
 
+def fetch_yunet(models_dir: Path, force: bool) -> bool:
+    """Download the OpenCV Zoo YuNet face detector (Apache-2.0, ~230 KB)."""
+    target = models_dir / "opencv" / "face_detection_yunet_2023mar.onnx"
+    if target.is_file() and not force:
+        print(f"[fetch_models] yunet: already present at {target}")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    download(YUNET_URL, target)
+    print(f"[fetch_models] yunet: ready at {target} ({target.stat().st_size / 1024:.0f} KB)")
+    return True
+
+
 def fetch_uniface(names: list[str], force: bool) -> bool:
     try:
         from uniface.model_store import download_models
@@ -257,13 +273,29 @@ def main() -> None:
     parser.add_argument("--base-url", default=BASE_URL, help="Model zoo release URL.")
     parser.add_argument("--force", action="store_true", help="Re-download even if present.")
     parser.add_argument("--list", action="store_true", help="List known packs and exit.")
+    parser.add_argument(
+        "--all", action="store_true", dest="all_models",
+        help="Fetch every known pack, YuNet, and every UniFace weight (if uniface is installed).",
+    )
+    parser.add_argument(
+        "--yunet", action="store_true",
+        help="Fetch the OpenCV Zoo YuNet detector (Apache-2.0, ~230 KB).",
+    )
     args = parser.parse_args()
 
     if args.list:
         for name, spec in sorted(KNOWN_PACKS.items()):
             print(f"  {name:12s} needs: {', '.join(spec['required'])}")
+        print("  yunet        needs: face_detection_yunet_2023mar.onnx (--yunet)")
         print("  uniface weights:", ", ".join(sorted(UNIFACE_WEIGHTS)))
         return
+
+    if args.all_models:
+        packs = sorted(KNOWN_PACKS)
+        uniface_names = ["all"]
+    else:
+        packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
+        uniface_names = args.uniface
 
     models_dir = (
         Path(args.models_dir).expanduser().resolve()
@@ -274,13 +306,14 @@ def main() -> None:
         Path(args.data_dir).expanduser().resolve() if args.data_dir else default_data_dir()
     )
 
-    packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
     print(f"[fetch_models] models dir: {models_dir}")
     fetched = False
     for name in packs:
         fetched = fetch_pack(name, models_dir, args.force, args.base_url) or fetched
-    if args.uniface:
-        fetched = fetch_uniface(args.uniface, args.force) or fetched
+    if args.yunet or args.all_models:
+        fetched = fetch_yunet(models_dir, args.force) or fetched
+    if uniface_names:
+        fetched = fetch_uniface(uniface_names, args.force) or fetched
 
     write_manifest(models_dir, data_dir)
     print("[fetch_models] done" + ("" if fetched else " (nothing to download)"))

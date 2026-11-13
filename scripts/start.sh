@@ -7,7 +7,11 @@ set -eu
 cd "$(dirname "$0")/.."
 
 MODEL="${FACELAB_DEFAULT_MODEL:-buffalo_l}"
-if [ "${FACELAB_FETCH_MODELS:-1}" = "1" ]; then
+FETCH="${FACELAB_FETCH_MODELS:-1}"
+if [ "$FETCH" = "all" ]; then
+  python scripts/fetch_models.py --all \
+    || echo "[facelab] warning: could not fetch all models; starting anyway"
+elif [ "$FETCH" = "1" ]; then
   python scripts/fetch_models.py --model "$MODEL" \
     || echo "[facelab] warning: could not fetch model '$MODEL'; starting anyway"
 fi

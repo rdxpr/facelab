@@ -64,12 +64,11 @@ KNOWN_DETECTORS: dict[str, dict] = {
         "label": "SCRFD-34G (no kps)",
         "library": "insightface",
         "kind": "detector",
-        "pack": "buffalo_x",
         "file_candidates": ["det_34g.onnx", "scrfd_34g.onnx"],
         "landmarks_5pt": False,
         "wider_hard": 87.0,
         "license": "Non-Commercial",
-        "role": "High-recall ablation; needs a landmark predictor",
+        "role": "High-recall ablation; drop scrfd_34g.onnx in models/ (needs a landmark predictor)",
     },
     "uniface:retinaface_r50": {
         "id": "uniface:retinaface_r50",

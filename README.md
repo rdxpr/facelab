@@ -48,14 +48,21 @@ Requires Python 3.11+ and, optionally, [uv](https://docs.astral.sh/uv/).
 uv sync                       # or: python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 2. Make sure a detector + recognizer exist (skips if already present)
-.venv/bin/python scripts/fetch_models.py                       # buffalo_l
-.venv/bin/python scripts/fetch_models.py --uniface adaface_ir_101   # optional SOTA recognizer
+.venv/bin/python scripts/fetch_models.py                       # buffalo_l (SCRFD-10G + ArcFace R50)
+.venv/bin/python scripts/fetch_models.py --yunet               # + OpenCV YuNet (Apache-2.0, 230 KB)
+.venv/bin/python scripts/fetch_models.py --all                 # every pack + YuNet + UniFace weights
 
 # 3. Run
 ./run.sh                      # http://127.0.0.1:8010
 ```
 
 `./run.sh` prefers the project's `.venv`, then `uv run`, then plain `python3`.
+
+> **Why a single model by default?** The default fetch pulls only `buffalo_l`,
+> and a model is only selectable once its weights are on disk (or, for UniFace,
+> once `uniface` is installed). Run `fetch_models.py --all` to populate the whole
+> benchmark matrix — it is a large download (hundreds of MB). `--list` shows what
+> is available.
 
 ### Optional: UniFace models
 
