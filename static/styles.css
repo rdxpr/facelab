@@ -121,10 +121,19 @@ code {
   background: var(--tan-2);
 }
 
+/* One calm focus ring everywhere; fields below opt into their own highlight. */
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
 .app {
   position: relative;
   z-index: 1;
+  display: flex;
+  flex-direction: column;
   width: min(1720px, 100%);
+  min-height: 100vh;
   margin: 0 auto;
   padding: 0 26px 20px;
 }
@@ -154,34 +163,11 @@ code {
   transform: translateY(2px);
 }
 
-.brand-text {
-  min-width: 0;
-}
-
 .brand h1 {
   font-size: 24px;
   font-weight: 640;
   letter-spacing: -0.045em;
   line-height: 1;
-}
-
-.brand p {
-  color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  margin-top: 4px;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.brand p span[id] {
-  color: var(--ink-2);
-}
-
-.dot-sep {
-  color: var(--faint);
-  padding: 0 3px;
 }
 
 .top-actions {
@@ -293,6 +279,14 @@ code {
   background: var(--ink);
 }
 
+/* A soft halo reads better than a hard box on bare text nav. */
+.tab:focus-visible {
+  outline: none;
+  border-radius: 6px;
+  background: var(--tan-2);
+  box-shadow: 0 0 0 8px var(--tan-2);
+}
+
 /* Banners ---------------------------------------------------------------- */
 .banner {
   padding: 11px 16px;
@@ -327,7 +321,7 @@ code {
 .workspace {
   display: grid;
   gap: 18px;
-  height: calc(100vh - 188px);
+  flex: 1 1 auto;
   min-height: 560px;
 }
 
@@ -360,20 +354,6 @@ code {
   gap: 12px;
   padding: 20px 22px 16px;
   border-bottom: 1px solid var(--line);
-}
-
-.step {
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 24px;
-  height: 24px;
-  margin-top: 1px;
-  border: 1px solid var(--line-2);
-  border-radius: 5px;
-  color: var(--ink-2);
-  font-family: var(--mono);
-  font-size: 11px;
 }
 
 .pane-title {
@@ -473,6 +453,7 @@ code {
 }
 
 .input:focus-visible {
+  outline: none;
   border-color: var(--ink);
   box-shadow: 0 0 0 3px rgba(201, 182, 160, 0.4);
 }
@@ -557,16 +538,6 @@ label.stacked .field-label {
   background: var(--ink);
   border-color: var(--ink);
   color: var(--bg);
-}
-
-/* The signature trailing caret. */
-.btn.primary::after {
-  content: "";
-  width: 1px;
-  height: 0.95em;
-  margin-left: 4px;
-  background: currentColor;
-  opacity: 0.75;
 }
 
 @media (hover: hover) and (pointer: fine) {
@@ -669,6 +640,10 @@ label.stacked .field-label {
   gap: 7px;
 }
 
+.chip-check + .chip-check {
+  margin-top: 7px;
+}
+
 .advanced {
   margin-top: 18px;
   border-top: 1px solid var(--line);
@@ -697,6 +672,15 @@ label.stacked .field-label {
 
 .advanced[open] > summary::after {
   content: " –";
+}
+
+.advanced .toggle-row {
+  margin-top: 16px;
+}
+
+/* The run button sits after the collapsible parameters, so give it air. */
+#bench-run-btn {
+  margin-top: 20px;
 }
 
 /* Mini usage stats ------------------------------------------------------- */
@@ -927,21 +911,11 @@ label.stacked .field-label {
 
 .num {
   flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  width: 26px;
-  height: 26px;
-  border: 1px solid var(--line-2);
-  border-radius: 5px;
+  min-width: 16px;
   font-family: var(--mono);
   font-size: 11px;
-  color: var(--ink-2);
-}
-
-.num.sm {
-  width: 22px;
-  height: 22px;
-  font-size: 10px;
+  color: var(--faint);
+  font-variant-numeric: tabular-nums;
 }
 
 .person-name {
@@ -1050,6 +1024,11 @@ label.stacked .field-label {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.control {
+  display: flex;
+  flex-direction: column;
+}
+
 .control label {
   display: flex;
   align-items: baseline;
@@ -1074,9 +1053,14 @@ label.stacked .field-label {
   appearance: none;
   width: 100%;
   height: 18px;
-  margin: 0;
+  margin: auto 0 0;
   background: transparent;
   cursor: pointer;
+}
+
+/* The thumb carries its own focus ring, so suppress the box on the track. */
+.control input[type="range"]:focus-visible {
+  outline: none;
 }
 
 .control input[type="range"]::-webkit-slider-runnable-track {
@@ -1665,11 +1649,14 @@ label.stacked .field-label {
 
 .model-tag {
   flex: 0 0 auto;
-  padding: 1px 6px;
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 7px;
   border: 1px solid var(--line-2);
   border-radius: 4px;
   font-family: var(--mono);
   font-size: 10px;
+  line-height: 1.2;
   color: var(--ink-2);
 }
 
@@ -1680,7 +1667,7 @@ label.stacked .field-label {
 
 .history-meta {
   margin-top: 3px;
-  color: var(--faint);
+  color: var(--muted);
   font-size: 10.5px;
   font-family: var(--mono);
   overflow: hidden;
@@ -1724,8 +1711,7 @@ label.stacked .field-label {
 }
 
 .present-chip.on .num {
-  border-color: rgba(255, 255, 255, 0.4);
-  color: var(--bg);
+  color: rgba(255, 255, 255, 0.62);
 }
 
 .dataset-list {
@@ -2165,14 +2151,6 @@ table.matrix tr.error-row td {
 .empty.small {
   min-height: 90px;
   padding: 18px;
-}
-
-/* =============================================================== footer == */
-footer {
-  padding: 18px 2px 0;
-  color: var(--faint);
-  font-size: 11px;
-  text-align: right;
 }
 
 /* ================================================================ toast == */

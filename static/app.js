@@ -229,11 +229,7 @@ function renderModelPickers() {
   const { detectors, recognizers } = state.registry;
   fillSelect($("#detector-select"), detectors, state.detector, (entry) => entry.label || entry.id);
   fillSelect($("#recognizer-select"), recognizers, state.recognizer, (entry) => entry.label || entry.id);
-  const detectorEntry = detectors.find((entry) => entry.id === state.detector);
   const recognizerEntry = recognizers.find((entry) => entry.id === state.recognizer);
-  $("#model-detect").textContent = detectorEntry?.label || state.detector;
-  $("#model-recognize").textContent = recognizerEntry?.label || state.recognizer;
-  $("#enroll-recognizer").textContent = recognizerEntry?.label || state.recognizer;
   $("#scan-recognizer").textContent = recognizerEntry?.label || state.recognizer;
 }
 
@@ -357,7 +353,6 @@ async function addPerson(event) {
   state.busy = true;
   const form = new FormData();
   form.append("name", $("#person-name").value.trim());
-  form.append("recognizer", state.recognizer);
   for (const file of state.faceFiles) form.append("images", file, file.name);
   try {
     const data = await api("/api/people", { method: "POST", body: form });
@@ -377,7 +372,6 @@ async function addPerson(event) {
 
 async function uploadPersonPhotos(personId, files) {
   const form = new FormData();
-  form.append("recognizer", state.recognizer);
   for (const file of files) form.append("images", file, file.name);
   try {
     const data = await api(`/api/people/${personId}/photos`, { method: "POST", body: form });

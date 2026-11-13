@@ -11,14 +11,7 @@
       <header class="topbar">
         <div class="brand">
           <span class="brand-mark" aria-hidden="true">//</span>
-          <div class="brand-text">
-            <h1>FaceLab</h1>
-            <p>
-              Detector <span id="model-detect">SCRFD</span>
-              <span class="dot-sep">+</span>
-              recognizer <span id="model-recognize">ArcFace</span>
-            </p>
-          </div>
+          <h1>FaceLab</h1>
         </div>
 
         <nav class="tabs" id="tabs" aria-label="Workspace">
@@ -46,7 +39,6 @@
       <main class="workspace" id="panel-attendance" data-panel="attendance">
         <section class="pane" aria-labelledby="students-title">
           <div class="pane-head">
-            <div class="step">1</div>
             <div class="pane-title">
               <h2 id="students-title">Students</h2>
               <p>One face per reference photo. Add a few angles for stronger matching.</p>
@@ -78,9 +70,6 @@
               </label>
 
               <div id="face-files" class="file-chips"></div>
-              <div class="enroll-note">
-                Enrolls under <b id="enroll-recognizer">ArcFace</b>
-              </div>
               <div id="add-error" class="inline-error" hidden></div>
 
               <button id="add-person-btn" class="btn primary" type="submit">
@@ -90,7 +79,7 @@
 
             <div class="list-head">
               <span>Recognizer coverage</span>
-              <button id="reembed-btn" class="btn ghost small" type="button" title="Compute embeddings for every registered recognizer">Embed all</button>
+              <button id="reembed-btn" class="btn ghost small" type="button" title="Backfill embeddings for recognizers added after enrollment">Re-embed all</button>
             </div>
             <div id="model-usage-list" class="model-usage-list"></div>
 
@@ -104,7 +93,6 @@
 
         <section class="pane" id="scan-pane" aria-labelledby="scan-title">
           <div class="pane-head">
-            <div class="step">2</div>
             <div class="pane-title">
               <h2 id="scan-title">Classroom scan</h2>
               <p>Pick a detector + recognizer pair, tune the thresholds, then scan.</p>
@@ -251,7 +239,6 @@
 
         <section class="pane" id="results-pane" aria-labelledby="results-title">
           <div class="pane-head">
-            <div class="step">3</div>
             <div class="pane-title">
               <h2 id="results-title">Results</h2>
               <p id="results-meta">Scan a classroom frame to see matches here.</p>
@@ -316,7 +303,6 @@
       <main class="workspace" id="panel-benchmark" data-panel="benchmark" hidden>
         <section class="pane" aria-labelledby="bench-setup-title">
           <div class="pane-head">
-            <div class="step">1</div>
             <div class="pane-title">
               <h2 id="bench-setup-title">Benchmark setup</h2>
               <p>Choose datasets, the model grid, and the operating parameters.</p>
@@ -391,7 +377,6 @@
 
         <section class="pane" aria-labelledby="bench-matrix-title">
           <div class="pane-head">
-            <div class="step">2</div>
             <div class="pane-title">
               <h2 id="bench-matrix-title">Model matrix</h2>
               <p>Calibrated F1, precision, recall, size-stratified recall, and latency.</p>
@@ -417,7 +402,6 @@
       <main class="workspace" id="panel-datasets" data-panel="datasets" hidden>
         <section class="pane" aria-labelledby="dataset-add-title">
           <div class="pane-head">
-            <div class="step">1</div>
             <div class="pane-title">
               <h2 id="dataset-add-title">Build a dataset</h2>
               <p>Frames plus the students actually present — the ground truth benchmarks calibrate against.</p>
@@ -452,7 +436,6 @@
 
         <section class="pane" aria-labelledby="dataset-list-title">
           <div class="pane-head">
-            <div class="step">2</div>
             <div class="pane-title">
               <h2 id="dataset-list-title">Datasets</h2>
               <p>Reusable ground-truth sets. Sweeps never re-upload images.</p>
@@ -464,10 +447,6 @@
           </div>
         </section>
       </main>
-
-      <footer>
-        Standalone harness · scans cached under <code>.data/cache</code> · benchmarks under <code>.data/benchmarks</code>
-      </footer>
     </div>
 
     <div id="toast" class="toast" hidden></div>
