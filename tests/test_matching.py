@@ -226,3 +226,69 @@ def test_attendance_metrics_confusion_and_f1():
     assert perfect["f1"] == 1.0
     empty = matching.attendance_metrics([], [])
     assert empty["f1"] == 0.0
+
+
+def test_k_of_n_voting_respects_hungarian_assignment():
+    # Each frame's single face is closest to 'a' but also clears review for 'b'.
+    # The one-to-one assignment must give the face to 'a' only; 'b' must not vote.
+    gallery = {
+        "a": unit([1.0, 0.0])[None, :],
+        "b": unit([0.85, 0.5268])[None, :],  # cosine(face, b) ~= 0.85
+    }
+    frames = [_frame([_det([1.0, 0.0])]), _frame([_det([1.0, 0.0])])]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="k_of_n_voting",
+        accept_threshold=0.9,
+        review_threshold=0.4,
+        min_margin=0.05,
+        k=1,
+    )
+    assert fused["students"]["a"]["status"] == "present"
+    # 'b' never wins the assignment, so it must be absent even though its raw
+    # max similarity clears the review band.
+    assert fused["students"]["b"]["status"] == "absent"
+
+
+def test_k_of_n_voting_honours_min_margin():
+    # The face clears accept for 'a', but 'b' is almost as close, so the margin
+    # gate must demote it to review instead of calling it present.
+    gallery = {
+        "a": unit([1.0, 0.0, 0.0])[None, :],
+        "b": unit([0.99, 0.14, 0.0])[None, :],
+    }
+    frames = [_frame([_det([1.0, 0.0, 0.0])]), _frame([_det([1.0, 0.0, 0.0])])]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="k_of_n_voting",
+        accept_threshold=0.5,
+        review_threshold=0.4,
+        min_margin=0.05,
+        k=1,
+    )
+    assert fused["students"]["a"]["status"] == "needs_review"
+    assert fused["students"]["b"]["status"] == "absent"
+
+
+def test_annotate_classroom_photo_draws_bbox_only_matches():
+    from facelab import face as face_module
+
+    image = np.zeros((120, 160, 3), dtype=np.uint8)
+    assert int(face_module.annotate_classroom_photo(image, []).sum()) == 0
+
+    # The scan passes match dicts with a "bbox" but no "face" object; those must
+    # still be drawn instead of skipped.
+    matches = [
+        {
+            "bbox": [20, 20, 80, 90],
+            "status": "present",
+            "student_name": "squid",
+            "confidence": 0.9,
+            "matched": True,
+        }
+    ]
+    annotated = face_module.annotate_classroom_photo(image, matches)
+    assert annotated.shape == image.shape
+    assert int(annotated.sum()) > 0

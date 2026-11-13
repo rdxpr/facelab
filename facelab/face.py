@@ -268,6 +268,10 @@ class InsightFaceDetector(BaseDetector):
         self.model.prepare(
             ctx_id=0, input_size=det_size, det_thresh=det_thresh, nms_thresh=nms_thresh
         )
+        # SCRFD keeps these on the model, and some zoo packs reset them in
+        # prepare(); pin them so the requested thresholds actually take effect.
+        self.model.det_thresh = float(det_thresh)
+        self.model.nms_thresh = float(nms_thresh)
         if not getattr(self.model, "use_kps", True):
             raise FaceEngineUnavailable(
                 f"{detector_id} has no 5-point keypoint head, so it cannot feed "
@@ -803,7 +807,8 @@ def embed_reference(
             entry["flip_avg"] = matching.flip_averaged(raw, mirror)
         if lowres_aug:
             augmented = np.asarray(recognizer.embed([lowres_augment(crop)]), dtype=np.float32)[0]
-            entry["lowres_aug"] = augmented
+            base_vec = entry["flip_avg"] if entry.get("flip_avg") is not None else raw
+            entry["lowres_aug"] = matching.flip_averaged(base_vec, augmented)
         embeddings[recognizer.id] = entry
 
     primary = recognizers[0]
@@ -1294,11 +1299,7 @@ def annotate_classroom_photo(image_bgr: np.ndarray, matches: list[dict]) -> np.n
 
     for match in matches:
         face = match.get("face")
-        if face is None:
-            continue
-        bbox = getattr(face, "bbox", None)
-        if bbox is None:
-            bbox = match.get("bbox")
+        bbox = getattr(face, "bbox", None) if face is not None else match.get("bbox")
         if bbox is None:
             continue
         x1, y1, x2, y2 = np.asarray(bbox).astype(int)

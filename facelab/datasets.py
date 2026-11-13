@@ -111,17 +111,18 @@ def create_dataset(
             }
         )
 
+    present_count = len(present_student_ids or [])
+    expected_faces = len(boxes) or (present_count * len(frame_records)) or len(frame_records)
     manifest = {
         "dataset_id": identifier,
+        "datasetId": identifier,
         "name": (name or identifier).strip()[:120] or identifier,
         "notes": notes.strip()[:500],
         "createdAt": _now(),
         "frames": frame_records,
         "ground_truth": {
             "present_student_ids": [int(value) for value in (present_student_ids or [])],
-            "expected_total_faces": int(
-                len(boxes) or sum(1 for _ in frame_records)
-            ),
+            "expected_total_faces": int(expected_faces),
             "annotated_boxes": boxes,
         },
     }
@@ -154,6 +155,7 @@ def list_datasets() -> list[dict]:
         items.append(
             {
                 "dataset_id": manifest["dataset_id"],
+                "datasetId": manifest["dataset_id"],
                 "name": manifest.get("name"),
                 "createdAt": manifest.get("createdAt"),
                 "frames": len(manifest.get("frames", [])),

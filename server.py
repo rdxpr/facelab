@@ -674,7 +674,7 @@ def _analyze_or_cache(
         with_quality=bool(det_params.get("with_quality", True)),
         with_pose=bool(det_params.get("with_pose", True)),
         crops_dir=settings.crops_dir,
-        crop_prefix=image_sha[:12],
+        crop_prefix=key,
     )
     payload["cache_key"] = key
     payload["image_sha256"] = image_sha
@@ -1366,19 +1366,18 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 with_pose=request.with_pose,
             )
 
-            all_frames: list[dict] = []
+            dataset_inputs: list[tuple[list[dict], list[int], list[dict]]] = []
             timings: list[dict] = []
             expected_faces = 0
-            annotated_boxes: list[dict] = []
-            present_ids: list[int] = []
             try:
                 for dataset_id, manifest in manifests.items():
                     gt = manifest.get("ground_truth", {})
-                    present_ids.extend(gt.get("present_student_ids", []))
-                    annotated_boxes.extend(gt.get("annotated_boxes", []))
+                    present_ids = [int(value) for value in gt.get("present_student_ids", [])]
+                    dataset_boxes = gt.get("annotated_boxes", [])
                     expected_faces += int(
                         gt.get("expected_total_faces") or len(manifest.get("frames", []))
                     )
+                    dataset_frames: list[dict] = []
                     for frame in manifest["frames"][: settings.benchmark_max_frames]:
                         path = dataset_store.dataset_dir(dataset_id) / frame["filename"]
                         if not path.is_file():
@@ -1392,7 +1391,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                             detector_id=detector_id, recognizer_id=recognizer_id,
                             det_params=det_params, flip_aug=request.flip_aug,
                         )
-                        all_frames.append(
+                        dataset_frames.append(
                             {
                                 "frame_id": frame["frame_id"],
                                 "width": frame["width"],
@@ -1402,6 +1401,8 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                             }
                         )
                         timings.append(payload["timings_ms"])
+                    if dataset_frames:
+                        dataset_inputs.append((dataset_frames, present_ids, dataset_boxes))
             except engine.FaceEngineUnavailable as exc:
                 rows.append(
                     {
@@ -1414,7 +1415,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 )
                 continue
 
-            if not all_frames:
+            if not dataset_inputs:
                 rows.append(
                     {
                         "detector": detector_id,
@@ -1426,10 +1427,9 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 )
                 continue
 
-            curve = bench.threshold_curve(
-                all_frames,
+            curve = bench.threshold_curve_datasets(
+                [(frames, present_ids) for frames, present_ids, _boxes in dataset_inputs],
                 gallery,
-                present_ids,
                 variant=variant,
                 review_ratio=(request.review_threshold / request.accept_threshold)
                 if request.accept_threshold else 0.8,
@@ -1444,21 +1444,31 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             chosen_threshold = request.accept_threshold or (
                 points["best_f1"]["threshold"] if points["best_f1"] else request.review_threshold
             )
-            evaluation = bench.evaluate_frames(
-                all_frames,
-                gallery,
-                present_ids,
-                variant=variant,
-                accept_threshold=chosen_threshold,
-                review_threshold=request.review_threshold,
-                min_margin=request.min_margin,
-                assignment_mode=request.assignment_mode,
-                template_strategy=request.template_strategy,
-                top_k=request.top_k,
-                fusion_mode=request.fusion_mode,
-                k=request.k,
-                min_quality=request.min_quality,
-                annotated_boxes=annotated_boxes,
+            evaluations = [
+                bench.evaluate_frames(
+                    frames,
+                    gallery,
+                    present_ids,
+                    variant=variant,
+                    accept_threshold=chosen_threshold,
+                    review_threshold=request.review_threshold,
+                    min_margin=request.min_margin,
+                    assignment_mode=request.assignment_mode,
+                    template_strategy=request.template_strategy,
+                    top_k=request.top_k,
+                    fusion_mode=request.fusion_mode,
+                    k=request.k,
+                    min_quality=request.min_quality,
+                    annotated_boxes=dataset_boxes,
+                )
+                for frames, present_ids, dataset_boxes in dataset_inputs
+            ]
+            attendance = bench.aggregate_attendance(evaluations)
+            detection = bench.aggregate_detection(
+                [evaluation["detection"] for evaluation in evaluations]
+            )
+            faces_detected = sum(
+                evaluation["faces_detected"] for evaluation in evaluations
             )
             rows.append(
                 {
@@ -1476,13 +1486,13 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     "assignmentMode": request.assignment_mode,
                     "templateStrategy": request.template_strategy,
                     "fusionMode": request.fusion_mode,
-                    "metrics": evaluation["attendance"],
+                    "metrics": attendance,
                     "tauF1": points["best_f1"]["threshold"] if points["best_f1"] else None,
                     "bestF1": points["best_f1"]["f1"] if points["best_f1"] else 0.0,
                     "far0": points["far0"],
                     "prec98": points["prec98"],
-                    "detection": evaluation["detection"],
-                    "facesDetected": evaluation["faces_detected"],
+                    "detection": detection,
+                    "facesDetected": faces_detected,
                     "expectedFaces": expected_faces,
                     "latency": bench.latency_percentiles(timings),
                     "warmupMs": round(warmup_ms, 3),

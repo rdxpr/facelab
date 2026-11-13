@@ -83,8 +83,13 @@ _EMBEDDING_FIELDS = {
 
 def select_embedding(detection: dict, variant: str = "flip_avg") -> np.ndarray:
     """Pick the detection embedding to score with, falling back to raw."""
-    field = _EMBEDDING_FIELDS.get(variant, "embedding")
-    for key in (field, "embedding"):
+    if variant == "lowres_aug":
+        # Classroom probes are already low-resolution; don't degrade them a
+        # second time with the low-res augmentation. Use the clean/flip vector.
+        keys = ("embedding_flip_avg", "embedding")
+    else:
+        keys = (_EMBEDDING_FIELDS.get(variant, "embedding"), "embedding")
+    for key in keys:
         value = detection.get(key)
         if value is None:
             continue
@@ -295,6 +300,53 @@ def threshold_curve(
     return rows
 
 
+def threshold_curve_datasets(
+    datasets: Sequence[tuple[Sequence[dict], Sequence[int]]],
+    gallery: dict[int, np.ndarray],
+    *,
+    variant: str = "flip_avg",
+    low: float = 0.15,
+    high: float = 0.75,
+    step: float = 0.01,
+    review_ratio: float = 0.8,
+    min_margin: float = 0.04,
+    assignment_mode: str = "hungarian",
+    template_strategy: str = "top_k_mean",
+    top_k: int = 2,
+    fusion_mode: str = "k_of_n_voting",
+    k: int = 2,
+) -> list[dict]:
+    """Sweep ``accept_threshold`` across several datasets, aggregating per step.
+
+    Evaluating datasets separately avoids the frame-id collisions and mixed
+    present-rosters you get from concatenating every dataset's frames into one
+    call.
+    """
+    rows = []
+    threshold = low
+    while threshold <= high + 1e-9:
+        results = [
+            evaluate_frames(
+                frames,
+                gallery,
+                present_ids,
+                variant=variant,
+                accept_threshold=threshold,
+                review_threshold=round(threshold * review_ratio, 4),
+                min_margin=min_margin,
+                assignment_mode=assignment_mode,
+                template_strategy=template_strategy,
+                top_k=top_k,
+                fusion_mode=fusion_mode,
+                k=k,
+            )
+            for frames, present_ids in datasets
+        ]
+        rows.append({"threshold": round(threshold, 4), **aggregate_attendance(results)})
+        threshold = round(threshold + step, 4)
+    return rows
+
+
 def pick_operating_points(curve: list[dict]) -> dict:
     """Reduce a threshold curve to the three operating points we report."""
     if not curve:
@@ -327,6 +379,40 @@ def aggregate_attendance(results: Sequence[dict]) -> dict:
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "f1": round(f1, 4),
+    }
+
+
+def aggregate_detection(results: Sequence[dict]) -> dict:
+    """Merge per-dataset stratified detection counts into one report."""
+    buckets = {
+        name: {"gt": 0, "detected": 0, "identified": 0}
+        for name in ("large", "medium", "small")
+    }
+    for result in results:
+        for name, value in (result.get("buckets") or {}).items():
+            bucket = buckets.setdefault(name, {"gt": 0, "detected": 0, "identified": 0})
+            bucket["gt"] += int(value.get("gt") or 0)
+            bucket["detected"] += int(value.get("detected") or 0)
+            bucket["identified"] += int(value.get("identified") or 0)
+
+    for value in buckets.values():
+        value["detection_recall"] = (
+            round(value["detected"] / value["gt"], 4) if value["gt"] else 0.0
+        )
+        value["identification_recall"] = (
+            round(value["identified"] / value["gt"], 4) if value["gt"] else 0.0
+        )
+    total_gt = sum(value["gt"] for value in buckets.values())
+    total_detected = sum(value["detected"] for value in buckets.values())
+    total_identified = sum(value["identified"] for value in buckets.values())
+    return {
+        "has_annotations": any(result.get("has_annotations") for result in results),
+        "gt_faces": total_gt,
+        "detected_faces": total_detected,
+        "identified_faces": total_identified,
+        "detection_recall": round(total_detected / total_gt, 4) if total_gt else 0.0,
+        "identification_recall": round(total_identified / total_gt, 4) if total_gt else 0.0,
+        "buckets": buckets,
     }
 
 

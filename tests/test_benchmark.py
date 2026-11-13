@@ -141,3 +141,51 @@ def test_latency_percentiles():
     assert stats["detect_ms_p50"] == 10
     assert stats["total_inference_ms_p50"] == 31
     assert stats["passes"] == 10
+
+
+def test_select_embedding_lowres_aug_prefers_clean_flip():
+    detection = {
+        "embedding": unit(1, 0, 0),
+        "embedding_flip_avg": unit(0, 1, 0),
+        "embedding_lowres_aug": unit(0, 0, 1),
+    }
+    # Classroom probes are already low-res, so lowres_aug must reuse the clean
+    # flip-averaged vector rather than degrading them again.
+    assert np.allclose(benchmark.select_embedding(detection, "lowres_aug"), unit(0, 1, 0))
+
+
+def test_threshold_curve_datasets_aggregates_across_datasets():
+    students = {1: make_student(1, [1.0, 0.0, 0.0])}
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    # Both datasets reuse the same frame id on purpose: they must be scored
+    # separately, not concatenated.
+    good = [
+        frame("frame_01", [det(unit(1, 0, 0))]),
+        frame("frame_02", [det(unit(1, 0, 0))]),
+    ]
+    bad = [frame("frame_01", [det(unit(0.0, 1.0, 0.0), bbox=(700, 700, 760, 760))])]
+    curve = benchmark.threshold_curve_datasets(
+        [(good, [1]), (bad, [1])],
+        gallery,
+        variant="raw",
+        low=0.2,
+        high=0.7,
+        step=0.1,
+        k=1,
+    )
+    row = next(item for item in curve if item["threshold"] == pytest.approx(0.2))
+    assert row["tp"] == 1  # dataset one recognised
+    assert row["fn"] == 1  # dataset two missed
+    assert row["fp"] == 0
+
+
+def test_aggregate_detection_sums_buckets():
+    results = [
+        {"has_annotations": True, "buckets": {"large": {"gt": 2, "detected": 2, "identified": 1}}},
+        {"has_annotations": True, "buckets": {"large": {"gt": 1, "detected": 1, "identified": 1}}},
+    ]
+    merged = benchmark.aggregate_detection(results)
+    assert merged["gt_faces"] == 3
+    assert merged["detected_faces"] == 3
+    assert merged["identified_faces"] == 2
+    assert merged["buckets"]["large"]["detection_recall"] == 1.0

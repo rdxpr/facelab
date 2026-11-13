@@ -41,7 +41,7 @@ KNOWN_DETECTORS: dict[str, dict] = {
         "library": "insightface",
         "kind": "detector",
         "pack": "buffalo_l",
-        "file_candidates": ["det_10g.onnx"],
+        "file_candidates": ["det_10g.onnx", "scrfd_10g_bnkps.onnx"],
         "landmarks_5pt": True,
         "wider_hard": 83.05,
         "license": "Non-Commercial",

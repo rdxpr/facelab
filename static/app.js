@@ -1045,9 +1045,10 @@ function renderDatasets() {
     return;
   }
   list.innerHTML = state.datasets
-    .map(
-      (dataset) => `
-      <div class="dataset-row" data-dataset="${esc(dataset.datasetId)}">
+    .map((dataset) => {
+      const id = dataset.datasetId || dataset.dataset_id;
+      return `
+      <div class="dataset-row" data-dataset="${esc(id)}">
         <div class="history-thumb">${dataset.thumbUrl ? `<img src="${esc(dataset.thumbUrl)}" alt="" loading="lazy">` : ""}</div>
         <div class="history-main">
           <div class="history-title"><strong>${esc(dataset.name)}</strong></div>
@@ -1057,8 +1058,8 @@ function renderDatasets() {
           <button class="btn ghost small" type="button" data-action="use-dataset">Benchmark</button>
           <button class="icon-btn" type="button" data-action="delete-dataset" title="Delete dataset">×</button>
         </div>
-      </div>`,
-    )
+      </div>`;
+    })
     .join("");
 }
 
@@ -1160,10 +1161,10 @@ function renderBenchDatasets() {
   }
   const current = new Set([...wrap.querySelectorAll("input:checked")].map((input) => input.value));
   wrap.innerHTML = state.datasets
-    .map(
-      (dataset) =>
-        `<label class="check"><input type="checkbox" value="${esc(dataset.datasetId)}" ${current.has(dataset.datasetId) ? "checked" : ""}><span>${esc(dataset.name)} <span class="muted">${plural(dataset.frames, "frame")}</span></span></label>`,
-    )
+    .map((dataset) => {
+      const id = dataset.datasetId || dataset.dataset_id;
+      return `<label class="check"><input type="checkbox" value="${esc(id)}" ${current.has(id) ? "checked" : ""}><span>${esc(dataset.name)} <span class="muted">${plural(dataset.frames, "frame")}</span></span></label>`;
+    })
     .join("");
 }
 
@@ -1593,7 +1594,9 @@ function wireEvents() {
   wireDropzone($("#frame-drop"), (files) => addFiles({ files: state.frameFiles, render: renderFrameFiles }, files, state.settings.maxFrames, "frames"));
   wireDropzone($("#dataset-drop"), (files) => addFiles({ files: state.datasetFiles, render: renderDatasetFiles }, files, state.settings.maxFrames, "frames"));
 
-  for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode", "flip-aug", "lowres-aug"]) {
+  // Detector thresholds change detection itself, so they need a fresh scan;
+  // only the embedding-space knobs can be swept from the cache.
+  for (const id of ["accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode", "flip-aug", "lowres-aug"]) {
     $(`#${id}`).addEventListener("change", scheduleSweep);
   }
 

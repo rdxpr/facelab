@@ -289,21 +289,32 @@ def fuse_multi_frame(
         return student_ids.index(student_id)
 
     if mode == "k_of_n_voting":
-        for sid in student_ids:
-            col = student_index(sid)
-            scores = [
-                float(np.max(sim[:, col]))
-                for sim in sims
-                if sim.size and sim.shape[1] > col
-            ]
-            hits = sum(1 for score in scores if score >= review_threshold)
-            best = max(scores, default=0.0)
-            record = student_status[sid]
-            record["score"] = round(best, 4)
-            record["frames_hit"] = hits
-            if hits >= k and best >= accept_threshold:
+        # Vote on the *assigned* decision per frame, not the raw max similarity:
+        # otherwise the Hungarian one-to-one assignment, the margin gate and the
+        # min_quality filter are all bypassed here.
+        hits: dict[Any, int] = {sid: 0 for sid in student_ids}
+        present_hits: dict[Any, int] = {sid: 0 for sid in student_ids}
+        for frame_index, frame in enumerate(frames):
+            detections = frame.get("detections", [])
+            for det_index, decision in enumerate(per_frame[frame_index]):
+                sid = decision["matched_student_id"]
+                if sid is None or sid not in student_status:
+                    continue
+                if float(detections[det_index].get("quality") or 0.0) < min_quality:
+                    continue
+                score = float(decision["score"])
+                if score >= review_threshold:
+                    hits[sid] += 1
+                    if decision["status"] == "present":
+                        present_hits[sid] += 1
+                record = student_status[sid]
+                if score > record["score"]:
+                    record["score"] = round(score, 4)
+        for sid, record in student_status.items():
+            record["frames_hit"] = hits[sid]
+            if hits[sid] >= k and present_hits[sid] >= 1:
                 record["status"] = "present"
-            elif hits >= 1:
+            elif hits[sid] >= 1:
                 record["status"] = "needs_review"
     elif mode == "max_with_margin_gate":
         for frame_index, frame in enumerate(frames):
