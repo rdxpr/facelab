@@ -1,3 +1,9 @@
+---
+title: FaceLab
+sdk: docker
+app_port: 7860
+---
+
 # FaceLab
 
 A standalone harness for **testing face-detection / recognition models** and
@@ -27,8 +33,9 @@ reference photo → embedding   →    frames → faces → match against
 - **Offline-friendly models.** Weights are too large for git (GitHub rejects
   files over 100 MB), so `scripts/fetch_models.py` downloads them on demand and
   the local copy under `models/` is reused.
-- **Deployable.** Ships with a `Dockerfile` and a `render.yaml` Blueprint
-  (persistent disk for models + results).
+- **Deployable.** Ships with a `Dockerfile`. The hosted image keeps everything
+  in `/tmp` (ephemeral) so photos and results are never persisted, while local
+  development keeps persistent storage.
 
 ## Quick start (local)
 
@@ -147,32 +154,49 @@ most useful ones:
 | `FACELAB_RESULTS_TO_KEEP` | `50` | Saved run JSONs retained |
 | `FACELAB_CORS_ORIGINS` | `*` | Comma-separated allowlist for the parent app |
 
-## Deploy on Render
+## Hosting on Hugging Face Spaces
 
-A `render.yaml` Blueprint is included (`runtime: docker`). From the Render
-dashboard: **New → Blueprint**, connect the repo, and apply.
+This repo is ready to run as a **Docker** Space. Create one at
+[huggingface.co/new-space](https://huggingface.co/new-space) with the **Docker**
+SDK, then push this repo to the Space's git remote or upload the files — the
+image builds automatically. Spaces reads its config from the YAML front matter
+at the top of this README (`sdk: docker`, `app_port: 7860`).
 
-Models and results live on a persistent disk mounted at `/var/data`
-(`FACELAB_MODELS_DIR=/var/data/models`, `FACELAB_DATA_DIR=/var/data`), so the
-~330 MB of ONNX weights download once and survive deploys. The container
-entrypoint (`scripts/start.sh`) fetches the default pack only if it is missing,
-then starts the server.
+### Hosted is ephemeral, local is persistent
 
-Notes:
+The container image stores everything under `/tmp`:
 
-- The persistent disk needs a paid instance type. On the free tier, delete the
-  `disk:` block and `FACELAB_MODELS_DIR`; models are then re-fetched into the
-  ephemeral filesystem on each cold start.
-- Detection at 960 px wants ~1 GB of RAM; the Blueprint uses the `standard`
-  (2 GB) plan. Lower `FACELAB_FACE_SCAN_DET_SIZE` if you run smaller.
-- The server binds `0.0.0.0` automatically when `PORT` is set, as on Render.
+- `FACELAB_DATA_DIR=/tmp/data` — roster, reference photos, frames, results
+- `FACELAB_MODELS_DIR=/tmp/models` — downloaded ONNX packs
+
+`/tmp` is wiped on every restart, so on a hosted Space **reference photos,
+scans, and results are never persisted** and each cold start begins from a clean
+slate. The model pack is re-downloaded from GitHub on the first boot (~1 minute).
+
+Local development is unaffected: `./run.sh` uses the persistent `./models` and
+`./.data` directories.
+
+> **Privacy.** Public Spaces have no authentication: anyone with the URL can
+> enroll faces, view results, or call `/api/reset`. Do not upload real people's
+> faces to a public Space — make the Space private or add auth first. The
+> InsightFace pretrained models are licensed for non-commercial research use.
+
+The free CPU tier (2 vCPU, 16 GB RAM, 50 GB disk) runs `buffalo_l` at 960 px
+comfortably. The server binds `0.0.0.0` and listens on `7860` (the image sets
+`PORT=7860`).
 
 ### Run the container locally
 
 ```bash
 docker build -t facelab .
-docker run --rm -p 8010:8010 -v facelab-data:/var/data \
-  -e FACELAB_DATA_DIR=/var/data -e FACELAB_MODELS_DIR=/var/data/models facelab
+
+# Ephemeral, like a Space:
+docker run --rm -p 7860:7860 facelab
+
+# Persistent: override the storage paths and mount volumes.
+docker run --rm -p 7860:7860 \
+  -e FACELAB_DATA_DIR=/data -e FACELAB_MODELS_DIR=/models \
+  -v facelab-data:/data -v facelab-models:/models facelab
 ```
 
 ## Project layout
@@ -188,8 +212,7 @@ scripts/
   start.sh          Container entrypoint (fetch model, then serve)
 models/<pack>/      ONNX weights (git-ignored, fetched on demand)
 .data/              Roster, frames, results (git-ignored, local runtime data)
-Dockerfile          Container image (installs libGL for OpenCV)
-render.yaml         Render Blueprint
+Dockerfile          Container image (libGL for OpenCV, ephemeral /tmp storage)
 ```
 
 ## Notes

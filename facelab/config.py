@@ -1,7 +1,7 @@
 """Configuration for the standalone FaceLab tool.
 
 All settings can be overridden with ``FACELAB_``-prefixed environment variables,
-for example ``FACELAB_DATA_DIR=/var/data`` on Render.
+for example ``FACELAB_DATA_DIR=/tmp/data`` on an ephemeral host.
 """
 
 from __future__ import annotations

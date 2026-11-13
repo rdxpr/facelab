@@ -2,8 +2,8 @@
 """Download InsightFace model packs into the FaceLab ``models/`` directory.
 
 The ONNX weights are far too large for git, so they are kept out of the
-repository and fetched on demand. This runs automatically at container start on
-Render (see ``scripts/start.sh``) and can be run by hand locally:
+repository and fetched on demand. This runs automatically at container start
+(see ``scripts/start.sh``) and can be run by hand locally:
 
     python scripts/fetch_models.py                 # default pack
     python scripts/fetch_models.py --model buffalo_s --model buffalo_sc

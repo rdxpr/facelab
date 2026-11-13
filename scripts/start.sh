@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
-# Container/production entrypoint: make sure the default model pack exists, then
-# start the server. Fetching is skipped when the pack is already on disk (which
-# is the steady state once the Render persistent disk is populated).
+# Container entrypoint: make sure the default model pack exists, then start the
+# server. Fetching is skipped when the pack is already on disk; on an ephemeral
+# host (e.g. Hugging Face Spaces) that download happens again on each cold start.
 set -eu
 
 cd "$(dirname "$0")/.."

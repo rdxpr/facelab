@@ -898,7 +898,8 @@ def main() -> None:
     default_host = os.environ.get("FACELAB_HOST") or os.environ.get("HOST")
     default_port = os.environ.get("FACELAB_PORT") or os.environ.get("PORT")
     if default_host is None:
-        # Render (and most PaaS) exposes the service on PORT and needs 0.0.0.0.
+        # Hugging Face Spaces / most PaaS expose the service on PORT and need
+        # the server on 0.0.0.0.
         default_host = "0.0.0.0" if default_port else "127.0.0.1"
 
     parser = argparse.ArgumentParser(description="FaceLab face-model playground")
