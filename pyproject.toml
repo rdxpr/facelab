@@ -1,7 +1,7 @@
 [project]
 name = "facelab"
-version = "0.2.0"
-description = "Standalone harness for testing face-detection models and storing structured results."
+version = "0.3.0"
+description = "Multi-model face-detection & recognition benchmarking harness for classroom attendance."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,10 +10,17 @@ dependencies = [
     "python-multipart==0.0.33",
     "pydantic-settings==2.16.2",
     "numpy==1.26.4",
+    "scipy==1.17.1",
     "pillow==13.0.0",
     "onnxruntime==1.31.1",
     "insightface==2.1",
 ]
+
+[project.optional-dependencies]
+# UniFace unlocks AdaFace / EdgeFace / SphereFace recognizers plus the eDifFIQA
+# quality and 6D head-pose predictors. Everything else works without it.
+uniface = ["uniface[cpu]>=4.3.0"]
+dev = ["pytest==8.3.4"]
 
 [tool.uv]
 # FaceLab is an application, not a library: sync dependencies only, don't try to

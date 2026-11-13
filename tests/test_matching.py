@@ -1,0 +1,228 @@
+"""Unit tests for the pure NumPy/SciPy matching engine."""
+
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from facelab import matching
+
+
+def unit(vec):
+    vec = np.asarray(vec, dtype=np.float32)
+    return vec / np.linalg.norm(vec)
+
+
+def test_size_bucket_boundaries():
+    assert matching.size_bucket(120) == "large"
+    assert matching.size_bucket(55) == "large"
+    assert matching.size_bucket(54.9) == "medium"
+    assert matching.size_bucket(30) == "medium"
+    assert matching.size_bucket(29.9) == "small"
+    assert matching.size_bucket(0) == "small"
+
+
+def test_flip_average_renormalizes_and_is_symmetric():
+    left = unit([1.0, 0.0, 0.0])
+    right = unit([0.8, 0.6, 0.0])
+    fused = matching.flip_averaged(left, right)
+    assert np.isclose(np.linalg.norm(fused), 1.0, atol=1e-6)
+    assert np.allclose(fused, matching.flip_averaged(right, left))
+
+
+def test_compute_student_similarity_strategies():
+    face = unit([1.0, 0.0, 0.0])
+    templates = np.stack([unit([1.0, 0.0, 0.0]), unit([0.0, 1.0, 0.0])])
+    assert matching.compute_student_similarity(face, templates, "max") == pytest.approx(1.0)
+    assert matching.compute_student_similarity(face, templates, "mean") == pytest.approx(0.5)
+    assert matching.compute_student_similarity(face, templates, "top_k_mean", top_k=1) == pytest.approx(1.0)
+    proto = matching.compute_student_similarity(face, templates, "prototype")
+    assert 0.5 < proto < 1.0
+    with pytest.raises(ValueError):
+        matching.compute_student_similarity(face, templates, "nope")
+
+
+def test_build_similarity_matrix_shape_and_order():
+    gallery = {
+        "a": unit([1.0, 0.0, 0.0])[None, :],
+        "b": unit([0.0, 1.0, 0.0])[None, :],
+    }
+    faces = [unit([1.0, 0.0, 0.0]), unit([0.0, 1.0, 0.0])]
+    matrix, ids = matching.build_similarity_matrix(faces, gallery, "max")
+    assert ids == ["a", "b"]
+    assert matrix.shape == (2, 2)
+    assert matrix[0, 0] == pytest.approx(1.0)
+    assert matrix[1, 1] == pytest.approx(1.0)
+    assert matrix[0, 1] == pytest.approx(0.0)
+
+
+def test_assign_single_frame_present_review_and_unmatched():
+    # face 0 -> student a (clear), face 1 -> borderline b, face 2 -> nobody.
+    matrix = np.array(
+        [
+            [0.80, 0.10],
+            [0.05, 0.44],
+            [0.20, 0.10],
+        ],
+        dtype=np.float32,
+    )
+    decisions = matching.assign_single_frame(
+        matrix, ["a", "b"], accept_threshold=0.5, review_threshold=0.4, min_margin=0.05
+    )
+    assert decisions[0]["status"] == "present"
+    assert decisions[0]["matched_student_id"] == "a"
+    # face 1 lands in the review band (below accept, above review).
+    assert decisions[1]["status"] == "needs_review"
+    assert decisions[1]["matched_student_id"] == "b"
+    assert decisions[2]["status"] == "unmatched"
+    assert decisions[0]["top_candidates"][0]["student_id"] == "a"
+    assert decisions[0]["margin"] == pytest.approx(0.7, abs=1e-3)
+
+
+def test_assign_single_frame_margin_gate_rejects_ambiguous():
+    matrix = np.array([[0.60, 0.58]], dtype=np.float32)
+    decisions = matching.assign_single_frame(
+        matrix, ["a", "b"], accept_threshold=0.5, review_threshold=0.4, min_margin=0.05
+    )
+    assert decisions[0]["status"] == "needs_review"
+    loose = matching.assign_single_frame(
+        matrix, ["a", "b"], accept_threshold=0.5, review_threshold=0.4, min_margin=0.01
+    )
+    assert loose[0]["status"] == "present"
+
+
+def test_hungarian_resolves_conflict_greedily_differently():
+    # Two faces both prefer student a; the second face has a strong student b.
+    matrix = np.array(
+        [
+            [0.90, 0.10],
+            [0.80, 0.75],
+        ],
+        dtype=np.float32,
+    )
+    hungarian = matching.assign_single_frame(
+        matrix, ["a", "b"], assignment_mode="hungarian"
+    )
+    assert {row["matched_student_id"] for row in hungarian} == {"a", "b"}
+
+    greedy = matching.assign_single_frame(matrix, ["a", "b"], assignment_mode="greedy")
+    assert greedy[0]["matched_student_id"] == "a"
+    # Greedy already used student a, so face 1 must fall back to b.
+    assert greedy[1]["matched_student_id"] == "b"
+
+    independent = matching.assign_single_frame(matrix, ["a", "b"], assignment_mode="margin")
+    assert independent[0]["matched_student_id"] == "a"
+    assert independent[1]["matched_student_id"] == "a"
+
+
+def test_assign_single_frame_empty_inputs():
+    assert matching.assign_single_frame(np.zeros((0, 2)), ["a", "b"]) == []
+    assert matching.assign_single_frame(np.zeros((3, 0)), []) == []
+
+
+def _frame(detections, width=1000, height=1000):
+    return {"detections": detections, "width": width, "height": height}
+
+
+def _det(embedding, bbox=(100, 100, 200, 200), quality=0.9):
+    return {"embedding": unit(embedding), "bbox": list(bbox), "quality": quality}
+
+
+def test_k_of_n_voting_suppresses_single_frame_impostor():
+    gallery = {
+        "real": unit([1.0, 0.0, 0.0])[None, :],
+        "impostor": unit([0.0, 1.0, 0.0])[None, :],
+    }
+    # A face that is genuinely 'real' every frame, plus a one-off random blip
+    # that happens to resemble the impostor in a single frame.
+    frames = [
+        _frame([_det([1.0, 0.0, 0.0])]),
+        _frame([_det([1.0, 0.0, 0.0]), _det([0.0, 1.0, 0.0], bbox=(700, 700, 760, 760))]),
+        _frame([_det([1.0, 0.0, 0.0])]),
+    ]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="k_of_n_voting",
+        accept_threshold=0.5,
+        review_threshold=0.4,
+        k=2,
+    )
+    assert fused["students"]["real"]["status"] == "present"
+    # The impostor only cleared review once, so it must not be marked present.
+    assert fused["students"]["impostor"]["status"] != "present"
+
+
+def test_k_of_n_requires_one_frame_above_accept():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    # Two frames clear the review band but never the accept band.
+    frames = [
+        _frame([_det([0.45, 0.893, 0.0])]),
+        _frame([_det([0.45, 0.893, 0.0])]),
+    ]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="k_of_n_voting",
+        accept_threshold=0.6,
+        review_threshold=0.4,
+        k=2,
+    )
+    assert fused["students"]["s"]["status"] == "needs_review"
+
+
+def test_max_with_margin_gate_requires_quality():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([_det([1.0, 0.0, 0.0], quality=0.1)])]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="max_with_margin_gate",
+        accept_threshold=0.5,
+        min_quality=0.5,
+    )
+    assert fused["students"]["s"]["status"] == "absent"
+
+    good = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="max_with_margin_gate",
+        accept_threshold=0.5,
+        min_quality=0.05,
+    )
+    assert good["students"]["s"]["status"] == "present"
+
+
+def test_quality_weighted_cluster_merges_tracks_across_frames():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [
+        _frame([_det([1.0, 0.05, 0.0], bbox=(100, 100, 180, 180), quality=0.9)]),
+        _frame([_det([0.98, 0.1, 0.0], bbox=(104, 102, 182, 181), quality=0.8)]),
+    ]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="quality_weighted_embedding_cluster",
+        accept_threshold=0.5,
+        review_threshold=0.4,
+    )
+    assert fused["students"]["s"]["status"] == "present"
+    # The two detections were clustered into one track, but both keep a status.
+    assert all(row["status"] == "present" for row in fused["per_frame"][0])
+    assert all(row["status"] == "present" for row in fused["per_frame"][1])
+
+
+def test_attendance_metrics_confusion_and_f1():
+    metrics = matching.attendance_metrics(["a", "b", "c"], ["a", "b", "d"])
+    assert metrics == {
+        "tp": 2,
+        "fp": 1,
+        "fn": 1,
+        "precision": 0.6667,
+        "recall": 0.6667,
+        "f1": 0.6667,
+    }
+    perfect = matching.attendance_metrics(["a"], ["a"])
+    assert perfect["f1"] == 1.0
+    empty = matching.attendance_metrics([], [])
+    assert empty["f1"] == 0.0
