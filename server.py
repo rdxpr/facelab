@@ -692,67 +692,62 @@ def _pick_detector(preferred: str | None = None) -> str:
 
 
 def _embed_reference(
-    image_bgr: np.ndarray, data: bytes, recognizer_id: str, detector_id: str
+    image_bgr: np.ndarray, data: bytes, recognizer_ids: list[str], detector_id: str
 ) -> dict:
-    payload = engine.analyze_frame(
-        image_bgr,
-        detector_id=detector_id,
-        recognizer_id=recognizer_id,
-        det_size=settings.face_det_size,
-        det_thresh=0.5,
-        nms_thresh=0.45,
-        tiling_mode="none",
-        flip_aug=True,
-        lowres_aug=True,
-        with_quality=True,
-        with_pose=True,
-    )
-    detections = payload["detections"]
-    if not detections:
-        raise HTTPException(
-            status_code=422,
-            detail="No face detected. Ask the student to face the camera in good light.",
+    """Run one detection and embed the aligned face with every recognizer."""
+    try:
+        result = engine.embed_reference(
+            image_bgr,
+            detector_id=detector_id,
+            recognizer_ids=recognizer_ids,
+            det_size=settings.face_det_size,
+            det_thresh=0.5,
+            nms_thresh=0.45,
+            flip_aug=True,
+            lowres_aug=True,
+            with_quality=True,
+            with_pose=True,
         )
-    if len(detections) > 1:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Multiple faces ({len(detections)}) detected. Use exactly one student per photo.",
-        )
-    det = detections[0]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    embeddings = {
+        recognizer_id: {
+            "raw": np.asarray(entry["raw"], dtype=np.float32),
+            "flip_avg": (
+                np.asarray(entry["flip_avg"], dtype=np.float32)
+                if entry.get("flip_avg") is not None
+                else None
+            ),
+            "lowres_aug": (
+                np.asarray(entry["lowres_aug"], dtype=np.float32)
+                if entry.get("lowres_aug") is not None
+                else None
+            ),
+            "norm_magnitude": float(entry.get("norm_magnitude") or 0.0),
+        }
+        for recognizer_id, entry in result["embeddings"].items()
+    }
     return {
         "id": uuid.uuid4().hex[:10],
         "sha256": cache_store.sha256_bytes(data),
-        "quality_score": float(det.get("quality_score") or 0.0),
+        "quality_score": float(result.get("quality_score") or 0.0),
         "quality_note": (
             "Face is small in the frame; move closer for a stronger embedding."
-            if float(det.get("face_height_px") or 0.0) < 50
+            if float(result.get("face_height_px") or 0.0) < 50
             else "Face detected."
         ),
-        "head_pose": det.get("head_pose"),
+        "head_pose": result.get("head_pose"),
         "createdAt": _now(),
-        "embeddings": {
-            recognizer_id: {
-                "raw": np.asarray(det["embedding"], dtype=np.float32),
-                "flip_avg": (
-                    np.asarray(det["embedding_flip_avg"], dtype=np.float32)
-                    if det.get("embedding_flip_avg") is not None
-                    else None
-                ),
-                "lowres_aug": (
-                    np.asarray(det["embedding_lowres_aug"], dtype=np.float32)
-                    if det.get("embedding_lowres_aug") is not None
-                    else None
-                ),
-                "norm_magnitude": float(det.get("embedding_norm_mag") or 0.0),
-            }
-        },
+        "embeddings": embeddings,
     }
 
 
 def _process_reference_photos(
-    raw: list[tuple[bytes, str | None]], recognizer_id: str
+    raw: list[tuple[bytes, str | None]], recognizer_ids: list[str]
 ) -> list[tuple[np.ndarray, dict]]:
-    _require_recognizer(recognizer_id)
+    for recognizer_id in recognizer_ids:
+        _require_recognizer(recognizer_id)
     detector_id = _pick_detector()
     processed: list[tuple[np.ndarray, dict]] = []
     with _model_lock:
@@ -760,7 +755,7 @@ def _process_reference_photos(
             label = filename or "photo"
             image_bgr = _decode(data, label)
             try:
-                record = _embed_reference(image_bgr, data, recognizer_id, detector_id)
+                record = _embed_reference(image_bgr, data, recognizer_ids, detector_id)
             except HTTPException:
                 raise
             except engine.FaceEngineUnavailable as exc:
@@ -772,7 +767,9 @@ def _process_reference_photos(
     return processed
 
 
-def _create_person_sync(name: str, recognizer_id: str, raw: list[tuple[bytes, str | None]]) -> dict:
+def _create_person_sync(
+    name: str, recognizer_ids: list[str], raw: list[tuple[bytes, str | None]]
+) -> dict:
     global _next_number
     if not raw:
         raise HTTPException(status_code=422, detail="Add at least one face photo")
@@ -780,7 +777,7 @@ def _create_person_sync(name: str, recognizer_id: str, raw: list[tuple[bytes, st
         raise HTTPException(
             status_code=422, detail=f"Up to {settings.max_photos_per_upload} photos per upload"
         )
-    processed = _process_reference_photos(raw, recognizer_id)
+    processed = _process_reference_photos(raw, recognizer_ids)
 
     with _state_lock:
         number = _next_number
@@ -803,7 +800,9 @@ def _create_person_sync(name: str, recognizer_id: str, raw: list[tuple[bytes, st
         return _public_person(person)
 
 
-def _add_photos_sync(person_id: int, recognizer_id: str, raw: list[tuple[bytes, str | None]]) -> dict:
+def _add_photos_sync(
+    person_id: int, recognizer_ids: list[str], raw: list[tuple[bytes, str | None]]
+) -> dict:
     with _state_lock:
         person = _people.get(person_id)
         if person is None:
@@ -817,7 +816,7 @@ def _add_photos_sync(person_id: int, recognizer_id: str, raw: list[tuple[bytes, 
     if len(raw) > remaining:
         raise HTTPException(status_code=422, detail=f"{remaining} more photo(s) fit for this student")
 
-    processed = _process_reference_photos(raw, recognizer_id)
+    processed = _process_reference_photos(raw, recognizer_ids)
 
     with _state_lock:
         person = _people.get(person_id)
@@ -833,6 +832,11 @@ def _add_photos_sync(person_id: int, recognizer_id: str, raw: list[tuple[bytes, 
 
 
 def _reembed_sync(recognizer_ids: list[str]) -> dict:
+    """Backfill embeddings for recognizers added after a student was enrolled.
+
+    Photos are grouped so each one is detected once and embedded with every
+    recognizer it is still missing, instead of re-detecting per recognizer.
+    """
     registry = recognizer_registry()
     targets = [rid for rid in (recognizer_ids or list(registry.keys())) if rid in registry]
     targets = [rid for rid in targets if engine.recognizer_availability(rid)[0]]
@@ -843,38 +847,65 @@ def _reembed_sync(recognizer_ids: list[str]) -> dict:
     results = {rid: {"updated": 0, "skipped": 0} for rid in targets}
     errors: list[str] = []
     with _state_lock, _model_lock:
-        for recognizer_id in targets:
-            for person in _people.values():
-                for photo in person["photos"]:
-                    if (photo.get("embeddings") or {}).get(recognizer_id, {}).get("raw") is not None:
+        for person in _people.values():
+            for photo in person["photos"]:
+                existing = photo.get("embeddings") or {}
+                missing = [
+                    rid for rid in targets if existing.get(rid, {}).get("raw") is None
+                ]
+                for recognizer_id in targets:
+                    if recognizer_id not in missing:
                         results[recognizer_id]["skipped"] += 1
-                        continue
-                    path = settings.data_dir / (photo.get("filename") or "")
-                    image_bgr = cv2.imread(str(path)) if path.is_file() else None
-                    if image_bgr is None:
+                if not missing:
+                    continue
+                path = settings.data_dir / (photo.get("filename") or "")
+                image_bgr = cv2.imread(str(path)) if path.is_file() else None
+                if image_bgr is None:
+                    for recognizer_id in missing:
                         results[recognizer_id]["skipped"] += 1
-                        errors.append(f"missing reference image for photo {photo['id']}")
-                        continue
-                    try:
-                        record = _embed_reference(
-                            image_bgr,
-                            path.read_bytes(),
-                            recognizer_id,
-                            detector_id,
-                        )
-                    except HTTPException as exc:
+                    errors.append(f"missing reference image for photo {photo['id']}")
+                    continue
+                try:
+                    record = _embed_reference(
+                        image_bgr, path.read_bytes(), missing, detector_id
+                    )
+                except HTTPException as exc:
+                    for recognizer_id in missing:
                         results[recognizer_id]["skipped"] += 1
-                        errors.append(f"{recognizer_id}/{photo['id']}: {exc.detail}")
-                        continue
-                    entry = photo.setdefault("embeddings", {})
+                    errors.append(f"{photo['id']}: {exc.detail}")
+                    continue
+                entry = photo.setdefault("embeddings", {})
+                for recognizer_id in missing:
                     entry[recognizer_id] = record["embeddings"][recognizer_id]
-                    if not photo.get("quality_score"):
-                        photo["quality_score"] = record["quality_score"]
-                    if not photo.get("head_pose"):
-                        photo["head_pose"] = record["head_pose"]
                     results[recognizer_id]["updated"] += 1
+                if not photo.get("quality_score"):
+                    photo["quality_score"] = record["quality_score"]
+                if not photo.get("head_pose"):
+                    photo["head_pose"] = record["head_pose"]
         _save_state()
     return {"results": results, "errors": errors[:20], "state": _public_state()}
+
+
+def _available_recognizer_ids() -> list[str]:
+    return [
+        rid for rid in recognizer_registry() if engine.recognizer_availability(rid)[0]
+    ]
+
+
+def _resolve_recognizer_ids(requested: list[str] | None) -> list[str]:
+    """Enrolment targets every installed recognizer unless callers name some."""
+    requested = [rid for rid in (requested or []) if rid]
+    if requested:
+        for recognizer_id in requested:
+            _require_recognizer(recognizer_id)
+        return requested
+    available = _available_recognizer_ids()
+    if not available:
+        raise HTTPException(
+            status_code=503,
+            detail="No recognizer weights are installed. Run scripts/fetch_models.py.",
+        )
+    return available
 
 
 # --------------------------------------------------------------------------- #
@@ -1733,13 +1764,13 @@ def cache_stats() -> dict:
 async def create_person(
     images: list[UploadFile] = File(...),
     name: str = Form(""),
-    model: str = Form(""),
     recognizer: str = Form(""),
+    recognizers: list[str] = Form([]),
     _: None = Depends(require_token),
 ) -> dict:
     raw = [(await image.read(), image.filename) for image in images]
-    recognizer_id = recognizer or (default_recognizer_for_pack(model) if model else settings.default_recognizer)
-    person = await run_in_threadpool(_create_person_sync, name, recognizer_id, raw)
+    targets = _resolve_recognizer_ids([*recognizers, recognizer])
+    person = await run_in_threadpool(_create_person_sync, name, targets, raw)
     return {"person": person, "state": _public_state()}
 
 
@@ -1747,13 +1778,13 @@ async def create_person(
 async def add_photos(
     person_id: int,
     images: list[UploadFile] = File(...),
-    model: str = Form(""),
     recognizer: str = Form(""),
+    recognizers: list[str] = Form([]),
     _: None = Depends(require_token),
 ) -> dict:
     raw = [(await image.read(), image.filename) for image in images]
-    recognizer_id = recognizer or (default_recognizer_for_pack(model) if model else settings.default_recognizer)
-    person = await run_in_threadpool(_add_photos_sync, person_id, recognizer_id, raw)
+    targets = _resolve_recognizer_ids([*recognizers, recognizer])
+    person = await run_in_threadpool(_add_photos_sync, person_id, targets, raw)
     return {"person": person, "state": _public_state()}
 
 

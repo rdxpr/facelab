@@ -110,16 +110,51 @@ def _file_model_availability(entry: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _uniface_weight_cached(value: str | None) -> Path | None:
+    """Path to a cached UniFace weight file, or None if it isn't downloaded.
+
+    UniFace resolves weights lazily on first use, so constructing a model can
+    kick off a multi-hundred-megabyte download from inside a request. Checking
+    the cache (``~/.uniface/models``) directly means a model only counts as
+    ready once its weights are actually on disk.
+    """
+    if not value:
+        return None
+    try:
+        from uniface.model_store import get_cache_dir
+    except Exception:
+        return None
+    cache = Path(get_cache_dir())
+    if not cache.is_dir():
+        return None
+    matches = sorted(cache.glob(f"{value}.*"))
+    return matches[0] if matches else None
+
+
+def _uniface_cached_weight(entry: dict) -> Path | None:
+    return _uniface_weight_cached(entry.get("uniface_weights"))
+
+
+def _uniface_availability(entry: dict) -> tuple[bool, str]:
+    try:
+        _uniface_module()
+    except FaceEngineUnavailable as exc:
+        return False, str(exc)
+    if _uniface_cached_weight(entry) is None:
+        value = entry.get("uniface_weights")
+        return False, (
+            f"weights not downloaded yet ({value}); run "
+            f"`scripts/fetch_models.py --uniface {value}`"
+        )
+    return True, ""
+
+
 def detector_availability(detector_id: str) -> tuple[bool, str]:
     entry = KNOWN_DETECTORS.get(detector_id)
     if entry is None:
         return False, "unknown detector id"
     if entry["library"] == "uniface":
-        try:
-            _uniface_module()
-        except FaceEngineUnavailable as exc:
-            return False, str(exc)
-        return True, ""
+        return _uniface_availability(entry)
     return _file_model_availability(entry)
 
 
@@ -128,11 +163,7 @@ def recognizer_availability(recognizer_id: str) -> tuple[bool, str]:
     if entry is None:
         return False, "unknown recognizer id"
     if entry["library"] == "uniface":
-        try:
-            _uniface_module()
-        except FaceEngineUnavailable as exc:
-            return False, str(exc)
-        return True, ""
+        return _uniface_availability(entry)
     return _file_model_availability(entry)
 
 
@@ -497,9 +528,14 @@ def get_quality_predictor():
     with _ENGINE_LOCK:
         if predictor_id in _QUALITY:
             return _QUALITY[predictor_id]
+        value = predictor_id.split(":", 1)[-1]
+        if _uniface_weight_cached(value) is None:
+            # Weights aren't cached; the norm-based fallback keeps working and we
+            # avoid blocking a request on a lazy multi-hundred-MB download.
+            _QUALITY[predictor_id] = None
+            return None
         try:
             module = __import__("uniface.quality", fromlist=["*"])
-            value = predictor_id.split(":", 1)[-1]
             model = module.EDifFIQA(model_name=_uniface_enum(value), providers=settings.provider_list)
         except Exception as exc:
             _QUALITY[predictor_id] = None
@@ -516,11 +552,14 @@ def get_head_pose_predictor():
     with _ENGINE_LOCK:
         if predictor_id in _POSE:
             return _POSE[predictor_id]
+        value = predictor_id.split(":", 1)[-1]
+        if value in ("6d", "headpose_6d"):
+            value = "headpose_mobilenetv2"
+        if _uniface_weight_cached(value) is None:
+            _POSE[predictor_id] = None
+            return None
         try:
             module = __import__("uniface.headpose", fromlist=["*"])
-            value = predictor_id.split(":", 1)[-1]
-            if value in ("6d", "headpose_6d"):
-                value = "headpose_mobilenetv2"
             model = module.HeadPose(model_name=_uniface_enum(value), providers=settings.provider_list)
         except Exception as exc:
             _POSE[predictor_id] = None
@@ -694,6 +733,93 @@ def lowres_augment(crop: np.ndarray, tiny: int = 24, size: int = 112) -> np.ndar
     """Simulate a back-row face: downsample to ``tiny`` then bicubic upscale."""
     down = cv2.resize(crop, (tiny, tiny), interpolation=cv2.INTER_AREA)
     return cv2.resize(down, (size, size), interpolation=cv2.INTER_CUBIC)
+
+
+def embed_reference(
+    image_bgr: np.ndarray,
+    *,
+    detector_id: str,
+    recognizer_ids: list[str],
+    det_size: int | None = None,
+    det_thresh: float = 0.5,
+    nms_thresh: float = 0.45,
+    flip_aug: bool = True,
+    lowres_aug: bool = True,
+    with_quality: bool = True,
+    with_pose: bool = True,
+) -> dict:
+    """Embed one reference photo with *every* recognizer from a single detection.
+
+    Enrolment is recognizer-agnostic, so we detect and align the face once and
+    then run each recognizer over the same 112×112 crop. That keeps enrolment
+    cheap as the recognizer collection grows (adding a model costs one embed,
+    not another full detection pass).
+
+    Returns a cache-shaped record with an ``embeddings`` mapping keyed by
+    recognizer id. Raises :class:`ValueError` unless exactly one face is found.
+    """
+    detector_id = detector_id or settings.default_detector
+    det_size = det_size or settings.face_det_size
+    recognizers = [get_recognizer(rid) for rid in recognizer_ids]
+    if not recognizers:
+        raise ValueError("No recognizers requested for enrolment.")
+
+    detector = get_detector(detector_id, det_size, det_thresh, nms_thresh)
+    detections = detect_with_sahi(
+        image_bgr, lambda img: detector.detect(img), tiling_mode="none"
+    )
+    aligned = [
+        (det, align_face(image_bgr, det.kps.astype(np.float32), 112))
+        for det in detections
+        if det.kps is not None
+    ]
+    if not aligned:
+        raise ValueError("No face detected. Ask the student to face the camera in good light.")
+    if len(aligned) > 1:
+        raise ValueError(
+            f"Multiple faces ({len(aligned)}) detected. Use exactly one student per photo."
+        )
+
+    det, crop = aligned[0]
+    bbox = det.bbox.astype(np.float32)
+    height_px = float(bbox[3] - bbox[1])
+
+    embeddings: dict[str, dict] = {}
+    for recognizer in recognizers:
+        raw = np.asarray(recognizer.embed([crop]), dtype=np.float32)[0]
+        entry: dict[str, Any] = {
+            "raw": raw,
+            "flip_avg": None,
+            "lowres_aug": None,
+            "norm_magnitude": round(float(np.linalg.norm(raw)), 4),
+        }
+        if flip_aug:
+            mirror = np.asarray(recognizer.embed([cv2.flip(crop, 1)]), dtype=np.float32)[0]
+            entry["flip_avg"] = matching.flip_averaged(raw, mirror)
+        if lowres_aug:
+            augmented = np.asarray(recognizer.embed([lowres_augment(crop)]), dtype=np.float32)[0]
+            entry["lowres_aug"] = augmented
+        embeddings[recognizer.id] = entry
+
+    primary = recognizers[0]
+    quality_score = 0.0
+    quality_source = "none"
+    head_pose = None
+    if with_quality:
+        score, source = _quality_score(
+            get_quality_predictor(), crop, embeddings[primary.id]["norm_magnitude"]
+        )
+        quality_score, quality_source = round(score, 4), source
+    if with_pose:
+        head_pose = _head_pose(get_head_pose_predictor(), crop)
+
+    return {
+        "face_height_px": round(height_px, 2),
+        "quality_score": quality_score,
+        "quality_source": quality_source,
+        "head_pose": head_pose,
+        "embeddings": embeddings,
+    }
 
 
 def analyze_frame(

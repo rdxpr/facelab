@@ -87,17 +87,26 @@ def needs_download(target: Path, required: list[str], force: bool) -> bool:
 
 def download(url: str, destination: Path, retries: int = 3) -> None:
     last_error: Exception | None = None
+    partial = destination.with_name(destination.name + ".part")
     for attempt in range(1, retries + 1):
         try:
             print(f"[fetch_models] downloading {url} (attempt {attempt}/{retries})")
-            with urllib.request.urlopen(url, timeout=120) as response, destination.open(
-                "wb"
-            ) as handle:
-                shutil.copyfileobj(response, handle)
+            with urllib.request.urlopen(url, timeout=180) as response:
+                header = response.headers.get("Content-Length")
+                expected = int(header) if header and header.isdigit() else None
+                with partial.open("wb") as handle:
+                    shutil.copyfileobj(response, handle)
+            written = partial.stat().st_size
+            if not written:
+                raise OSError("empty response")
+            if expected is not None and written != expected:
+                raise OSError(f"truncated download ({written}/{expected} bytes)")
+            os.replace(partial, destination)
             return
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             print(f"[fetch_models]   retry needed: {exc}", file=sys.stderr)
+    partial.unlink(missing_ok=True)
     raise SystemExit(f"[fetch_models] could not download {url}: {last_error}")
 
 
@@ -129,7 +138,9 @@ def _extract_flat(zf: zipfile.ZipFile, target: Path) -> None:
             shutil.copyfileobj(source, sink)
 
 
-def fetch_pack(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
+def fetch_pack(
+    name: str, models_dir: Path, force: bool, base_url: str, attempts: int = 3
+) -> bool:
     target = models_dir / name
     required = KNOWN_MODELS.get(name, [])
     if not needs_download(target, required, force):
@@ -138,14 +149,32 @@ def fetch_pack(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
 
     url = f"{base_url.rstrip('/')}/{name}.zip"
     models_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / f"{name}.zip"
-        download(url, archive)
-        if force and target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-        target.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(archive) as zf:
-            _extract_flat(zf, target)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / f"{name}.zip"
+            download(url, archive)
+            try:
+                if force and target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+                target.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive) as zf:
+                    _extract_flat(zf, target)
+            except zipfile.BadZipFile as exc:
+                last_error = exc
+                shutil.rmtree(target, ignore_errors=True)
+                print(
+                    f"[fetch_models] {name}: archive unreadable "
+                    f"(attempt {attempt}/{attempts}); re-downloading",
+                    file=sys.stderr,
+                )
+                continue
+        break
+    else:
+        shutil.rmtree(target, ignore_errors=True)
+        raise SystemExit(
+            f"[fetch_models] {name}: no valid archive after {attempts} attempts ({last_error})"
+        )
 
     onnx_files = sorted(target.glob("*.onnx"))
     if not onnx_files:

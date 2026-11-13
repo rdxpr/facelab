@@ -59,10 +59,12 @@ uv sync                       # or: python -m venv .venv && .venv/bin/pip instal
 `./run.sh` prefers the project's `.venv`, then `uv run`, then plain `python3`.
 
 > **Why a single model by default?** The default fetch pulls only `buffalo_l`,
-> and a model is only selectable once its weights are on disk (or, for UniFace,
-> once `uniface` is installed). Run `fetch_models.py --all` to populate the whole
-> benchmark matrix — it is a large download (hundreds of MB). `--list` shows what
-> is available.
+> and a model is only selectable once its weights are actually on disk — for
+> UniFace models that means the weights have been downloaded to
+> `~/.uniface/models`, not merely that the package is installed. This keeps a
+> request from blocking on a lazy download. Run `fetch_models.py --all` to
+> populate the whole benchmark matrix — it is a large download (hundreds of MB).
+> `--list` shows what is available.
 
 ### Optional: UniFace models
 
@@ -74,8 +76,9 @@ uv pip install --python .venv/bin/python "uniface[cpu]"   # or [gpu] on CUDA
 .venv/bin/python scripts/fetch_models.py --uniface all
 ```
 
-Without `uniface`, the registry marks those models unavailable and the quality
-score falls back to the pre-L2 embedding norm.
+Without `uniface` (or before its weights are downloaded), the registry marks
+those models unavailable and the quality score falls back to the pre-L2
+embedding norm.
 
 ## Using the UI
 
@@ -83,9 +86,10 @@ The interface has three tabs.
 
 ### Attendance
 
-1. **Students** — add a name and one or more single-face photos. Each photo is
-   embedded once per available recognizer, so switching backbones never requires
-   re-enrolling.
+1. **Students** — add a name and one or more single-face photos. Every photo is
+   detected once and embedded with *every* available recognizer, so switching
+   backbones never requires re-enrolling; **Re-embed all** backfills students
+   enrolled before a new model was added.
 2. **Classroom scan** — choose a detector, a recognizer, a detection resolution,
    and optional SAHI tiling. Tune the detection threshold, NMS IoU, accept and
    review thresholds, the top1–top2 margin gate, and the assignment strategy.
