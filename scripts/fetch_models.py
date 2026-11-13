@@ -34,6 +34,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -138,18 +139,49 @@ def needs_download(target: Path, required: list[str], force: bool) -> bool:
     return False
 
 
+def _format_progress(label: str, written: int, expected: int | None, elapsed: float) -> str:
+    speed = written / elapsed if elapsed > 0 else 0.0
+    if expected:
+        pct = 100.0 * written / expected
+        body = f"{pct:5.1f}%  {written / 1e6:7.1f}/{expected / 1e6:.1f} MB"
+    else:
+        body = f"{written / 1e6:7.1f} MB"
+    return f"  {label}: {body}  {speed / 1e6:5.2f} MB/s"
+
+
+def _stream_to_file(response, target: Path, expected: int | None, label: str,
+                    chunk_size: int = 1 << 20, interval: float = 1.0) -> int:
+    """Copy a response body to ``target``, reporting progress on stderr."""
+    written = 0
+    started = time.monotonic()
+    last_report = started
+    with target.open("wb") as handle:
+        while True:
+            chunk = response.read(chunk_size)
+            if not chunk:
+                break
+            handle.write(chunk)
+            written += len(chunk)
+            now = time.monotonic()
+            if now - last_report >= interval:
+                print(_format_progress(label, written, expected, now - started),
+                      end="\r", file=sys.stderr, flush=True)
+                last_report = now
+    print(_format_progress(label, written, expected, time.monotonic() - started),
+          file=sys.stderr, flush=True)
+    return written
+
+
 def download(url: str, destination: Path, retries: int = 3) -> None:
     last_error: Exception | None = None
     partial = destination.with_name(destination.name + ".part")
     for attempt in range(1, retries + 1):
         try:
-            print(f"[fetch_models] downloading {url} (attempt {attempt}/{retries})")
+            print(f"[fetch_models] downloading {url} (attempt {attempt}/{retries})", flush=True)
             with urllib.request.urlopen(url, timeout=180) as response:
                 header = response.headers.get("Content-Length")
                 expected = int(header) if header and header.isdigit() else None
-                with partial.open("wb") as handle:
-                    shutil.copyfileobj(response, handle)
-            written = partial.stat().st_size
+                written = _stream_to_file(response, partial, expected, destination.name)
             if not written:
                 raise OSError("empty response")
             if expected is not None and written != expected:
