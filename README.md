@@ -1,36 +1,43 @@
 # FaceLab
 
-A standalone harness for **testing face-detection / recognition models** and
-**storing each run's results** so the parent Attendyrc project can reuse them.
+A local **benchmarking and hyperparameter-tuning harness for classroom
+attendance**: enroll a roster, run several face detectors and recognizers over
+the same classroom frames, and compare them on calibrated attendance F1,
+size-stratified recall, and latency.
 
-FaceLab runs the [InsightFace](https://github.com/deepinsight/insightface)
-pipeline locally, lets you enroll reference photos under a chosen model pack,
-scan classroom frames, and saves every scan as structured JSON. It has no
-dependency on the Attendyrc backend — the face engine is vendored into
-`facelab/`, so this repository clones, builds, and runs on its own.
+FaceLab runs the face pipeline locally and has no dependency on any backend —
+the engine is vendored into `facelab/`, so this repository clones, builds, and
+runs on its own.
 
 ```
-Students (enroll per model)        Classroom scan (per model)
-──────────────────────────         ──────────────────────────
-reference photo → embedding   →    frames → faces → match against
-                                    that model's templates → result JSON
+Enroll (per recognizer)            Scan (detector + recognizer)        Benchmark
+─────────────────────────          ────────────────────────────        ─────────
+reference photo → embeddings  →    frames → detect → align → embed  →  cached artifacts
+stored per recognizer id           → match → present/review/unknown    → calibrate τ, score grid
 ```
 
 ## Highlights
 
-- **Multiple models.** Every model pack in `models/<name>/` is selectable.
-  Reference photos enroll under a model; scans only match templates for the
-  selected model, so results from different models never mix.
-- **Structured results.** Each scan is written under the data directory
-  (`./.data/results/<scanId>.json` in dev) and served over the API, alongside
-  the original and annotated frames.
-- **Offline-friendly models.** Weights are too large for git (GitHub rejects
-  files over 100 MB), so `scripts/fetch_models.py` downloads them on demand and
-  the local copy under `models/` is reused.
-- **Storage modes.** Local development persists the roster, photos, and results
-  in `./.data`. When `FACELAB_ENV` is anything other than `dev`, uploads and
-  results go to an ephemeral directory that is wiped on every start, so nothing
-  about real people is retained on a server.
+- **Detectors and recognizers are independent.** Pick any detector (SCRFD,
+  RetinaFace, YOLOv8-Face, YuNet) with any recognizer (ArcFace R50/R100,
+  MobileFaceNet, AdaFace, EdgeFace, SphereFace, Raccoon-L). No more "one pack per
+  run".
+- **SAHI for back rows.** Optional slicing-aided hyper-inference tiles the upper
+  band or the whole frame so small back-row faces survive detection.
+- **Calibrated thresholds.** Similarity scores are not comparable across
+  backbones, so benchmarks sweep the accept threshold on labelled data and report
+  the operating point that maximises F1 (τ\*), the lowest threshold with zero
+  false attendances, and the lowest with precision ≥ 0.98.
+- **Stratified recall.** Detection and identification recall are split into
+  large / medium / small face buckets so you can see the back-row cost directly.
+- **Persistent inference cache.** Every scan stores detections, aligned crops,
+  quality, pose, and raw vectors per `(image, detector, params, recognizer)`. Once
+  cached, threshold/margin/fusion sweeps run in pure NumPy — the UI recolors a
+  scan live as you drag the sliders, with no re-inference.
+- **Ground-truth datasets.** Build reusable labelled datasets; sweeps never
+  re-upload images.
+- **Storage modes.** Local development persists everything under `./.data`. Any
+  non-`dev` `FACELAB_ENV` switches to ephemeral storage that is wiped on start.
 
 ## Quick start (local)
 
@@ -38,76 +45,116 @@ Requires Python 3.11+ and, optionally, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 # 1. Install dependencies (uv is fastest)
-uv sync                     # or: python -m venv .venv && .venv/bin/pip install -r requirements.txt
+uv sync                       # or: python -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 2. Make sure a model pack exists (skips if models/buffalo_l is already there)
-.venv/bin/python scripts/fetch_models.py            # defaults to buffalo_l
+# 2. Make sure a detector + recognizer exist (skips if already present)
+.venv/bin/python scripts/fetch_models.py                       # buffalo_l
+.venv/bin/python scripts/fetch_models.py --uniface adaface_ir_101   # optional SOTA recognizer
 
 # 3. Run
-./run.sh                    # http://127.0.0.1:8010
+./run.sh                      # http://127.0.0.1:8010
 ```
 
-`./run.sh` prefers the project's `.venv`, then `uv run`, then plain `python3`,
-so it works no matter how you set the environment up.
+`./run.sh` prefers the project's `.venv`, then `uv run`, then plain `python3`.
 
-### Using more than one model
+### Optional: UniFace models
 
-Drop each pack into its own folder (the folder name is the model name the UI
-shows):
-
-```
-models/
-├── buffalo_l/      # det_10g.onnx, w600k_r50.onnx, ...
-├── buffalo_s/
-└── antelopev2/
-```
-
-Fetch known packs directly:
+`uniface` unlocks the AdaFace / EdgeFace / SphereFace recognizers plus the
+eDifFIQA quality and 6D head-pose predictors. Everything else works without it.
 
 ```bash
-.venv/bin/python scripts/fetch_models.py --model buffalo_s --model buffalo_sc
-.venv/bin/python scripts/fetch_models.py --list          # show known packs
+uv pip install --python .venv/bin/python "uniface[cpu]"   # or [gpu] on CUDA
+.venv/bin/python scripts/fetch_models.py --uniface all
 ```
 
-The folder only needs the ONNX files FaceLab uses for detection and
-recognition. By default `FACELAB_ALLOWED_MODULES=detection,recognition`, so
-extra ONNX files in a pack are ignored.
+Without `uniface`, the registry marks those models unavailable and the quality
+score falls back to the pre-L2 embedding norm.
+
+## Using the UI
+
+The interface has three tabs.
+
+### Attendance
+
+1. **Students** — add a name and one or more single-face photos. Each photo is
+   embedded once per available recognizer, so switching backbones never requires
+   re-enrolling.
+2. **Classroom scan** — choose a detector, a recognizer, a detection resolution,
+   and optional SAHI tiling. Tune the detection threshold, NMS IoU, accept and
+   review thresholds, the top1–top2 margin gate, and the assignment strategy.
+3. **Results** — the roster splits into *present* / *review* / *absent*; frames
+   show green (present), amber (review), and red (unknown) boxes. Click any box
+   for the **Face Inspector**: the aligned crop, size bucket, face height,
+   detector score, quality, head pose, and top-3 candidates with scores and
+   margins.
+
+Moving any matching slider (accept, review, margin, assignment, fusion, …)
+re-scores the loaded scan from cache instantly — no re-inference.
+
+### Datasets
+
+Build a labelled dataset from classroom frames: mark the students who are
+actually present, add notes, and save. Datasets are the ground truth benchmarks
+calibrate against and are reused across sweeps.
+
+### Benchmark
+
+Select datasets, a grid of detectors × recognizers × resolutions × tiling modes,
+and the operating parameters, then run. The **Model matrix** reports, per
+combination:
+
+| Column | Meaning |
+| ------ | ------- |
+| `F1` / `Prec` / `Rec` | Attendance precision/recall/F1 at the chosen threshold |
+| `τ*` | Threshold that maximises F1 |
+| `L/M/S recall` | Identification recall for large / medium / small faces |
+| `det p50` / `total p50` | Detection and total inference latency (ms) |
+
+Click a row for the threshold curve (precision/recall/F1 vs τ), the zero-false-
+positive and precision≥0.98 operating points, and per-bucket recall.
 
 ## How it works
 
-1. **Enroll.** Pick the active model in the top bar, then add a student with one
-   or more single-face photos. Each photo is detected and turned into an
-   embedding stored with the model name it came from.
-2. **Scan.** Upload one or more classroom frames. Detection runs at the chosen
-   detector size, faces are matched against the active model's templates with a
-   greedy best-score assignment, and the busiest frame is annotated.
-3. **Reuse.** The run is saved under the data directory (`./.data/results/...`
-   in dev) and listed under *Saved runs*. Reload any run, open its JSON, or
-   delete it.
-
-Legacy rosters (from before models existed) are treated as belonging to the
-default model pack.
+1. **Detect** — the chosen detector runs on the frame (optionally across SAHI
+   tiles), merged with NMS.
+2. **Align + embed** — 5-point landmarks drive a 112×112 aligned crop; the
+   recognizer returns a raw vector, plus optional flip-averaged and low-res-
+   augmented variants.
+3. **Match** — `facelab/matching.py` builds a face×student similarity matrix from
+   per-student templates and turns it into `present` / `needs_review` /
+   `unmatched` decisions with an optional margin gate and Hungarian/greedy
+   assignment.
+4. **Fuse** — a burst of frames is merged by k-of-n voting, a max-with-margin
+   gate, or quality-weighted embedding clustering.
+5. **Score** — benchmarks calibrate the threshold and compute attendance plus
+   stratified detection/identification recall from cached embeddings.
 
 ### Result JSON shape
 
 ```jsonc
 {
-  "scanId": "20261113-170942-d719bd",
-  "createdAt": "2026-11-13T11:39:42+00:00",
-  "model": "buffalo_l",
+  "scanId": "20261113-183907-671f5b",
+  "createdAt": "2026-11-13T18:39:07+00:00",
+  "detectorId": "insightface:scrfd_10g_bnkps",
+  "recognizerId": "insightface:w600k_r50",
   "summary": {
-    "model": "buffalo_l", "threshold": 0.5, "detSize": 960,
-    "frames": 2, "facesDetected": 33, "matchedCount": 3, "unknown": 4,
-    "peopleCount": 12, "templateCount": 18, "bestIndex": 0, "elapsedMs": 8430
+    "frames": 2, "facesDetected": 11, "matchedCount": 3, "unknown": 4,
+    "acceptThreshold": 0.42, "reviewThreshold": 0.34, "minMargin": 0.04,
+    "detSize": 1280, "tilingMode": "none", "variant": "flip_avg",
+    "bestIndex": 0, "elapsedMs": 8430,
+    "timings": { "detect_ms": 210.4, "align_embed_ms": 2400.1, "match_ms": 11.2 }
   },
-  "people": [ { "personId": 1, "number": 1, "name": "…", "status": "Present",
-                "confidence": 0.62, "templates": 2 } ],
-  "frames": [ { "order": 0, "sourceName": "frame.jpg", "width": 1280,
-                "height": 960, "imageUrl": "/media/scans/…/frame-0.jpg",
+  "people": [ { "personId": 1, "number": 1, "name": "…", "status": "present",
+                "confidence": 0.62, "framesHit": 2, "templates": 2 } ],
+  "frames": [ { "order": 0, "width": 1280, "height": 960,
+                "imageUrl": "/media/scans/…/frame-0.jpg",
                 "annotatedUrl": "/media/scans/…/frame-0-annotated.jpg",
-                "faces": [ { "box": [x1, y1, x2, y2], "detScore": 0.9,
-                             "matched": true, "personId": 1, "name": "…",
-                             "confidence": 0.62 } ] } ],
+                "cacheKey": "…",
+                "faces": [ { "box": [x1, y1, x2, y2], "status": "present",
+                             "personId": 1, "confidence": 0.62, "margin": 0.31,
+                             "sizeBucket": "medium", "quality": 0.78,
+                             "cropUrl": "/media/crops/…_det0.jpg",
+                             "topCandidates": [ {"studentId": 1, "score": 0.62} ] } ] } ],
   "warnings": []
 }
 ```
@@ -117,21 +164,29 @@ default model pack.
 | Method | Path | Purpose |
 | ------ | ---- | ------- |
 | `GET`  | `/api/health` | Liveness + installed model names |
-| `GET`  | `/api/state` | Roster, totals, per-model template usage, settings |
-| `GET`  | `/api/models` | Installed packs with size, template/people counts |
-| `GET`  | `/api/model?name=<pack>` | Load (or check) a model pack |
-| `POST` | `/api/people` | Enroll a student (`name`, `model`, `images[]`) |
-| `POST` | `/api/people/{id}/photos` | Add photos to a student (`model`, `images[]`) |
+| `GET`  | `/api/state` | Roster, totals, settings, registry |
+| `GET`  | `/api/registry` | Detector/recognizer availability, license, metrics |
+| `GET`  | `/api/models` | Installed packs with template/people counts |
+| `GET`  | `/api/model?detector=&recognizer=` | Load (or check) a model pair |
+| `GET`  | `/api/cache` | Inference cache size |
+| `POST` | `/api/people` | Enroll a student (`name`, `recognizer`, `images[]`) |
+| `POST` | `/api/people/{id}/photos` | Add photos (`recognizer`, `images[]`) |
+| `POST` | `/api/students/re-embed` | Backfill embeddings for other recognizers |
 | `PATCH`| `/api/people/{id}` | Rename a student |
-| `DELETE`| `/api/people/{id}` | Remove a student |
-| `DELETE`| `/api/people/{id}/photos/{photoId}` | Remove one photo |
-| `POST` | `/api/scan` | Scan frames (`model`, `threshold`, `detSize`, `images[]`) |
-| `GET`  | `/api/results` | List saved runs (optionally `?model=<pack>`) |
+| `DELETE`| `/api/people/{id}` · `/api/people/{id}/photos/{photoId}` | Remove a student / photo |
+| `POST` | `/api/scan` | Scan frames (detector, recognizer, thresholds, `images[]`) |
+| `GET`  | `/api/results` | List saved runs |
 | `GET`  | `/api/results/{scanId}` | Full result JSON |
+| `POST` | `/api/results/{scanId}/sweep` | Re-score from cache with new parameters |
 | `DELETE`| `/api/results/{scanId}` | Delete a run and its frames |
-| `POST` | `/api/reset` | Clear roster, scans, and results |
+| `GET`/`POST`/`DELETE` | `/api/datasets[/{id}]` | List, build, delete ground-truth datasets |
+| `POST` | `/api/benchmark/run` | Run a model grid over datasets |
+| `POST` | `/api/benchmark/sweep` | Re-score datasets (cached) with new parameters |
+| `GET`  | `/api/benchmarks[/{runId}]` | List / fetch benchmark runs |
+| `POST` | `/api/reset` | Clear roster, scans, datasets, and results |
 
-The interactive API docs are at `/docs` (FastAPI).
+Interactive API docs are at `/docs` (FastAPI). Set `FACELAB_API_TOKEN` to
+require `Authorization: Bearer <token>` (or `X-API-Token`) on mutating routes.
 
 ## Configuration
 
@@ -140,18 +195,19 @@ most useful ones:
 
 | Variable | Default | Notes |
 | -------- | ------- | ----- |
-| `FACELAB_MODELS_DIR` | `./models` | One subfolder per model pack |
-| `FACELAB_ENV` | `dev` | Any non-`dev` value enables ephemeral storage |
-| `FACELAB_EPHEMERAL_DATA` | auto | Force ephemeral (`true`) or persistent (`false`) |
-| `FACELAB_EPHEMERAL_DIR` | system temp `/facelab` | Where ephemeral data lives |
-| `FACELAB_DATA_DIR` | `./.data` | Persistent roster/frames/results (dev mode) |
-| `FACELAB_DEFAULT_MODEL` | `buffalo_l` | Used when a request omits `model` |
-| `FACELAB_ALLOWED_MODULES` | `detection,recognition` | Empty loads every model in a pack |
-| `FACELAB_FACE_DET_SIZE` | `640` | Enrollment detector size |
-| `FACELAB_FACE_SCAN_DET_SIZE` | `960` | Scan detector size |
-| `FACELAB_FACE_SIMILARITY_THRESHOLD` | `0.5` | Cosine-match threshold |
-| `FACELAB_RESULTS_TO_KEEP` | `50` | Saved run JSONs retained |
-| `FACELAB_CORS_ORIGINS` | `*` | Comma-separated allowlist for the parent app |
+| `FACELAB_DEFAULT_DETECTOR` | `insightface:scrfd_10g_bnkps` | Default detector id |
+| `FACELAB_DEFAULT_RECOGNIZER` | `insightface:w600k_r50` | Default recognizer id |
+| `FACELAB_FACE_SCAN_DET_SIZE` | `1280` | Scan detector input size |
+| `FACELAB_ACCEPT_THRESHOLD` | `0.42` | Present if score ≥ accept and margin passes |
+| `FACELAB_REVIEW_THRESHOLD` | `0.34` | Flag for review if score ≥ review |
+| `FACELAB_MIN_MARGIN` | `0.04` | Minimum top1−top2 margin for "present" |
+| `FACELAB_TILING_MODE` | `none` | `none`, `sahi_upper_band`, `sahi_full` |
+| `FACELAB_ASSIGNMENT_MODE` | `hungarian` | `hungarian`, `greedy`, `margin` |
+| `FACELAB_MULTI_FRAME_FUSION` | `k_of_n_voting` | Burst fusion strategy |
+| `FACELAB_BENCHMARK_DET_SIZES` | `640,1024,1280` | Sweep resolutions |
+| `FACELAB_ONNX_PROVIDERS` | auto | `CUDAExecutionProvider,CPUExecutionProvider` |
+| `FACELAB_API_TOKEN` | *(empty)* | Require a bearer token on writes |
+| `FACELAB_CORS_ORIGINS` | localhost | Comma-separated allowlist |
 
 ## Running on a server
 
@@ -159,68 +215,63 @@ most useful ones:
 
 | `FACELAB_ENV` | Data location | Behaviour |
 | ------------- | ------------- | --------- |
-| `dev` (default) | `./.data` | Roster, photos, frames, and results persist |
-| anything else (e.g. `prod`) | `FACELAB_EPHEMERAL_DIR` (default `<system temp>/facelab`) | Directory is wiped on every start |
-
-So a server started with `FACELAB_ENV=prod` keeps **no reference photos, scans,
-or results** across restarts — only the model weights under `./models` remain.
-Override the behaviour explicitly if you want something different:
+| `dev` (default) | `./.data` | Roster, photos, frames, datasets, results persist |
+| anything else | `FACELAB_EPHEMERAL_DIR` (default `<temp>/facelab`) | wiped on every start |
 
 ```bash
 FACELAB_ENV=prod FACELAB_EPHEMERAL_DATA=false ./run.sh   # persist despite prod
 FACELAB_ENV=dev  FACELAB_EPHEMERAL_DATA=true  ./run.sh   # wipe despite dev
 ```
 
-Set `FACELAB_HOST=0.0.0.0` (and optionally `PORT`) when running behind a reverse
-proxy or in a container. `scripts/start.sh` does this for you.
-
-> **Privacy.** There is no authentication: anyone who can reach the port can
-> enroll faces, view results, or call `/api/reset`. Keep it on localhost or a
-> private network, or put an auth proxy in front of it. The InsightFace
-> pretrained models are licensed for non-commercial research use.
+> **Privacy.** Without `FACELAB_API_TOKEN` there is no authentication: anyone who
+> can reach the port can enroll faces, view results, or call `/api/reset`. Keep it
+> on localhost or a private network. InsightFace pretrained models and several
+> UniFace weights are licensed for non-commercial research use.
 
 ### Docker
 
-The image sets `FACELAB_ENV=prod`, `FACELAB_HOST=0.0.0.0`, and `PORT=8010`, so
-it is ephemeral by default.
-
 ```bash
 docker build -t facelab .
-
-# Ephemeral: photos and results vanish when the container restarts.
-docker run --rm -p 8010:8010 facelab
-
-# Persistent: opt out of ephemeral storage and mount a volume for the data.
-docker run --rm -p 8010:8010 \
-  -e FACELAB_EPHEMERAL_DATA=false -e FACELAB_DATA_DIR=/data \
-  -v facelab-data:/data facelab
-
-# Keep downloaded model weights between container restarts (~326 MB).
-docker run --rm -p 8010:8010 -v facelab-models:/app/models facelab
+docker run --rm -p 8010:8010 facelab                              # ephemeral
+docker run --rm -p 8010:8010 -v facelab-data:/data \
+  -e FACELAB_EPHEMERAL_DATA=false -e FACELAB_DATA_DIR=/data facelab
 ```
+
+The image sets `FACELAB_ENV=prod`, `FACELAB_HOST=0.0.0.0`, and `PORT=8010`.
 
 ## Project layout
 
 ```
-facelab/            Vendored face engine + settings (no backend imports)
-  config.py         FACELAB_* settings, paths
-  face.py           detection, matching, annotation, per-model analyzer cache
-server.py           FastAPI app: roster, scans, results, models
+facelab/
+  config.py         FACELAB_* settings + detector/recognizer registry
+  face.py           detector/recognizer engine, SAHI, analyze_frame, annotation
+  matching.py       pure NumPy/SciPy matching, fusion, attendance metrics
+  benchmark.py      calibration, stratified recall, latency percentiles
+  datasets.py       persistent ground-truth dataset store
+  cache.py          inference cache keys + JSON artifacts
+server.py           FastAPI app: roster, scans, datasets, benchmarks
 static/             Zero-build UI (HTML/CSS/JS)
 scripts/
-  fetch_models.py   Download model packs from the InsightFace model zoo
-  start.sh          Container entrypoint (fetch model, then serve)
+  fetch_models.py   Download model packs + UniFace weights, write a SHA-256 manifest
 models/<pack>/      ONNX weights (git-ignored, fetched on demand)
-.data/              Roster, frames, results (git-ignored, dev runtime data)
+.data/              Roster, frames, datasets, cache, results (git-ignored, dev data)
+tests/              pytest suites for the matching and benchmark engines
 Dockerfile          Container image (libGL for OpenCV, prod/ephemeral defaults)
 ```
+
+## Tests
+
+```bash
+.venv/bin/python -m pytest tests -q
+```
+
+`tests/test_matching.py` covers similarity, assignment, margin gating, and burst
+fusion; `tests/test_benchmark.py` covers galleries, calibration, stratified
+recall, aggregation, and latency.
 
 ## Notes
 
 - **Model licensing.** The InsightFace *library* is MIT, but the pretrained
-  *models* are for non-commercial research use. Check their terms before any
-  commercial deployment.
-- FaceLab intentionally vendors the face pipeline instead of importing the
-  Attendyrc backend, so the two projects evolve independently. If matching
-  behavior must stay identical, keep `facelab/face.py` in sync with
-  `backend/app/ml/face.py`.
+  *models* are non-commercial; check the `license` field on `/api/registry`.
+- FaceLab vendors the face pipeline instead of importing any backend, so projects
+  evolve independently. Keep behavior in sync deliberately, not by import.

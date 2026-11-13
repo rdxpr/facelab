@@ -1,56 +1,92 @@
-const ACTIVE_MODEL_KEY = "facelab.activeModel";
+/* FaceLab UI — multi-model attendance + benchmarking harness.
+ *
+ * Two workspaces share one set of static assets:
+ *   • Attendance: enroll students, pick a detector/recognizer pair, scan frames,
+ *     and re-score the saved scan instantly as the threshold sliders move.
+ *   • Benchmark: build ground-truth datasets and compare model grids on
+ *     calibrated F1, size-stratified recall, and latency.
+ *
+ * Neural inference is only ever triggered by a scan or a benchmark run; every
+ * slider move re-uses the cached embeddings via /api/results/{id}/sweep.
+ */
+
+const STORAGE_KEY = "facelab.selection.v3";
 
 const state = {
+  // roster / registry
   people: [],
-  models: [],
+  registry: { detectors: [], recognizers: [] },
+  packs: [],
+  // current selections
+  detector: "insightface:scrfd_10g_bnkps",
+  recognizer: "insightface:w600k_r50",
+  // saved artifacts
   results: [],
-  activeModel: "buffalo_l",
-  settings: {
-    threshold: 0.5,
-    detSize: 960,
-    maxFrames: 12,
-    maxPhotosPerUpload: 8,
-    defaultModel: "buffalo_l",
-  },
-  modelReady: false,
-  modelInfo: null,
-  faceFiles: [],
-  frameFiles: [],
+  datasets: [],
+  benchmarks: [],
+  // scans
   scan: null,
   selectedFrame: 0,
+  inspector: null,
+  liveSweep: null,
+  sweepTimer: null,
+  // benchmark display
+  benchmarkRun: null,
+  // transient UI
+  faceFiles: [],
+  frameFiles: [],
+  datasetFiles: [],
+  datasetPresent: new Set(),
+  datasetBoxes: {},
   busy: false,
   toastTimer: null,
+  settings: {
+    acceptThreshold: 0.42,
+    reviewThreshold: 0.34,
+    minMargin: 0.04,
+    detSize: 1280,
+    detThresh: 0.35,
+    nmsThresh: 0.45,
+    tilingMode: "none",
+    assignmentMode: "hungarian",
+    templateStrategy: "top_k_mean",
+    fusionMode: "k_of_n_voting",
+    fusionK: 2,
+    minFaceQuality: 0,
+    maxFrames: 12,
+    benchmarkDetSizes: [640, 1024, 1280],
+    defaultDetector: "insightface:scrfd_10g_bnkps",
+    defaultRecognizer: "insightface:w600k_r50",
+  },
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
 
+/* ------------------------------------------------------------------ utils */
+
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => {
     switch (char) {
-      case "&":
-        return "&amp;";
-      case "<":
-        return "&lt;";
-      case ">":
-        return "&gt;";
-      case '"':
-        return "&quot;";
-      default:
-        return "&#39;";
+      case "&": return "&amp;";
+      case "<": return "&lt;";
+      case ">": return "&gt;";
+      case '"': return "&quot;";
+      default: return "&#39;";
     }
   });
 }
 
-function clamp(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
+const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
-function plural(count, singular, pluralForm = `${singular}s`) {
-  return `${count} ${count === 1 ? singular : pluralForm}`;
-}
+const plural = (count, singular, pluralForm = `${singular}s`) =>
+  `${count} ${count === 1 ? singular : pluralForm}`;
+
+const pct = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
+const fixed = (value, digits = 3) => (Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "—");
 
 function formatBytes(bytes) {
+  if (!bytes) return "0 B";
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -59,8 +95,15 @@ function formatBytes(bytes) {
 function formatWhen(value) {
   if (!value) return "unknown time";
   const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return String(value);
-  return date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
+function debounce(fn, delay) {
+  let handle = null;
+  return (...args) => {
+    window.clearTimeout(handle);
+    handle = window.setTimeout(() => fn(...args), delay);
+  };
 }
 
 async function api(path, options = {}) {
@@ -70,18 +113,22 @@ async function api(path, options = {}) {
     try {
       const body = await response.json();
       if (body && body.detail) {
-        detail =
-          typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
       }
-    } catch {
-      // not JSON; keep the status text
-    }
+    } catch { /* keep the status text */ }
     const error = new Error(detail);
     error.status = response.status;
     throw error;
   }
+  if (response.status === 204) return null;
   return response.json();
 }
+
+const jsonRequest = (body) => ({
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
 
 function toast(message, kind = "") {
   const element = $("#toast");
@@ -89,195 +136,159 @@ function toast(message, kind = "") {
   element.className = `toast ${kind}`.trim();
   element.hidden = false;
   window.clearTimeout(state.toastTimer);
-  state.toastTimer = window.setTimeout(() => {
-    element.hidden = true;
-  }, 4600);
+  state.toastTimer = window.setTimeout(() => { element.hidden = true; }, 4600);
 }
 
-function setModelPill(kind, text) {
+function remember() {
+  try {
+    window.localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({ detector: state.detector, recognizer: state.recognizer }),
+    );
+  } catch { /* localStorage may be blocked */ }
+}
+
+function recall() {
+  try {
+    return JSON.parse(window.localStorage.getItem(STORAGE_KEY) || "null") || {};
+  } catch {
+    return {};
+  }
+}
+
+/* --------------------------------------------------------------- controls */
+
+function slider(id, outputId, value, formatter = (v) => Number(v).toFixed(2)) {
+  const input = $(`#${id}`);
+  input.value = String(value);
+  const update = () => { $(`#${outputId}`).textContent = formatter(input.value); };
+  input.addEventListener("input", update);
+  update();
+}
+
+function readNumber(id, fallback = 0) {
+  const value = Number($(`#${id}`).value);
+  return Number.isFinite(value) ? value : fallback;
+}
+
+function readSelection() {
+  return {
+    detector: $("#detector-select").value,
+    recognizer: $("#recognizer-select").value,
+    detSize: parseInt($("#det-size").value, 10),
+    tilingMode: $("#tiling-mode").value,
+    detThresh: readNumber("det-thresh", 0.35),
+    nmsThresh: readNumber("nms-thresh", 0.45),
+    acceptThreshold: readNumber("accept-threshold", 0.42),
+    reviewThreshold: readNumber("review-threshold", 0.34),
+    minMargin: readNumber("min-margin", 0.04),
+    minQuality: readNumber("min-quality", 0),
+    assignmentMode: $("#assignment-mode").value,
+    templateStrategy: $("#template-strategy").value,
+    fusionMode: $("#fusion-mode").value,
+    fusionK: readNumber("fusion-k", 2),
+    flipAug: $("#flip-aug").checked,
+    lowresAug: $("#lowres-aug").checked,
+    withQuality: $("#with-quality").checked,
+    withPose: $("#with-pose").checked,
+  };
+}
+
+/* ----------------------------------------------------------- model status */
+
+function setModelPill(kind, text, title = "") {
   const pill = $("#model-pill");
   pill.classList.remove("loading", "ready", "error");
   pill.classList.add(kind);
   $("#model-status").textContent = text;
+  pill.title = title;
 }
 
-function setAddError(message) {
-  const element = $("#add-error");
-  element.hidden = !message;
-  element.textContent = message || "";
-}
-
-function setScanError(message) {
-  const element = $("#scan-error");
-  element.hidden = !message;
-  element.textContent = message || "";
-}
-
-function updateActionState() {
-  const ready = state.modelReady && !state.busy;
-  $("#add-person-btn").disabled = !ready;
-  $("#scan-btn").disabled = !ready;
-  const reason = state.modelReady ? "" : "Waiting for the active model to load";
-  $("#add-person-btn").title = reason;
-  $("#scan-btn").title = reason;
-}
-
-function rememberModel(name) {
-  try {
-    window.localStorage.setItem(ACTIVE_MODEL_KEY, name);
-  } catch {
-    // localStorage can be blocked; the in-memory value still works.
+function fillSelect(select, entries, value, labelFor) {
+  select.innerHTML = "";
+  for (const entry of entries) {
+    const option = document.createElement("option");
+    option.value = entry.id;
+    const unavailable = entry.available === false;
+    option.textContent = `${labelFor(entry)}${unavailable ? " · unavailable" : ""}`;
+    option.disabled = unavailable;
+    select.append(option);
   }
-}
-
-function readRememberedModel() {
-  try {
-    return window.localStorage.getItem(ACTIVE_MODEL_KEY);
-  } catch {
-    return null;
+  if (value && !entries.some((entry) => entry.id === value)) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = value;
+    select.append(option);
   }
+  select.value = value;
 }
 
-async function loadState() {
-  try {
-    const data = await api("/api/state");
-    state.people = data.people;
-    state.settings = { ...state.settings, ...data.settings };
-    $("#ephemeral-banner").hidden = !state.settings.ephemeral;
-    $("#max-frames").textContent = state.settings.maxFrames;
-    $("#threshold").value = String(state.settings.threshold);
-    $("#threshold-value").textContent = Number(state.settings.threshold).toFixed(2);
-    const sizeSelect = $("#det-size");
-    const target = String(state.settings.detSize);
-    if (![...sizeSelect.options].some((option) => option.value === target)) {
-      const option = document.createElement("option");
-      option.value = target;
-      option.textContent = `${target} px`;
-      sizeSelect.append(option);
-    }
-    sizeSelect.value = target;
-    renderPeople();
-  } catch (error) {
-    toast(`Could not load roster: ${error.message}`, "error");
-  }
+function renderModelPickers() {
+  const { detectors, recognizers } = state.registry;
+  fillSelect($("#detector-select"), detectors, state.detector, (entry) => entry.label || entry.id);
+  fillSelect($("#recognizer-select"), recognizers, state.recognizer, (entry) => entry.label || entry.id);
+  const detectorEntry = detectors.find((entry) => entry.id === state.detector);
+  const recognizerEntry = recognizers.find((entry) => entry.id === state.recognizer);
+  $("#model-detect").textContent = detectorEntry?.label || state.detector;
+  $("#model-recognize").textContent = recognizerEntry?.label || state.recognizer;
+  $("#enroll-recognizer").textContent = recognizerEntry?.label || state.recognizer;
+  $("#scan-recognizer").textContent = recognizerEntry?.label || state.recognizer;
 }
 
-async function loadModels() {
+async function refreshModelStatus() {
+  setModelPill("loading", "Checking models…");
   try {
-    const data = await api("/api/models");
-    state.models = data.models || [];
-    if (!state.activeModel) {
-      state.activeModel = readRememberedModel() || data.defaultModel || "buffalo_l";
-    }
-    renderModels();
-  } catch (error) {
-    toast(`Could not list models: ${error.message}`, "error");
-  }
-}
-
-async function loadModel(name) {
-  setModelPill("loading", `${name} loading...`);
-  try {
-    const info = await api(`/api/model?name=${encodeURIComponent(name)}`);
-    state.modelInfo = info;
-    state.modelReady = Boolean(info.ready);
+    const info = await api(
+      `/api/model?detector=${encodeURIComponent(state.detector)}&recognizer=${encodeURIComponent(state.recognizer)}`,
+    );
     if (info.ready) {
-      const loadTime =
-        info.loadMs >= 30 ? ` · loaded in ${(info.loadMs / 1000).toFixed(1)}s` : "";
-      setModelPill("ready", `${info.name} · ready${loadTime}`);
-      $("#model-pill").title = `Model: ${info.path}`;
+      setModelPill(
+        "ready",
+        `${info.detector?.label || state.detector} · ready`,
+        `${info.detectorId} + ${info.recognizerId}`,
+      );
       $("#model-banner").hidden = true;
     } else {
-      setModelPill("error", `${info.name} unavailable`);
-      $("#model-pill").title = info.error || "Model unavailable";
+      setModelPill("error", "Models unavailable", info.error || "");
       $("#model-banner").hidden = false;
-      $("#model-banner").textContent = info.installed === false
-        ? `Model pack "${info.name}" is not installed. Run "python scripts/fetch_models.py --model ${info.name}" or add its ONNX files to the models directory.`
-        : `Face model could not load: ${info.error}`;
+      $("#model-banner").textContent = info.error || "The selected models could not load.";
     }
   } catch (error) {
-    state.modelReady = false;
-    setModelPill("error", "Model unavailable");
+    setModelPill("error", "Models unavailable", error.message);
     $("#model-banner").hidden = false;
-    $("#model-banner").textContent = `Face model could not load: ${error.message}`;
-  } finally {
-    updateActionState();
+    $("#model-banner").textContent = error.message;
   }
 }
 
-async function loadResults() {
-  try {
-    const data = await api("/api/results");
-    state.results = data.results || [];
-    renderHistory();
-  } catch (error) {
-    toast(`Could not load saved runs: ${error.message}`, "error");
-  }
+/* ---------------------------------------------------------------- roster */
+
+function personById(id) {
+  return state.people.find((person) => person.id === Number(id));
 }
 
-function selectModel(name) {
-  if (!name) return;
-  state.activeModel = name;
-  rememberModel(name);
-  $("#model-name").textContent = name;
-  $("#enroll-model").textContent = name;
-  $("#scan-model").textContent = name;
-  const select = $("#model-select");
-  if (select.value !== name) select.value = name;
-  renderModels();
-  updateActionState();
-  return loadModel(name);
-}
-
-function renderModels() {
-  const select = $("#model-select");
-  const models = state.models;
-  select.innerHTML = "";
-  for (const model of models) {
-    const option = document.createElement("option");
-    option.value = model.name;
-    option.textContent = model.installed ? model.name : `${model.name} · missing`;
-    select.append(option);
-  }
-  if (!models.some((model) => model.name === state.activeModel)) {
-    const option = document.createElement("option");
-    option.value = state.activeModel;
-    option.textContent = state.activeModel;
-    select.append(option);
-  }
-  select.value = state.activeModel;
-
+function renderModelUsage() {
   const list = $("#model-usage-list");
-  if (!models.length) {
-    list.innerHTML = `
-      <div class="empty small">
-        <strong>No model packs found</strong>
-        <span>Run <code>python scripts/fetch_models.py</code> to download one.</span>
-      </div>`;
+  const usage = {};
+  for (const person of state.people) {
+    for (const [recognizerId, count] of Object.entries(person.recognizers || {})) {
+      usage[recognizerId] = usage[recognizerId] || { templates: 0, people: 0 };
+      usage[recognizerId].templates += count;
+      usage[recognizerId].people += 1;
+    }
+  }
+  const ids = Object.keys(usage);
+  if (!ids.length) {
+    list.innerHTML = `<div class="empty small"><strong>No embeddings yet</strong><span>Enroll a student to create templates.</span></div>`;
     return;
   }
-
-  list.innerHTML = models
-    .map((model) => {
-      const active = model.name === state.activeModel;
-      const badges = [
-        model.default ? `<span class="badge default">default</span>` : "",
-        model.installed ? "" : `<span class="badge missing">missing</span>`,
-        active ? `<span class="badge active">active</span>` : "",
-      ].join("");
+  list.innerHTML = ids
+    .map((id) => {
+      const entry = state.registry.recognizers.find((item) => item.id === id);
+      const active = id === state.recognizer;
       return `
-        <div class="model-row${active ? " is-active" : ""}" data-model="${esc(model.name)}">
-          <div class="model-main">
-            <span class="model-name">${esc(model.name)}</span>
-            ${badges}
-          </div>
-          <div class="model-stats">
-            <b>${model.templates}</b> ${model.templates === 1 ? "template" : "templates"}
-            · <b>${model.people}</b> ${model.people === 1 ? "student" : "students"}
-          </div>
-          <button class="btn ghost small" type="button" data-action="use-model" ${active ? "disabled" : ""}>
-            ${active ? "Active" : "Use"}
-          </button>
+        <div class="model-row${active ? " is-active" : ""}">
+          <div class="model-main"><span class="model-name">${esc(entry?.label || id)}</span></div>
+          <div class="model-stats"><b>${usage[id].templates}</b> templates · <b>${usage[id].people}</b> students</div>
         </div>`;
     })
     .join("");
@@ -289,13 +300,10 @@ function renderPeople() {
   $("#student-count").textContent = String(state.people.length);
   const templates = state.people.reduce((total, person) => total + person.templates, 0);
   $("#template-total").textContent = plural(templates, "template");
+  renderModelUsage();
 
   if (!state.people.length) {
-    list.innerHTML = `
-      <li class="empty">
-        <strong>No students yet</strong>
-        <span>Add a name and one or more face photos to get started.</span>
-      </li>`;
+    list.innerHTML = `<li class="empty"><strong>No students yet</strong><span>Add a name and one or more face photos to get started.</span></li>`;
     return;
   }
 
@@ -305,26 +313,20 @@ function renderPeople() {
         ? person.photos
             .map(
               (photo) => `
-                <div class="thumb" title="${esc(photo.quality || "Face photo")} · ${esc(photo.model)}">
+                <div class="thumb" title="${esc(photo.quality || "Face photo")} · ${photo.recognizers?.length || 0} embedder(s)">
                   <img src="${esc(photo.url)}" alt="" loading="lazy">
-                  <span class="thumb-model">${esc(photo.model)}</span>
                   <button class="thumb-x" data-action="remove-photo" data-photo-id="${esc(photo.id)}" title="Remove this photo" type="button">×</button>
                 </div>`,
             )
             .join("")
         : `<div class="thumb-empty">No photos — add one before scanning.</div>`;
-
-      const modelBits = Object.entries(person.models || {})
-        .map(([name, count]) => `${esc(name)} ${count}`)
-        .join(" · ");
-
       return `
         <li class="person" data-id="${person.id}">
           <div class="person-top">
             <span class="num">${String(person.number).padStart(2, "0")}</span>
             <div class="person-title">
               <div class="person-name" title="Double-click to rename">${esc(person.name)}</div>
-              <div class="person-meta">${plural(person.templates, "face photo")}${modelBits ? ` · ${modelBits}` : ""}</div>
+              <div class="person-meta">${plural(person.templates, "face photo")}</div>
             </div>
             <div class="person-actions">
               <button class="btn ghost small" data-action="add-photos" type="button">+ Photos</button>
@@ -338,143 +340,174 @@ function renderPeople() {
     .join("");
 }
 
-function renderHistory() {
-  const list = $("#history-list");
-  const runs = state.results;
-  $("#history-count").textContent = plural(runs.length, "run");
-  if (!runs.length) {
-    list.innerHTML = `
-      <div class="empty small">
-        <strong>No saved runs yet</strong>
-        <span>Scan a classroom frame and the result is stored here.</span>
-      </div>`;
+async function addPerson(event) {
+  event.preventDefault();
+  const errorElement = $("#add-error");
+  errorElement.hidden = true;
+  if (!state.faceFiles.length) {
+    errorElement.hidden = false;
+    errorElement.textContent = "Add at least one face photo.";
+    return;
+  }
+  const button = $("#add-person-btn");
+  const original = button.textContent;
+  button.textContent = "Adding…";
+  state.busy = true;
+  const form = new FormData();
+  form.append("name", $("#person-name").value.trim());
+  form.append("recognizer", state.recognizer);
+  for (const file of state.faceFiles) form.append("images", file, file.name);
+  try {
+    const data = await api("/api/people", { method: "POST", body: form });
+    applyState(data.state);
+    state.faceFiles = [];
+    $("#person-name").value = "";
+    renderFaceFiles();
+    toast(`Student #${data.person.number} added (${data.person.name})`, "ok");
+  } catch (error) {
+    errorElement.hidden = false;
+    errorElement.textContent = error.message;
+  } finally {
+    state.busy = false;
+    button.textContent = original;
+  }
+}
+
+async function uploadPersonPhotos(personId, files) {
+  const form = new FormData();
+  form.append("recognizer", state.recognizer);
+  for (const file of files) form.append("images", file, file.name);
+  try {
+    const data = await api(`/api/people/${personId}/photos`, { method: "POST", body: form });
+    applyState(data.state);
+    toast(`Added ${plural(files.length, "photo")} to ${data.person.name}`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+async function handlePeopleClick(event) {
+  const actionElement = event.target.closest("[data-action]");
+  if (!actionElement) return;
+  const card = actionElement.closest(".person");
+  if (!card) return;
+  const personId = Number(card.dataset.id);
+  const action = actionElement.dataset.action;
+
+  if (action === "add-photos") { card.querySelector(".photo-input").click(); return; }
+
+  if (action === "remove-photo") {
+    try {
+      const data = await api(`/api/people/${personId}/photos/${actionElement.dataset.photoId}`, { method: "DELETE" });
+      applyState(data.state);
+      toast("Photo removed", "ok");
+    } catch (error) { toast(error.message, "error"); }
     return;
   }
 
-  list.innerHTML = runs
-    .map((run) => {
-      const current = state.scan && state.scan.scanId === run.scanId;
-      const thumb = run.thumbUrl
-        ? `<img src="${esc(run.thumbUrl)}" alt="" loading="lazy">`
-        : "";
-      return `
-        <div class="history-row${current ? " is-current" : ""}" data-scan="${esc(run.scanId)}">
-          <div class="history-thumb">${thumb}</div>
-          <div class="history-main">
-            <div class="history-title">
-              <span class="model-tag">${esc(run.model || "?")}</span>
-              <span class="muted">${esc(formatWhen(run.createdAt))}</span>
-            </div>
-            <div class="history-meta">
-              ${plural(run.facesDetected ?? 0, "face")} ·
-              ${run.matchedCount ?? 0} matched ·
-              ${plural(run.frames ?? 0, "frame")} ·
-              threshold ${Number(run.threshold ?? 0).toFixed(2)} ·
-              ${(Number(run.elapsedMs || 0) / 1000).toFixed(2)}s
-            </div>
-          </div>
-          <div class="history-actions">
-            <button class="btn ghost small" type="button" data-action="load-result">Load</button>
-            <a class="btn ghost small" href="/api/results/${encodeURIComponent(run.scanId)}" target="_blank" rel="noopener">JSON</a>
-            <button class="icon-btn" type="button" data-action="delete-result" title="Delete run">×</button>
-          </div>
-        </div>`;
-    })
-    .join("");
+  if (action === "remove-person") {
+    const person = personById(personId);
+    if (!person || !window.confirm(`Remove ${person.name} and all their face photos?`)) return;
+    try {
+      const data = await api(`/api/people/${personId}`, { method: "DELETE" });
+      applyState(data.state);
+      toast(`${person.name} removed`, "ok");
+    } catch (error) { toast(error.message, "error"); }
+  }
 }
 
-function renderFaceFiles() {
-  const wrap = $("#face-files");
+async function handlePeopleChange(event) {
+  if (!event.target.classList.contains("photo-input")) return;
+  const card = event.target.closest(".person");
+  const files = [...event.target.files];
+  event.target.value = "";
+  if (!card || !files.length) return;
+  await uploadPersonPhotos(Number(card.dataset.id), files);
+}
+
+async function handleRename(event) {
+  const nameElement = event.target.closest(".person-name");
+  if (!nameElement) return;
+  const card = nameElement.closest(".person");
+  const person = personById(card?.dataset.id);
+  if (!person) return;
+  const next = window.prompt("Rename student", person.name);
+  if (next === null) return;
+  const clean = next.trim();
+  if (!clean || clean === person.name) return;
+  try {
+    const data = await api(`/api/people/${person.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: clean }),
+    });
+    applyState(data.state);
+    toast("Student renamed", "ok");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function applyState(payload) {
+  if (payload.people) state.people = payload.people;
+  if (payload.registry) state.registry = payload.registry;
+  renderPeople();
+  renderModelPickers();
+  renderPresentPicker();
+  renderBenchOptions();
+}
+
+/* ------------------------------------------------------------ file chips */
+
+function renderFileChips(containerId, files, onRemove) {
+  const wrap = $(`#${containerId}`);
   wrap.innerHTML = "";
-  state.faceFiles.forEach((file, index) => {
+  files.forEach((file, index) => {
     const chip = document.createElement("div");
     chip.className = "file-chip";
-
     const image = document.createElement("img");
     const url = URL.createObjectURL(file);
     image.src = url;
     image.alt = "";
     image.onload = () => URL.revokeObjectURL(url);
     image.onerror = () => URL.revokeObjectURL(url);
-
     const label = document.createElement("span");
     label.textContent = file.name;
     label.title = `${file.name} · ${formatBytes(file.size)}`;
-
     const remove = document.createElement("button");
     remove.type = "button";
     remove.textContent = "×";
     remove.title = "Remove";
-    remove.addEventListener("click", () => {
-      state.faceFiles.splice(index, 1);
-      renderFaceFiles();
-    });
-
+    remove.addEventListener("click", () => onRemove(index));
     chip.append(image, label, remove);
     wrap.append(chip);
   });
 }
 
-function renderFrameFiles() {
-  const wrap = $("#frame-files");
-  wrap.innerHTML = "";
-  state.frameFiles.forEach((file, index) => {
-    const chip = document.createElement("div");
-    chip.className = "file-chip";
-
-    const image = document.createElement("img");
-    const url = URL.createObjectURL(file);
-    image.src = url;
-    image.alt = "";
-    image.onload = () => URL.revokeObjectURL(url);
-    image.onerror = () => URL.revokeObjectURL(url);
-
-    const label = document.createElement("span");
-    label.textContent = file.name;
-    label.title = `${file.name} · ${formatBytes(file.size)}`;
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.textContent = "×";
-    remove.title = "Remove";
-    remove.addEventListener("click", () => {
-      state.frameFiles.splice(index, 1);
-      renderFrameFiles();
-    });
-
-    chip.append(image, label, remove);
-    wrap.append(chip);
+const renderFaceFiles = () =>
+  renderFileChips("face-files", state.faceFiles, (index) => {
+    state.faceFiles.splice(index, 1);
+    renderFaceFiles();
   });
-}
 
-function addFaceFiles(files) {
+const renderFrameFiles = () =>
+  renderFileChips("frame-files", state.frameFiles, (index) => {
+    state.frameFiles.splice(index, 1);
+    renderFrameFiles();
+  });
+
+const renderDatasetFiles = () =>
+  renderFileChips("dataset-files", state.datasetFiles, (index) => {
+    state.datasetFiles.splice(index, 1);
+    renderDatasetFiles();
+  });
+
+function addFiles(bucket, files, limit, label) {
   const incoming = [...files].filter((file) => file.type.startsWith("image/"));
   if (!incoming.length) return;
-  const room = state.settings.maxPhotosPerUpload - state.faceFiles.length;
-  if (room <= 0) {
-    toast(`Up to ${state.settings.maxPhotosPerUpload} photos per upload`, "error");
-    return;
-  }
-  if (incoming.length > room) {
-    toast(`Only ${room} more photo(s) can be added to this upload`, "error");
-  }
-  state.faceFiles.push(...incoming.slice(0, room));
-  renderFaceFiles();
-}
-
-function addFrameFiles(files) {
-  const incoming = [...files].filter((file) => file.type.startsWith("image/"));
-  if (!incoming.length) return;
-  const room = state.settings.maxFrames - state.frameFiles.length;
-  if (room <= 0) {
-    toast(`Up to ${state.settings.maxFrames} frames per scan`, "error");
-    return;
-  }
-  if (incoming.length > room) {
-    toast(`Only ${room} more frame(s) can be added`, "error");
-  }
-  state.frameFiles.push(...incoming.slice(0, room));
-  renderFrameFiles();
+  const room = limit - bucket.files.length;
+  if (room <= 0) { toast(`Up to ${limit} ${label}`, "error"); return; }
+  if (incoming.length > room) toast(`Only ${room} more ${label} can be added`, "error");
+  bucket.files.push(...incoming.slice(0, room));
+  bucket.render();
 }
 
 function wireDropzone(dropzone, handler) {
@@ -494,253 +527,206 @@ function wireDropzone(dropzone, handler) {
   });
 }
 
-async function addPerson(event) {
-  event.preventDefault();
-  setAddError("");
-  if (!state.modelReady) {
-    setAddError(`The active model (${state.activeModel}) is still loading.`);
-    return;
-  }
-  if (!state.faceFiles.length) {
-    setAddError("Add at least one face photo.");
-    return;
-  }
+/* ------------------------------------------------------------------ scan */
 
-  const button = $("#add-person-btn");
-  const originalText = button.textContent;
-  state.busy = true;
-  updateActionState();
-  button.textContent = "Adding...";
-
+function scanForm() {
+  const selection = readSelection();
   const form = new FormData();
-  form.append("name", $("#person-name").value.trim());
-  form.append("model", state.activeModel);
-  for (const file of state.faceFiles) form.append("images", file, file.name);
-
-  try {
-    const data = await api("/api/people", { method: "POST", body: form });
-    state.people = data.state.people;
-    state.faceFiles = [];
-    $("#person-name").value = "";
-    renderFaceFiles();
-    renderPeople();
-    await loadModels();
-    setAddError("");
-    toast(`Student #${data.person.number} added (${data.person.name})`, "ok");
-  } catch (error) {
-    setAddError(error.message);
-    toast(error.message, "error");
-  } finally {
-    state.busy = false;
-    button.textContent = originalText;
-    updateActionState();
-  }
+  form.append("detector", selection.detector);
+  form.append("recognizer", selection.recognizer);
+  form.append("detSize", String(selection.detSize));
+  form.append("tilingMode", selection.tilingMode);
+  form.append("detThresh", String(selection.detThresh));
+  form.append("nmsThresh", String(selection.nmsThresh));
+  form.append("acceptThreshold", String(selection.acceptThreshold));
+  form.append("reviewThreshold", String(selection.reviewThreshold));
+  form.append("minMargin", String(selection.minMargin));
+  form.append("minQuality", String(selection.minQuality));
+  form.append("assignmentMode", selection.assignmentMode);
+  form.append("templateStrategy", selection.templateStrategy);
+  form.append("fusionMode", selection.fusionMode);
+  form.append("fusionK", String(selection.fusionK));
+  form.append("flipAug", String(selection.flipAug));
+  form.append("lowresAug", String(selection.lowresAug));
+  form.append("withQuality", String(selection.withQuality));
+  form.append("withPose", String(selection.withPose));
+  for (const file of state.frameFiles) form.append("images", file, file.name);
+  return form;
 }
 
-async function uploadPersonPhotos(personId, files) {
-  const form = new FormData();
-  form.append("model", state.activeModel);
-  for (const file of files) form.append("images", file, file.name);
+async function runScan() {
+  setBanner("#scan-error", "");
+  $("#scan-warnings").hidden = true;
+  if (!state.frameFiles.length) { setBanner("#scan-error", "Add at least one classroom frame."); return; }
+
+  const button = $("#scan-btn");
+  const original = button.textContent;
+  const status = $("#scan-status");
+  const startedAt = performance.now();
+  button.textContent = "Scanning…";
+  status.hidden = false;
   state.busy = true;
-  updateActionState();
+  const timer = window.setInterval(() => {
+    $("#scan-status-text").textContent =
+      `Analyzing ${plural(state.frameFiles.length, "frame")} · ${((performance.now() - startedAt) / 1000).toFixed(1)}s`;
+  }, 120);
+
   try {
-    const data = await api(`/api/people/${personId}/photos`, {
-      method: "POST",
-      body: form,
-    });
-    state.people = data.state.people;
-    renderPeople();
-    await loadModels();
+    const result = await api("/api/scan", { method: "POST", body: scanForm() });
+    state.scan = result;
+    state.liveSweep = null;
+    state.inspector = null;
+    state.selectedFrame = result.summary.bestIndex >= 0 ? result.summary.bestIndex : 0;
+    renderResults();
+    await loadResults();
     toast(
-      `Added ${plural(files.length, "photo")} to ${data.person.name} (${state.activeModel})`,
+      `Scanned ${plural(result.summary.frames, "frame")} · ${result.summary.facesDetected} faces · ${(result.summary.elapsedMs / 1000).toFixed(1)}s`,
       "ok",
     );
   } catch (error) {
+    setBanner("#scan-error", error.message);
     toast(error.message, "error");
   } finally {
+    window.clearInterval(timer);
+    status.hidden = true;
+    button.textContent = original;
     state.busy = false;
-    updateActionState();
   }
 }
 
-async function handlePeopleClick(event) {
-  const actionElement = event.target.closest("[data-action]");
-  if (!actionElement) return;
-  const card = actionElement.closest(".person");
-  if (!card) return;
-  const personId = Number(card.dataset.id);
-  const action = actionElement.dataset.action;
-
-  if (action === "add-photos") {
-    card.querySelector(".photo-input").click();
-    return;
-  }
-
-  if (action === "remove-photo") {
-    const photoId = actionElement.dataset.photoId;
-    try {
-      const data = await api(`/api/people/${personId}/photos/${photoId}`, {
-        method: "DELETE",
-      });
-      state.people = data.state.people;
-      renderPeople();
-      await loadModels();
-      toast("Photo removed", "ok");
-    } catch (error) {
-      toast(error.message, "error");
-    }
-    return;
-  }
-
-  if (action === "remove-person") {
-    const person = state.people.find((item) => item.id === personId);
-    if (!person) return;
-    if (!window.confirm(`Remove ${person.name} and all their face photos?`)) return;
-    try {
-      const data = await api(`/api/people/${personId}`, { method: "DELETE" });
-      state.people = data.state.people;
-      renderPeople();
-      await loadModels();
-      toast(`${person.name} removed`, "ok");
-    } catch (error) {
-      toast(error.message, "error");
-    }
-  }
-}
-
-async function handlePeopleChange(event) {
-  if (!event.target.classList.contains("photo-input")) return;
-  const card = event.target.closest(".person");
-  if (!card) return;
-  const personId = Number(card.dataset.id);
-  const files = [...event.target.files];
-  event.target.value = "";
-  if (!files.length) return;
-  await uploadPersonPhotos(personId, files);
-}
-
-async function handleRename(event) {
-  const nameElement = event.target.closest(".person-name");
-  if (!nameElement) return;
-  const card = nameElement.closest(".person");
-  if (!card) return;
-  const personId = Number(card.dataset.id);
-  const person = state.people.find((item) => item.id === personId);
-  if (!person) return;
-  const next = window.prompt("Rename student", person.name);
-  if (next === null) return;
-  const clean = next.trim();
-  if (!clean || clean === person.name) return;
+/* Re-score the loaded scan from cached embeddings — no inference. */
+async function liveSweep() {
+  if (!state.scan) return;
+  const selection = readSelection();
+  const payload = {
+    detector: state.scan.detectorId,
+    recognizer: state.scan.recognizerId,
+    det_size: state.scan.summary?.detSize || selection.detSize,
+    tiling_mode: state.scan.summary?.tilingMode || selection.tilingMode,
+    det_thresh: selection.detThresh,
+    nms_thresh: selection.nmsThresh,
+    flip_aug: state.scan.summary?.flipAug ?? selection.flipAug,
+    lowres_aug: state.scan.summary?.lowresAug ?? false,
+    with_quality: selection.withQuality,
+    with_pose: selection.withPose,
+    variant: state.scan.summary?.variant,
+    accept_threshold: selection.acceptThreshold,
+    review_threshold: selection.reviewThreshold,
+    min_margin: selection.minMargin,
+    assignment_mode: selection.assignmentMode,
+    template_strategy: selection.templateStrategy,
+    fusion_mode: selection.fusionMode,
+    k: Math.round(selection.fusionK),
+    min_quality: selection.minQuality,
+  };
   try {
-    const data = await api(`/api/people/${personId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: clean }),
-    });
-    state.people = data.state.people;
-    renderPeople();
-    toast("Student renamed", "ok");
+    const data = await api(`/api/results/${encodeURIComponent(state.scan.scanId)}/sweep`, jsonRequest(payload));
+    state.liveSweep = data;
+    const frames = state.scan.frames;
+    data.faces.forEach((faces, index) => { if (frames[index]) frames[index].faces = faces; });
+    state.scan.roster = Object.entries(data.students).map(([id, record]) => ({
+      personId: Number(id),
+      ...record,
+    }));
+    state.scan.summary.acceptThreshold = payload.accept_threshold;
+    state.scan.summary.reviewThreshold = payload.review_threshold;
+    state.scan.summary.minMargin = payload.min_margin;
+    state.scan.summary.assignmentMode = payload.assignment_mode;
+    state.scan.summary.fusionMode = payload.fusion_mode;
+    renderSummary();
+    renderRoster();
+    renderFrame();
+    toast("Re-scored from cache — no re-inference", "");
   } catch (error) {
-    toast(error.message, "error");
+    toast(`Live sweep needs a fresh scan: ${error.message}`, "error");
   }
+}
+
+const scheduleSweep = debounce(liveSweep, 220);
+
+/* --------------------------------------------------------------- results */
+
+function rosterRows(scan) {
+  if (scan.roster) {
+    return scan.roster.map((row) => {
+      const person = personById(row.personId);
+      return {
+        personId: row.personId,
+        number: person?.number ?? row.number ?? 0,
+        name: person?.name || row.name || `#${row.personId}`,
+        status: row.status === "absent" ? "absent" : row.status,
+        confidence: row.score ?? row.confidence ?? 0,
+        framesHit: row.frames_hit ?? row.framesHit ?? 0,
+      };
+    });
+  }
+  return scan.people || [];
 }
 
 function summaryCard(label, value, sub, kind = "") {
-  return `
-    <div class="summary-card ${kind}">
-      <div class="label">${esc(label)}</div>
-      <div class="value">${esc(value)}</div>
-      <div class="sub">${esc(sub)}</div>
-    </div>`;
+  return `<div class="summary-card ${kind}"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="sub">${esc(sub)}</div></div>`;
 }
 
-function renderResults() {
+function renderSummary() {
   const scan = state.scan;
   if (!scan) return;
   const summary = scan.summary;
+  const rows = rosterRows(scan);
+  const present = rows.filter((row) => row.status === "present").length;
+  const review = rows.filter((row) => row.status === "needs_review").length;
+  const unmatched = (scan.frames[state.selectedFrame]?.faces || []).filter((face) => face.status === "unmatched").length;
 
-  $("#results").hidden = false;
   $("#results-meta").textContent = [
-    scan.model || summary.model || "model",
-    plural(summary.frames, "frame"),
-    `threshold ${Number(summary.threshold).toFixed(2)}`,
-    `detector ${summary.detSize}px`,
-    `${(summary.elapsedMs / 1000).toFixed(2)}s`,
-    scan.createdAt ? formatWhen(scan.createdAt) : "",
-  ]
-    .filter(Boolean)
-    .join(" · ");
+    scan.summary?.detectorId || scan.detectorId,
+    "+",
+    scan.summary?.recognizerId || scan.recognizerId,
+    `· ${plural(summary.frames, "frame")}`,
+    `· accept ${fixed(summary.acceptThreshold, 2)}`,
+    `· det ${summary.detSize}px`,
+    `· ${(summary.elapsedMs / 1000).toFixed(2)}s`,
+  ].filter(Boolean).join(" ");
 
   $("#summary-grid").innerHTML = [
+    summaryCard("Present", present, `of ${plural(rows.length, "student")}`, present ? "good" : ""),
+    summaryCard("Review", review, "ambiguous matches", review ? "warn" : ""),
+    summaryCard("Faces", summary.facesDetected, `${unmatched} unknown in frame ${state.selectedFrame + 1}`),
     summaryCard(
-      "Faces detected",
-      summary.facesDetected,
-      `max in one frame · ${plural(summary.templateCount, "template")}`,
-    ),
-    summaryCard(
-      "Matched",
-      summary.matchedCount,
-      `of ${plural(summary.peopleCount, "student")}`,
-      summary.matchedCount ? "good" : "",
-    ),
-    summaryCard("Unknown", summary.unknown, "in the busiest frame", summary.unknown ? "bad" : ""),
-    summaryCard(
-      "Frames",
-      summary.frames,
-      `${summary.uploadedFrames} uploaded · ${plural(summary.templateCount, "template")} compared`,
+      "Latency",
+      `${(Number(summary.elapsedMs || 0) / 1000).toFixed(1)}s`,
+      `${plural(summary.frames, "frame")} · ${summary.cachedFrames || 0} cached`,
     ),
   ].join("");
-
-  renderMatches(scan);
-  renderFrameTabs(scan);
-  renderSelectedFrame();
-
-  const warnings = [...(scan.warnings || [])];
-  if (!scan.people.length) {
-    warnings.unshift(
-      `No students are enrolled for ${scan.model || summary.model}. Add students with that model active, or pick a model that has templates.`,
-    );
-  }
-  const warningElement = $("#scan-warnings");
-  warningElement.hidden = warnings.length === 0;
-  warningElement.textContent = warnings.join("\n");
 }
 
-function renderMatches(scan) {
-  const present = scan.people
-    .filter((person) => person.status === "Present")
-    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-  const absent = scan.people.filter((person) => person.status !== "Present");
+function renderRoster() {
+  const scan = state.scan;
+  if (!scan) return;
+  const rows = rosterRows(scan);
   const list = $("#matches-list");
-  $("#matched-count").textContent = `${present.length} present`;
+  const present = rows
+    .filter((row) => row.status === "present" || row.status === "needs_review")
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+  const absent = rows.filter((row) => row.status !== "present" && row.status !== "needs_review");
+  $("#matched-count").textContent = `${present.length} matched`;
 
-  if (!scan.people.length) {
-    list.innerHTML = `
-      <div class="empty">
-        <strong>No students enrolled for this model</strong>
-        <span>Faces are detected and counted, but cannot be identified yet.</span>
-      </div>`;
+  if (!rows.length) {
+    list.innerHTML = `<div class="empty"><strong>No students enrolled</strong><span>Faces are detected and counted, but cannot be identified yet.</span></div>`;
     $("#absent-wrap").innerHTML = "";
     return;
   }
-
   if (!present.length) {
-    list.innerHTML = `
-      <div class="empty">
-        <strong>No students matched</strong>
-        <span>Try lowering the threshold, adding clearer reference photos, or using a larger frame.</span>
-      </div>`;
+    list.innerHTML = `<div class="empty"><strong>No students matched</strong><span>Try lowering the accept threshold or enrolling clearer reference photos.</span></div>`;
   } else {
     list.innerHTML = present
       .map(
-        (person) => `
-          <div class="match-row" data-person-id="${person.personId}" title="${esc(person.name)}">
-            <span class="num sm">${String(person.number).padStart(2, "0")}</span>
+        (row) => `
+          <div class="match-row ${row.status}" data-person-id="${row.personId}" title="${esc(row.name)}">
+            <span class="num sm">${String(row.number).padStart(2, "0")}</span>
             <div class="match-main">
-              <div class="match-name">${esc(person.name)}</div>
-              <div class="bar"><span style="width:${Math.round(clamp(person.confidence || 0, 0, 1) * 100)}%"></span></div>
+              <div class="match-name">${esc(row.name)} <span class="status-tag ${row.status}">${row.status === "present" ? "present" : "review"}</span></div>
+              <div class="bar"><span style="width:${Math.round(clamp(row.confidence || 0, 0, 1) * 100)}%"></span></div>
             </div>
-            <span class="score">${Number(person.confidence || 0).toFixed(3)}</span>
+            <span class="score">${fixed(row.confidence, 3)}</span>
           </div>`,
       )
       .join("");
@@ -751,34 +737,16 @@ function renderMatches(scan) {
     row.addEventListener("mouseleave", () => setHighlight(null));
   }
 
-  if (absent.length) {
-    $("#absent-wrap").innerHTML = `
-      <details class="absent-block">
-        <summary><span>Not detected</span><span>${absent.length}</span></summary>
-        <div class="absent-list">
-          ${absent
-            .map(
-              (person) => `
-                <div class="absent-row">
-                  <span class="num">${String(person.number).padStart(2, "0")}</span>
-                  <span>${esc(person.name)}</span>
-                  <span>absent</span>
-                </div>`,
-            )
-            .join("")}
-        </div>
-      </details>`;
-  } else {
-    $("#absent-wrap").innerHTML = "";
-  }
+  $("#absent-wrap").innerHTML = absent.length
+    ? `<details class="absent-block"><summary><span>Absent / undetected</span><span>${absent.length}</span></summary><div class="absent-list">${absent
+        .map((row) => `<div class="absent-row"><span class="num">${String(row.number).padStart(2, "0")}</span><span>${esc(row.name)}</span><span>absent</span></div>`)
+        .join("")}</div></details>`
+    : "";
 }
 
-function renderFrameTabs(scan) {
-  state.selectedFrame = clamp(
-    state.selectedFrame,
-    0,
-    Math.max(0, scan.frames.length - 1),
-  );
+function renderFrameTabs() {
+  const scan = state.scan;
+  state.selectedFrame = clamp(state.selectedFrame, 0, Math.max(0, scan.frames.length - 1));
   const tabs = $("#frame-tabs");
   tabs.innerHTML = "";
   scan.frames.forEach((frame, index) => {
@@ -789,20 +757,25 @@ function renderFrameTabs(scan) {
     button.innerHTML = `Frame <b>${index + 1}</b> <span>${plural(frame.faces.length, "face")}</span>`;
     button.addEventListener("click", () => {
       state.selectedFrame = index;
-      renderSelectedFrame();
-      $$(".frame-tab", tabs).forEach((tab, tabIndex) => {
-        tab.classList.toggle("active", tabIndex === index);
-      });
+      state.inspector = null;
+      renderFrameTabs();
+      renderFrame();
+      renderSummary();
     });
     tabs.append(button);
   });
 }
 
-function renderSelectedFrame() {
+function faceClass(status) {
+  if (status === "present") return "matched";
+  if (status === "needs_review") return "review";
+  return "unknown";
+}
+
+function renderFrame() {
   const scan = state.scan;
   if (!scan || !scan.frames.length) return;
   const index = clamp(state.selectedFrame, 0, scan.frames.length - 1);
-  state.selectedFrame = index;
   const frame = scan.frames[index];
   const view = $("#frame-view");
   view.innerHTML = "";
@@ -810,53 +783,52 @@ function renderSelectedFrame() {
 
   const media = document.createElement("div");
   media.className = "frame-media";
-
   const image = document.createElement("img");
   image.src = frame.imageUrl;
   image.alt = `Classroom frame ${index + 1}`;
   image.draggable = false;
   media.append(image);
-
   const layer = document.createElement("div");
   layer.className = "box-layer";
   media.append(layer);
   view.append(media);
 
-  for (const face of frame.faces) {
+  frame.faces.forEach((face, faceIndex) => {
     const [x1, y1, x2, y2] = face.box;
     const left = clamp((x1 / frame.width) * 100, 0, 100);
     const top = clamp((y1 / frame.height) * 100, 0, 100);
     const width = clamp(((x2 - x1) / frame.width) * 100, 0, 100 - left);
     const height = clamp(((y2 - y1) / frame.height) * 100, 0, 100 - top);
-    if (width <= 0 || height <= 0) continue;
+    if (width <= 0 || height <= 0) return;
 
-    const box = document.createElement("div");
-    box.className = `face-box ${face.matched ? "matched" : "unknown"}`;
+    const box = document.createElement("button");
+    box.type = "button";
+    box.className = `face-box ${faceClass(face.status)}`;
     box.style.left = `${left}%`;
     box.style.top = `${top}%`;
     box.style.width = `${width}%`;
     box.style.height = `${height}%`;
     box.dataset.person = face.personId == null ? "" : String(face.personId);
-    box.title = face.matched
-      ? `${face.name} · confidence ${Number(face.confidence).toFixed(3)} · detector ${Number(face.detScore).toFixed(3)}`
-      : `Unknown · best similarity ${Number(face.confidence).toFixed(3)} · detector ${Number(face.detScore).toFixed(3)}`;
-
-    const tooSmallForLabel = !face.matched && (width < 8 || height < 8);
-    if (tooSmallForLabel) box.classList.add("compact");
-
+    box.dataset.face = String(faceIndex);
+    box.title = `${face.name || "Unknown"} · ${face.status} · score ${fixed(face.confidence)} · margin ${fixed(face.margin)} · ${face.sizeBucket || "?"}`;
+    if (width < 7 || height < 7) box.classList.add("compact");
     const label = document.createElement("span");
     label.className = "box-label";
-    label.textContent = face.matched
-      ? `${face.name} · ${Number(face.confidence).toFixed(2)}`
-      : `Unknown · ${Number(face.confidence).toFixed(2)}`;
+    const tag = face.status === "present" ? "" : face.status === "needs_review" ? "? " : "? ";
+    label.textContent = `${tag}${face.personId != null ? face.name : "Unknown"} · ${fixed(face.confidence, 2)}`;
     if (top < 7) label.classList.add("inside");
-    if (left > 62) label.classList.add("right");
+    if (left > 60) label.classList.add("right");
     box.append(label);
+    box.addEventListener("click", () => openInspector(faceIndex));
     layer.append(box);
-  }
+  });
 
-  $("#frame-meta").textContent = `${frame.sourceName || `frame ${index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}`;
-  $("#annotated-link").href = frame.annotatedUrl || "#";
+  $("#frame-meta").textContent =
+    `${frame.sourceName || `frame ${index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}` +
+    (frame.cached ? " · cached" : "");
+  const link = $("#annotated-link");
+  link.hidden = !frame.annotatedUrl;
+  link.href = frame.annotatedUrl || "#";
 }
 
 function setHighlight(personId) {
@@ -872,206 +844,728 @@ function setHighlight(personId) {
   }
 }
 
-async function runScan() {
-  setScanError("");
-  $("#scan-warnings").hidden = true;
-  if (!state.modelReady) {
-    setScanError(`The active model (${state.activeModel}) is still loading.`);
+function renderResults() {
+  const scan = state.scan;
+  $("#results").hidden = !scan;
+  $("#empty-results").hidden = Boolean(scan);
+  if (!scan) return;
+  renderSummary();
+  renderRoster();
+  renderFrameTabs();
+  renderFrame();
+
+  const warnings = [...(scan.warnings || [])];
+  if (scan.summary && scan.summary.templateCount === 0) {
+    warnings.unshift("No templates exist for this recognizer — enroll students with it active.");
+  }
+  const warningElement = $("#scan-warnings");
+  warningElement.hidden = warnings.length === 0;
+  warningElement.textContent = warnings.join("\n");
+}
+
+/* -------------------------------------------------------------- inspector */
+
+function topCandidatesHtml(candidates) {
+  if (!candidates?.length) return `<div class="muted small">no candidates</div>`;
+  return candidates
+    .map((candidate, index) => {
+      const name = candidate.name || personById(candidate.studentId)?.name || `#${candidate.studentId}`;
+      return `<div class="cand-row${index === 0 ? " best" : ""}"><span>${esc(name)}</span><span class="mono">${fixed(candidate.score)}</span></div>`;
+    })
+    .join("");
+}
+
+function openInspector(faceIndex) {
+  const frame = state.scan?.frames[state.selectedFrame];
+  const face = frame?.faces[faceIndex];
+  if (!face) return;
+  state.inspector = { faceIndex };
+  const wrap = $("#inspector");
+  wrap.hidden = false;
+
+  const pose = face.headPose
+    ? `yaw ${face.headPose.yaw}° · pitch ${face.headPose.pitch}° · roll ${face.headPose.roll}°`
+    : "not computed";
+  const qualityText = face.quality != null ? `${fixed(face.quality, 3)} (${face.qualitySource || "n/a"})` : "n/a";
+
+  $("#inspector-body").innerHTML = `
+    ${face.cropUrl ? `<img class="inspect-crop" src="${esc(face.cropUrl)}" alt="Aligned face crop">` : `<div class="inspect-crop placeholder">no aligned crop</div>`}
+    <div class="inspect-title">
+      <span class="status-tag ${face.status}">${esc(face.status)}</span>
+      <strong>${esc(face.name || "Unknown")}</strong>
+      <span class="muted">conf ${fixed(face.confidence)} · margin ${fixed(face.margin)}</span>
+    </div>
+    <div class="inspect-grid">
+      <div><span class="muted">Size bucket</span><b>${esc(face.sizeBucket || "?")}</b></div>
+      <div><span class="muted">Face height</span><b>${face.faceHeightPx != null ? Math.round(face.faceHeightPx) + " px" : "—"}</b></div>
+      <div><span class="muted">Detector score</span><b>${fixed(face.detScore)}</b></div>
+      <div><span class="muted">Quality</span><b>${esc(qualityText)}</b></div>
+      <div class="wide"><span class="muted">Head pose</span><b>${esc(pose)}</b></div>
+    </div>
+    <div class="inspect-section">
+      <span class="field-label">Top candidates</span>
+      <div class="cand-list">${topCandidatesHtml(face.topCandidates)}</div>
+    </div>
+    <div class="inspect-section">
+      <span class="field-label">Box (x1, y1, x2, y2)</span>
+      <div class="mono small">${face.box.map((value) => Math.round(value)).join(", ")}</div>
+    </div>`;
+  for (const box of $$(".face-box", $("#frame-view"))) {
+    box.classList.toggle("active", box.dataset.face === String(faceIndex));
+  }
+}
+
+function closeInspector() {
+  state.inspector = null;
+  $("#inspector").hidden = true;
+  for (const box of $$(".face-box")) box.classList.remove("active");
+}
+
+/* ------------------------------------------------------------- history */
+
+function renderHistory() {
+  const list = $("#history-list");
+  const runs = state.results;
+  $("#history-count").textContent = plural(runs.length, "run");
+  if (!runs.length) {
+    list.innerHTML = `<div class="empty small"><strong>No saved runs yet</strong><span>Scan a classroom frame and the result is stored here.</span></div>`;
     return;
   }
-  if (!state.frameFiles.length) {
-    setScanError("Add at least one classroom frame.");
-    return;
-  }
-
-  const button = $("#scan-btn");
-  const originalText = button.textContent;
-  const status = $("#scan-status");
-  const statusText = $("#scan-status-text");
-  const startedAt = performance.now();
-  state.busy = true;
-  updateActionState();
-  button.textContent = "Scanning...";
-  status.hidden = false;
-  statusText.textContent = `Analyzing ${plural(state.frameFiles.length, "frame")} at ${$("#det-size").value}px...`;
-
-  const timer = window.setInterval(() => {
-    const seconds = ((performance.now() - startedAt) / 1000).toFixed(1);
-    statusText.textContent = `Analyzing ${plural(state.frameFiles.length, "frame")} at ${$("#det-size").value}px · ${seconds}s`;
-  }, 120);
-
-  const form = new FormData();
-  form.append("model", state.activeModel);
-  for (const file of state.frameFiles) form.append("images", file, file.name);
-  form.append("threshold", $("#threshold").value);
-  form.append("detSize", $("#det-size").value);
-
-  try {
-    const result = await api("/api/scan", { method: "POST", body: form });
-    state.scan = result;
-    state.selectedFrame =
-      result.summary.bestIndex >= 0 ? result.summary.bestIndex : 0;
-    renderResults();
-    await loadResults();
-    renderHistory();
-    toast(
-      `Scanned ${plural(result.summary.frames, "frame")} with ${result.model} in ${(result.summary.elapsedMs / 1000).toFixed(1)}s`,
-      "ok",
-    );
-  } catch (error) {
-    setScanError(error.message);
-    toast(error.message, "error");
-  } finally {
-    window.clearInterval(timer);
-    status.hidden = true;
-    button.textContent = originalText;
-    state.busy = false;
-    updateActionState();
-  }
+  list.innerHTML = runs
+    .map((run) => {
+      const current = state.scan && state.scan.scanId === run.scanId;
+      const thumb = run.thumbUrl ? `<img src="${esc(run.thumbUrl)}" alt="" loading="lazy">` : "";
+      return `
+        <div class="history-row${current ? " is-current" : ""}" data-scan="${esc(run.scanId)}">
+          <div class="history-thumb">${thumb}</div>
+          <div class="history-main">
+            <div class="history-title">
+              <span class="model-tag">${esc((run.detectorId || "?").split(":").pop())}</span>
+              <span class="model-tag alt">${esc((run.recognizerId || run.model || "?").split(":").pop())}</span>
+              <span class="muted">${esc(formatWhen(run.createdAt))}</span>
+            </div>
+            <div class="history-meta">
+              ${plural(run.facesDetected ?? 0, "face")} · ${run.matchedCount ?? 0} matched · ${plural(run.frames ?? 0, "frame")} · ${(Number(run.elapsedMs || 0) / 1000).toFixed(2)}s
+            </div>
+          </div>
+          <div class="history-actions">
+            <button class="btn ghost small" type="button" data-action="load-result">Load</button>
+            <button class="icon-btn" type="button" data-action="delete-result" title="Delete run">×</button>
+          </div>
+        </div>`;
+    })
+    .join("");
 }
 
 async function loadResult(scanId) {
   try {
     const data = await api(`/api/results/${encodeURIComponent(scanId)}`);
     state.scan = data;
-    state.selectedFrame =
-      Number.isInteger(data.summary?.bestIndex) && data.summary.bestIndex >= 0
-        ? data.summary.bestIndex
-        : 0;
+    state.liveSweep = null;
+    state.inspector = null;
+    state.selectedFrame = Number.isInteger(data.summary?.bestIndex) && data.summary.bestIndex >= 0 ? data.summary.bestIndex : 0;
+    switchTab("attendance");
     renderResults();
     renderHistory();
-    $("#results").scrollIntoView({ behavior: "smooth", block: "start" });
-    toast(`Loaded saved run ${scanId}`, "ok");
-  } catch (error) {
-    toast(error.message, "error");
-  }
+    $("#results").scrollIntoView({ behavior: "smooth", block: "nearest" });
+    toast(`Loaded run ${scanId}`, "ok");
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function deleteResult(scanId) {
-  if (!window.confirm(`Delete saved run ${scanId}? The annotated frames are removed too.`)) {
-    return;
-  }
+  if (!window.confirm(`Delete saved run ${scanId}? The annotated frames are removed too.`)) return;
   try {
-    const data = await api(`/api/results/${encodeURIComponent(scanId)}`, {
-      method: "DELETE",
-    });
+    const data = await api(`/api/results/${encodeURIComponent(scanId)}`, { method: "DELETE" });
     state.results = data.results || [];
-    if (state.scan && state.scan.scanId === scanId) {
-      state.scan = null;
-      $("#results").hidden = true;
-      $("#scan-warnings").hidden = true;
-    }
+    if (state.scan?.scanId === scanId) { state.scan = null; state.inspector = null; renderResults(); }
     renderHistory();
     toast("Saved run deleted", "ok");
-  } catch (error) {
-    toast(error.message, "error");
-  }
+  } catch (error) { toast(error.message, "error"); }
 }
 
 async function handleHistoryClick(event) {
   const row = event.target.closest(".history-row");
   if (!row) return;
-  const scanId = row.dataset.scan;
-  const actionElement = event.target.closest("[data-action]");
-  const action = actionElement?.dataset.action;
+  const action = event.target.closest("[data-action]")?.dataset.action;
+  if (action === "delete-result") { await deleteResult(row.dataset.scan); return; }
+  await loadResult(row.dataset.scan);
+}
 
-  if (action === "delete-result") {
-    await deleteResult(scanId);
+/* --------------------------------------------------------------- datasets */
+
+function renderPresentPicker() {
+  const wrap = $("#dataset-present");
+  if (!wrap) return;
+  if (!state.people.length) {
+    wrap.innerHTML = `<div class="muted small">Enroll students first, then mark who is present.</div>`;
     return;
   }
-  if (action === "load-result" || !event.target.closest("a")) {
-    await loadResult(scanId);
+  wrap.innerHTML = state.people
+    .map((person) => {
+      const on = state.datasetPresent.has(person.id);
+      return `<button type="button" class="present-chip${on ? " on" : ""}" data-person="${person.id}">
+        <span class="num sm">${String(person.number).padStart(2, "0")}</span>${esc(person.name)}
+      </button>`;
+    })
+    .join("");
+}
+
+function renderDatasets() {
+  const list = $("#dataset-list");
+  $("#dataset-count").textContent = String(state.datasets.length);
+  $("#bench-dataset-count").textContent = String(state.datasets.length);
+  if (!state.datasets.length) {
+    list.innerHTML = `<div class="empty"><strong>No datasets yet</strong><span>Build one on the left to unlock calibrated benchmarks.</span></div>`;
+    return;
+  }
+  list.innerHTML = state.datasets
+    .map(
+      (dataset) => `
+      <div class="dataset-row" data-dataset="${esc(dataset.datasetId)}">
+        <div class="history-thumb">${dataset.thumbUrl ? `<img src="${esc(dataset.thumbUrl)}" alt="" loading="lazy">` : ""}</div>
+        <div class="history-main">
+          <div class="history-title"><strong>${esc(dataset.name)}</strong></div>
+          <div class="history-meta">${plural(dataset.frames, "frame")} · ${dataset.present} labelled present · ${dataset.annotatedBoxes} boxes · ${esc(formatWhen(dataset.createdAt))}</div>
+        </div>
+        <div class="history-actions">
+          <button class="btn ghost small" type="button" data-action="use-dataset">Benchmark</button>
+          <button class="icon-btn" type="button" data-action="delete-dataset" title="Delete dataset">×</button>
+        </div>
+      </div>`,
+    )
+    .join("");
+}
+
+async function createDataset(event) {
+  event.preventDefault();
+  const errorElement = $("#dataset-error");
+  errorElement.hidden = true;
+  if (!state.datasetFiles.length) {
+    errorElement.hidden = false;
+    errorElement.textContent = "Add at least one frame.";
+    return;
+  }
+  const button = $("#dataset-btn");
+  const original = button.textContent;
+  button.textContent = "Saving…";
+  const form = new FormData();
+  form.append("name", $("#dataset-name").value.trim());
+  form.append("notes", $("#dataset-notes").value.trim());
+  form.append("presentIds", JSON.stringify([...state.datasetPresent]));
+  const boxes = Object.values(state.datasetBoxes);
+  form.append("boxes", JSON.stringify(boxes));
+  for (const file of state.datasetFiles) form.append("images", file, file.name);
+  try {
+    const data = await api("/api/datasets", { method: "POST", body: form });
+    state.datasets = data.datasets || [];
+    state.datasetFiles = [];
+    state.datasetPresent = new Set();
+    state.datasetBoxes = {};
+    $("#dataset-name").value = "";
+    $("#dataset-notes").value = "";
+    renderDatasetFiles();
+    renderPresentPicker();
+    renderDatasets();
+    renderBenchDatasets();
+    toast(`Dataset saved (${data.dataset.frames.length} frames)`, "ok");
+  } catch (error) {
+    errorElement.hidden = false;
+    errorElement.textContent = error.message;
+  } finally {
+    button.textContent = original;
   }
 }
 
-async function resetPlayground() {
-  if (
-    !window.confirm(
-      "Clear all students, face templates, saved runs, and their frames? Model packs are kept.",
-    )
-  ) {
+async function handleDatasetListClick(event) {
+  const row = event.target.closest(".dataset-row");
+  if (!row) return;
+  const action = event.target.closest("[data-action]")?.dataset.action;
+  const datasetId = row.dataset.dataset;
+  if (action === "delete-dataset") {
+    if (!window.confirm("Delete this dataset and its frames?")) return;
+    try {
+      const data = await api(`/api/datasets/${encodeURIComponent(datasetId)}`, { method: "DELETE" });
+      state.datasets = data.datasets || [];
+      renderDatasets();
+      renderBenchDatasets();
+      toast("Dataset deleted", "ok");
+    } catch (error) { toast(error.message, "error"); }
     return;
   }
+  if (action === "use-dataset") {
+    switchTab("benchmark");
+    const input = $(`#bench-datasets input[value="${CSS.escape(datasetId)}"]`);
+    if (input) input.checked = true;
+  }
+}
+
+/* -------------------------------------------------------------- benchmark */
+
+function renderBenchOptions() {
+  const detectors = state.registry.detectors.filter((entry) => entry.available);
+  const recognizers = state.registry.recognizers.filter((entry) => entry.available);
+  $("#bench-detectors").innerHTML = detectors.length
+    ? detectors.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" checked><span>${esc(entry.label)}</span></label>`).join("")
+    : `<div class="muted small">No detectors installed.</div>`;
+  $("#bench-recognizers").innerHTML = recognizers.length
+    ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" checked><span>${esc(entry.label)}</span></label>`).join("")
+    : `<div class="muted small">No recognizers installed.</div>`;
+
+  const sizes = [...new Set([...(state.settings.benchmarkDetSizes || []), 640, 1024, 1280])].sort((a, b) => a - b);
+  $("#bench-det-sizes").innerHTML = sizes
+    .map((size) => `<label class="chip"><input type="checkbox" value="${size}" ${size === 640 || size === 1280 ? "checked" : ""}><span>${size}px</span></label>`)
+    .join("");
+  $("#bench-tilings").innerHTML = [
+    ["none", "Off"],
+    ["sahi_upper_band", "Upper band"],
+    ["sahi_full", "Full SAHI"],
+  ]
+    .map(([value, label]) => `<label class="chip"><input type="checkbox" value="${value}" ${value === "none" ? "checked" : ""}><span>${label}</span></label>`)
+    .join("");
+}
+
+function renderBenchDatasets() {
+  const wrap = $("#bench-datasets");
+  if (!wrap) return;
+  $("#bench-dataset-count").textContent = String(state.datasets.length);
+  if (!state.datasets.length) {
+    wrap.innerHTML = `<div class="muted small">No datasets yet — build one in the Datasets tab.</div>`;
+    return;
+  }
+  const current = new Set([...wrap.querySelectorAll("input:checked")].map((input) => input.value));
+  wrap.innerHTML = state.datasets
+    .map(
+      (dataset) =>
+        `<label class="check"><input type="checkbox" value="${esc(dataset.datasetId)}" ${current.has(dataset.datasetId) ? "checked" : ""}><span>${esc(dataset.name)} <span class="muted">${plural(dataset.frames, "frame")}</span></span></label>`,
+    )
+    .join("");
+}
+
+function checkedValues(containerId) {
+  return $$(`#${containerId} input:checked`).map((input) => input.value);
+}
+
+async function runBenchmark() {
+  const datasetIds = checkedValues("bench-datasets");
+  if (!datasetIds.length) { setBanner("#bench-error", "Select at least one dataset."); return; }
+  const detectors = checkedValues("bench-detectors");
+  const recognizers = checkedValues("bench-recognizers");
+  if (!detectors.length || !recognizers.length) { setBanner("#bench-error", "Select at least one detector and recognizer."); return; }
+
+  setBanner("#bench-error", "");
+  const acceptRaw = $("#bench-accept").value.trim();
+  const payload = {
+    dataset_ids: datasetIds,
+    detectors,
+    recognizers,
+    det_sizes: checkedValues("bench-det-sizes").map(Number),
+    tiling_modes: checkedValues("bench-tilings"),
+    det_thresh: readNumber("bench-det-thresh", 0.35),
+    nms_thresh: 0.45,
+    flip_aug: $("#bench-flip").checked,
+    lowres_aug: $("#bench-lowres").checked,
+    with_quality: $("#bench-quality").checked,
+    with_pose: $("#bench-pose").checked,
+    accept_threshold: acceptRaw ? Number(acceptRaw) : null,
+    review_threshold: readNumber("bench-review", 0.34),
+    min_margin: readNumber("bench-margin", 0.04),
+    assignment_mode: $("#bench-assignment").value,
+    fusion_mode: $("#bench-fusion").value,
+    k: 1,
+  };
+
+  const button = $("#bench-run-btn");
+  const original = button.textContent;
+  button.textContent = "Running…";
+  $("#bench-status").hidden = false;
+  const startedAt = performance.now();
+  const timer = window.setInterval(() => {
+    $("#bench-status-text").textContent = `Warming models and measuring… ${((performance.now() - startedAt) / 1000).toFixed(0)}s`;
+  }, 250);
+
+  try {
+    const run = await api("/api/benchmark/run", jsonRequest(payload));
+    state.benchmarkRun = run;
+    renderBenchmark(run);
+    await loadBenchmarks();
+    const ok = run.rows.filter((row) => !row.error).length;
+    toast(`Benchmark finished · ${ok}/${run.rows.length} combinations scored`, "ok");
+  } catch (error) {
+    setBanner("#bench-error", error.message);
+    toast(error.message, "error");
+  } finally {
+    window.clearInterval(timer);
+    $("#bench-status").hidden = true;
+    button.textContent = original;
+  }
+}
+
+function metricClass(value) {
+  if (value >= 0.9) return "good";
+  if (value >= 0.7) return "warn";
+  return "bad";
+}
+
+function renderBenchmark(run) {
+  $("#bench-row-count").textContent = String(run.rows.length);
+  const wrap = $("#bench-matrix");
+  if (!run.rows.length) {
+    wrap.innerHTML = `<div class="empty"><strong>No combinations</strong><span>Widen the grid and run again.</span></div>`;
+    return;
+  }
+  const rows = run.rows
+    .map((row, index) => {
+      if (row.error) {
+        return `<tr class="error-row"><td>${esc(row.detector.split(":").pop())}</td><td>${esc(row.recognizer.split(":").pop())}</td><td>${row.detSize ?? "—"}</td><td>${esc(row.tilingMode || "—")}</td><td colspan="7">${esc(row.error)}</td></tr>`;
+      }
+      const buckets = row.detection?.buckets || {};
+      const latency = row.latency || {};
+      const rec = row.metrics || {};
+      return `
+        <tr data-index="${index}">
+          <td title="${esc(row.detector)}">${esc(row.detector.split(":").pop())}</td>
+          <td title="${esc(row.recognizer)}">${esc(row.recognizer.split(":").pop())}</td>
+          <td>${row.detSize}</td>
+          <td>${esc(row.tilingMode)}</td>
+          <td class="mono ${metricClass(rec.f1)}">${fixed(rec.f1)}</td>
+          <td class="mono">${fixed(rec.precision)}</td>
+          <td class="mono">${fixed(rec.recall)}</td>
+          <td class="mono">${fixed(row.tauF1, 2)}</td>
+          <td class="mono" title="recall on large / medium / small faces">${fixed(buckets.large?.identification_recall)} / ${fixed(buckets.medium?.identification_recall)} / ${fixed(buckets.small?.identification_recall)}</td>
+          <td class="mono">${fixed(latency.detect_ms_p50, 0)}</td>
+          <td class="mono">${fixed(latency.total_inference_ms_p50, 0)}</td>
+        </tr>`;
+    })
+    .join("");
+
+  wrap.innerHTML = `
+    <table class="matrix">
+      <thead>
+        <tr>
+          <th>Detector</th><th>Recognizer</th><th>Res</th><th>Tiling</th>
+          <th>F1</th><th>Prec</th><th>Rec</th><th>τ*</th>
+          <th>L/M/S recall</th><th>det p50</th><th>total p50</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+
+  for (const tr of $$("tbody tr[data-index]", wrap)) {
+    tr.addEventListener("click", () => showBenchmarkRow(run.rows[Number(tr.dataset.index)], tr));
+  }
+}
+
+function curveSvg(curve) {
+  if (!curve?.length) return "";
+  const width = 520;
+  const height = 120;
+  const pad = 6;
+  const x = (index) => pad + (index / (curve.length - 1)) * (width - pad * 2);
+  const y = (value) => height - pad - value * (height - pad * 2);
+  const path = (key) =>
+    curve.map((point, index) => `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(clamp(point[key], 0, 1)).toFixed(1)}`).join(" ");
+  const bestIndex = curve.reduce((best, point, index) => (point.f1 > curve[best].f1 ? index : best), 0);
+  const best = curve[bestIndex];
+  return `
+    <svg class="curve" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="precision, recall, F1 vs threshold">
+      <line x1="${x(bestIndex)}" y1="${pad}" x2="${x(bestIndex)}" y2="${height - pad}" class="curve-marker" />
+      <path d="${path("precision")}" class="curve-line precision" />
+      <path d="${path("recall")}" class="curve-line recall" />
+      <path d="${path("f1")}" class="curve-line f1" />
+      <text x="${pad}" y="${height - 2}">τ=${fixed(curve[0].threshold, 2)}</text>
+      <text x="${width - pad}" y="${height - 2}" text-anchor="end">τ=${fixed(curve[curve.length - 1].threshold, 2)}</text>
+      <text x="${x(bestIndex)}" y="${pad + 10}" text-anchor="middle" class="curve-best">F1 ${fixed(best.f1)} @ ${fixed(best.threshold, 2)}</text>
+    </svg>
+    <div class="curve-legend"><span class="curve-key precision"></span>precision <span class="curve-key recall"></span>recall <span class="curve-key f1"></span>F1</div>`;
+}
+
+function showBenchmarkRow(row, tr) {
+  for (const other of $$("tbody tr")) other.classList.remove("selected");
+  tr?.classList.add("selected");
+  const detail = $("#bench-detail");
+  detail.hidden = false;
+  if (row.error) {
+    detail.innerHTML = `<div class="bench-detail-head"><strong>${esc(row.detector)}</strong> + <strong>${esc(row.recognizer)}</strong></div><div class="banner error">${esc(row.error)}</div>`;
+    return;
+  }
+  const buckets = row.detection?.buckets || {};
+  const reading = (key) =>
+    ["large", "medium", "small"]
+      .map((name) => `<div class="bucket"><span class="muted">${name}</span><b class="mono">${fixed(buckets[name]?.[key])}</b><span class="muted small">${buckets[name]?.gt || 0} gt</span></div>`)
+      .join("");
+  detail.innerHTML = `
+    <div class="bench-detail-head">
+      <strong>${esc(row.detector)}</strong> + <strong>${esc(row.recognizer)}</strong>
+      <span class="muted">${row.detSize}px · ${esc(row.tilingMode)} · ${esc(row.variant)} · ${esc(row.assignmentMode)}</span>
+    </div>
+    <div class="inspect-grid">
+      <div><span class="muted">Best F1</span><b>${fixed(row.bestF1)}</b></div>
+      <div><span class="muted">τ* (F1)</span><b>${fixed(row.tauF1, 2)}</b></div>
+      <div><span class="muted">τ (FAR=0)</span><b>${row.far0 ? fixed(row.far0.threshold, 2) : "—"}</b></div>
+      <div><span class="muted">τ (P≥0.98)</span><b>${row.prec98 ? fixed(row.prec98.threshold, 2) : "—"}</b></div>
+      <div><span class="muted">Detected / expected</span><b>${row.facesDetected} / ${row.expectedFaces}</b></div>
+      <div><span class="muted">Latency p50 / p95</span><b>${fixed(row.latency?.total_inference_ms_p50, 0)} / ${fixed(row.latency?.total_inference_ms_p95, 0)} ms</b></div>
+    </div>
+    ${curveSvg(row.curve)}
+    <div class="inspect-section">
+      <span class="field-label">Identification recall by face size</span>
+      <div class="bucket-row">${reading("identification_recall")}</div>
+    </div>
+    <div class="inspect-section">
+      <span class="field-label">Detection recall by face size</span>
+      <div class="bucket-row">${reading("detection_recall")}</div>
+    </div>`;
+  detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function loadBenchmarks() {
+  try {
+    const data = await api("/api/benchmarks");
+    state.benchmarks = data.benchmarks || [];
+    renderBenchmarkHistory();
+  } catch (error) { toast(error.message, "error"); }
+}
+
+function renderBenchmarkHistory() {
+  const list = $("#bench-history");
+  $("#bench-history-count").textContent = plural(state.benchmarks.length, "run");
+  if (!state.benchmarks.length) {
+    list.innerHTML = `<div class="empty small"><strong>No benchmark runs yet</strong><span>Configure a grid and run it.</span></div>`;
+    return;
+  }
+  list.innerHTML = state.benchmarks
+    .map((run) => {
+      const config = run.config || {};
+      return `
+        <div class="history-row" data-run="${esc(run.runId)}">
+          <div class="history-main">
+            <div class="history-title"><strong>${esc(run.runId)}</strong><span class="muted">${esc(formatWhen(run.createdAt))}</span></div>
+            <div class="history-meta">${run.rows} rows · ${(config.detectors || []).length} detectors × ${(config.recognizers || []).length} recognizers · ${(config.detSizes || []).join("/")}px</div>
+          </div>
+          <div class="history-actions"><button class="btn ghost small" type="button" data-action="load-run">Load</button></div>
+        </div>`;
+    })
+    .join("");
+}
+
+async function handleBenchHistoryClick(event) {
+  const row = event.target.closest(".history-row");
+  if (!row) return;
+  try {
+    const run = await api(`/api/benchmarks/${encodeURIComponent(row.dataset.run)}`);
+    state.benchmarkRun = run;
+    renderBenchmark(run);
+    toast(`Loaded benchmark ${run.runId}`, "ok");
+  } catch (error) { toast(error.message, "error"); }
+}
+
+/* ------------------------------------------------------------- tab + reset */
+
+function switchTab(name) {
+  for (const tab of $$("#tabs .tab")) tab.classList.toggle("active", tab.dataset.tab === name);
+  for (const panel of $$(".workspace[data-panel]")) panel.hidden = panel.dataset.panel !== name;
+  if (name === "datasets") { renderDatasets(); renderPresentPicker(); }
+  if (name === "benchmark") { renderBenchDatasets(); renderBenchOptions(); }
+}
+
+function setBanner(selector, message) {
+  const element = $(selector);
+  element.hidden = !message;
+  element.textContent = message || "";
+}
+
+async function resetEverything() {
+  if (!window.confirm("Clear all students, scans, datasets, and results? Model packs are kept.")) return;
   try {
     const data = await api("/api/reset", { method: "POST" });
     state.people = data.state.people;
+    state.scan = null;
+    state.results = [];
+    state.datasets = [];
+    state.benchmarks = [];
     state.faceFiles = [];
     state.frameFiles = [];
-    state.scan = null;
+    state.datasetFiles = [];
+    state.datasetPresent = new Set();
+    state.benchmarkRun = null;
     state.selectedFrame = 0;
-    state.results = [];
-    $("#person-name").value = "";
-    $("#results").hidden = true;
-    $("#scan-warnings").hidden = true;
-    setAddError("");
-    setScanError("");
     renderFaceFiles();
     renderFrameFiles();
+    renderDatasetFiles();
     renderPeople();
+    renderModelPickers();
     renderHistory();
-    await loadModels();
-    toast("Reset: roster, results, and frames cleared", "ok");
-  } catch (error) {
-    toast(error.message, "error");
-  }
+    renderResults();
+    renderDatasets();
+    renderBenchDatasets();
+    renderBenchmarkHistory();
+    $("#bench-matrix").innerHTML = "";
+    $("#bench-detail").hidden = true;
+    await loadDatasets();
+    toast("Reset: everything cleared", "ok");
+  } catch (error) { toast(error.message, "error"); }
 }
 
+/* ------------------------------------------------------------------- load */
+
+function applySettings(settings) {
+  if (!settings) return;
+  state.settings = { ...state.settings, ...settings };
+  $("#max-frames").textContent = state.settings.maxFrames;
+  $("#det-size").value = String(state.settings.detSize);
+  $("#tiling-mode").value = state.settings.tilingMode;
+  $("#det-thresh").value = String(state.settings.detThresh);
+  $("#nms-thresh").value = String(state.settings.nmsThresh);
+  $("#accept-threshold").value = String(state.settings.acceptThreshold);
+  $("#review-threshold").value = String(state.settings.reviewThreshold);
+  $("#min-margin").value = String(state.settings.minMargin);
+  $("#min-quality").value = String(state.settings.minFaceQuality);
+  $("#assignment-mode").value = state.settings.assignmentMode;
+  $("#template-strategy").value = state.settings.templateStrategy;
+  $("#fusion-mode").value = state.settings.fusionMode;
+  $("#fusion-k").value = String(state.settings.fusionK);
+  for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality"]) {
+    $(`#${id}`).dispatchEvent(new Event("input"));
+  }
+  $("#ephemeral-banner").hidden = !state.settings.ephemeral;
+}
+
+async function loadState() {
+  const data = await api("/api/state");
+  state.people = data.people || [];
+  if (data.registry) state.registry = data.registry;
+  applySettings(data.settings);
+  renderPeople();
+  renderModelPickers();
+  renderPresentPicker();
+}
+
+async function loadModels() {
+  const data = await api("/api/models");
+  state.packs = data.packs || [];
+  if (data.detectors) state.registry.detectors = data.detectors;
+  if (data.recognizers) state.registry.recognizers = data.recognizers;
+  const remembered = recall();
+  const available = (entry) => entry.available;
+  state.detector =
+    (remembered.detector && state.registry.detectors.some((entry) => entry.id === remembered.detector) && remembered.detector) ||
+    state.settings.defaultDetector ||
+    state.registry.detectors.find(available)?.id ||
+    state.registry.detectors[0]?.id;
+  state.recognizer =
+    (remembered.recognizer && state.registry.recognizers.some((entry) => entry.id === remembered.recognizer) && remembered.recognizer) ||
+    state.settings.defaultRecognizer ||
+    state.registry.recognizers.find(available)?.id ||
+    state.registry.recognizers[0]?.id;
+  renderModelPickers();
+  renderModelUsage();
+  renderBenchOptions();
+}
+
+async function loadResults() {
+  const data = await api("/api/results");
+  state.results = data.results || [];
+  renderHistory();
+}
+
+async function loadDatasets() {
+  const data = await api("/api/datasets");
+  state.datasets = data.datasets || [];
+  renderDatasets();
+  renderBenchDatasets();
+}
+
+/* ------------------------------------------------------------- wire + init */
+
 function wireEvents() {
+  $("#tabs").addEventListener("click", (event) => {
+    const tab = event.target.closest(".tab");
+    if (tab) switchTab(tab.dataset.tab);
+  });
+
   $("#add-person-form").addEventListener("submit", addPerson);
   $("#face-input").addEventListener("change", (event) => {
-    addFaceFiles(event.target.files);
+    addFiles({ files: state.faceFiles, render: renderFaceFiles }, event.target.files, state.settings.maxPhotosPerUpload, "photos per upload");
     event.target.value = "";
   });
   $("#frame-input").addEventListener("change", (event) => {
-    addFrameFiles(event.target.files);
+    addFiles({ files: state.frameFiles, render: renderFrameFiles }, event.target.files, state.settings.maxFrames, "frames");
     event.target.value = "";
   });
-  $("#threshold").addEventListener("input", (event) => {
-    $("#threshold-value").textContent = Number(event.target.value).toFixed(2);
+  $("#dataset-input").addEventListener("change", (event) => {
+    addFiles({ files: state.datasetFiles, render: renderDatasetFiles }, event.target.files, state.settings.maxFrames, "frames");
+    event.target.value = "";
   });
-  $("#model-select").addEventListener("change", (event) => {
-    selectModel(event.target.value);
+  wireDropzone($("#face-drop"), (files) => addFiles({ files: state.faceFiles, render: renderFaceFiles }, files, state.settings.maxPhotosPerUpload, "photos per upload"));
+  wireDropzone($("#frame-drop"), (files) => addFiles({ files: state.frameFiles, render: renderFrameFiles }, files, state.settings.maxFrames, "frames"));
+  wireDropzone($("#dataset-drop"), (files) => addFiles({ files: state.datasetFiles, render: renderDatasetFiles }, files, state.settings.maxFrames, "frames"));
+
+  for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode", "flip-aug", "lowres-aug"]) {
+    $(`#${id}`).addEventListener("change", scheduleSweep);
+  }
+
+  $("#detector-select").addEventListener("change", () => {
+    state.detector = $("#detector-select").value;
+    remember();
+    renderModelPickers();
+    refreshModelStatus();
   });
-  $("#model-usage-list").addEventListener("click", (event) => {
-    const row = event.target.closest(".model-row");
-    if (!row) return;
-    if (!event.target.closest("[data-action]")) return;
-    selectModel(row.dataset.model);
+  $("#recognizer-select").addEventListener("change", () => {
+    state.recognizer = $("#recognizer-select").value;
+    remember();
+    renderModelPickers();
+    refreshModelStatus();
   });
+
   $("#scan-btn").addEventListener("click", runScan);
-  $("#reset-btn").addEventListener("click", resetPlayground);
+  $("#reset-btn").addEventListener("click", resetEverything);
+  $("#inspector-close").addEventListener("click", closeInspector);
+
   $("#people-list").addEventListener("click", handlePeopleClick);
   $("#people-list").addEventListener("change", handlePeopleChange);
   $("#people-list").addEventListener("dblclick", handleRename);
   $("#history-list").addEventListener("click", handleHistoryClick);
-  wireDropzone($("#face-drop"), addFaceFiles);
-  wireDropzone($("#frame-drop"), addFrameFiles);
+
+  $("#dataset-form").addEventListener("submit", createDataset);
+  $("#dataset-present").addEventListener("click", (event) => {
+    const chip = event.target.closest(".present-chip");
+    if (!chip) return;
+    const id = Number(chip.dataset.person);
+    if (state.datasetPresent.has(id)) state.datasetPresent.delete(id);
+    else state.datasetPresent.add(id);
+    renderPresentPicker();
+  });
+  $("#dataset-list").addEventListener("click", handleDatasetListClick);
+
+  $("#bench-run-btn").addEventListener("click", runBenchmark);
+  $("#bench-history").addEventListener("click", handleBenchHistoryClick);
 }
 
 async function init() {
   wireEvents();
-  renderPeople();
+  slider("det-thresh", "det-thresh-value", 0.35);
+  slider("nms-thresh", "nms-thresh-value", 0.45);
+  slider("accept-threshold", "accept-threshold-value", 0.42);
+  slider("review-threshold", "review-threshold-value", 0.34);
+  slider("min-margin", "min-margin-value", 0.04);
+  slider("min-quality", "min-quality-value", 0.0);
   renderFaceFiles();
   renderFrameFiles();
+  renderDatasetFiles();
+  renderPresentPicker();
   renderHistory();
-  updateActionState();
+  renderResults();
 
-  await loadState();
-  await loadModels();
-  await loadResults();
-
-  const remembered = readRememberedModel();
-  const installed = state.models.filter((model) => model.installed).map((model) => model.name);
-  const initial =
-    (remembered && state.models.some((model) => model.name === remembered) && remembered) ||
-    (state.settings.defaultModel && state.models.some((m) => m.name === state.settings.defaultModel)
-      ? state.settings.defaultModel
-      : null) ||
-    installed[0] ||
-    state.models[0]?.name ||
-    state.activeModel;
-
-  selectModel(initial);
+  try {
+    await loadState();
+    await loadModels();
+    await loadResults();
+    await loadDatasets();
+    await loadBenchmarks();
+    await refreshModelStatus();
+  } catch (error) {
+    toast(`Startup problem: ${error.message}`, "error");
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

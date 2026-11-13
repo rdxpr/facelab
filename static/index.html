@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>FaceLab · face-model harness</title>
+    <title>FaceLab · model benchmark harness</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
@@ -19,20 +19,25 @@
           <div>
             <h1>FaceLab</h1>
             <p>
-              InsightFace <span id="model-name">buffalo_l</span>
+              Detector <span id="model-detect">SCRFD</span>
+              <span class="dot-sep">+</span>
+              recognizer <span id="model-recognize">ArcFace</span>
               <span class="dot-sep">/</span>
-              model testing harness
+              benchmark harness
             </p>
           </div>
         </div>
+
+        <nav class="tabs" id="tabs" aria-label="Workspace">
+          <button class="tab active" data-tab="attendance" type="button">Attendance</button>
+          <button class="tab" data-tab="benchmark" type="button">Benchmark</button>
+          <button class="tab" data-tab="datasets" type="button">Datasets</button>
+        </nav>
+
         <div class="top-actions">
-          <label class="model-picker" for="model-select">
-            <span class="model-picker-label">Active model</span>
-            <select id="model-select" class="input model-select"></select>
-          </label>
           <div id="model-pill" class="pill loading">
             <span class="pill-dot"></span>
-            <span id="model-status">Loading model...</span>
+            <span id="model-status">Loading models…</span>
           </div>
           <button id="reset-btn" class="btn ghost small" type="button">Reset</button>
         </div>
@@ -40,11 +45,12 @@
 
       <div id="model-banner" class="banner error" hidden></div>
       <div id="ephemeral-banner" class="banner info" hidden>
-        Ephemeral storage: enrolled photos, scans, and results are wiped whenever
-        this server restarts.
+        Ephemeral storage: enrolled photos, scans, datasets, and results are wiped
+        whenever this server restarts.
       </div>
 
-      <main class="workspace">
+      <!-- ============================= ATTENDANCE ============================= -->
+      <main class="workspace" id="panel-attendance" data-panel="attendance">
         <section class="pane" aria-labelledby="students-title">
           <div class="pane-head">
             <div class="step">1</div>
@@ -80,7 +86,7 @@
 
               <div id="face-files" class="file-chips"></div>
               <div class="enroll-note">
-                Enrolls under <b id="enroll-model">buffalo_l</b>
+                Enrolls under <b id="enroll-recognizer">ArcFace</b>
               </div>
               <div id="add-error" class="inline-error" hidden></div>
 
@@ -90,7 +96,7 @@
             </form>
 
             <div class="list-head">
-              <span>Models</span>
+              <span>Recognizer coverage</span>
               <span class="muted">templates per model</span>
             </div>
             <div id="model-usage-list" class="model-usage-list"></div>
@@ -103,12 +109,12 @@
           </div>
         </section>
 
-        <section class="pane" aria-labelledby="scan-title">
+        <section class="pane" id="scan-pane" aria-labelledby="scan-title">
           <div class="pane-head">
             <div class="step">2</div>
             <div class="pane-title">
               <h2 id="scan-title">Classroom scan</h2>
-              <p>Upload one or more frames. Every face is matched against the active model's templates.</p>
+              <p>Pick a detector + recognizer pair, tune the thresholds, then scan.</p>
             </div>
           </div>
 
@@ -126,72 +132,150 @@
 
               <div id="frame-files" class="file-chips"></div>
 
-              <div class="controls">
-                <div class="control">
-                  <label for="threshold">
-                    Match threshold <output id="threshold-value">0.50</output>
-                  </label>
-                  <input
-                    id="threshold"
-                    type="range"
-                    min="0.20"
-                    max="0.90"
-                    step="0.01"
-                    value="0.50"
-                  />
-                  <p class="hint">Lower finds more matches; higher is stricter.</p>
-                </div>
-
-                <div class="control narrow">
-                  <label for="det-size">Detector size</label>
+              <div class="field-grid">
+                <label class="stacked">
+                  <span class="field-label">Detector</span>
+                  <select id="detector-select" class="input"></select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Recognizer</span>
+                  <select id="recognizer-select" class="input"></select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Detection resolution</span>
                   <select id="det-size" class="input">
                     <option value="640">640 px</option>
                     <option value="960">960 px</option>
                     <option value="1280" selected>1280 px</option>
                     <option value="1600">1600 px</option>
                   </select>
-                  <p class="hint">Bigger recovers smaller faces, but is slower.</p>
-                </div>
-
-                <button id="scan-btn" class="btn primary scan-btn" type="button">
-                  Scan classroom
-                </button>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Tiling (SAHI)</span>
+                  <select id="tiling-mode" class="input">
+                    <option value="none">Off — full frame</option>
+                    <option value="sahi_upper_band">Upper band (back rows)</option>
+                    <option value="sahi_full">Full image</option>
+                  </select>
+                </label>
               </div>
 
+              <div class="controls two-col">
+                <div class="control">
+                  <label for="det-thresh">Detection threshold <output id="det-thresh-value">0.35</output></label>
+                  <input id="det-thresh" type="range" min="0.05" max="0.9" step="0.01" value="0.35" />
+                </div>
+                <div class="control">
+                  <label for="nms-thresh">NMS IoU <output id="nms-thresh-value">0.45</output></label>
+                  <input id="nms-thresh" type="range" min="0.1" max="0.9" step="0.01" value="0.45" />
+                </div>
+                <div class="control">
+                  <label for="accept-threshold">Accept threshold <output id="accept-threshold-value">0.42</output></label>
+                  <input id="accept-threshold" type="range" min="0.10" max="0.95" step="0.01" value="0.42" />
+                </div>
+                <div class="control">
+                  <label for="review-threshold">Review threshold <output id="review-threshold-value">0.34</output></label>
+                  <input id="review-threshold" type="range" min="0.05" max="0.90" step="0.01" value="0.34" />
+                </div>
+                <div class="control">
+                  <label for="min-margin">Min top1–top2 margin <output id="min-margin-value">0.04</output></label>
+                  <input id="min-margin" type="range" min="0.00" max="0.30" step="0.01" value="0.04" />
+                </div>
+                <div class="control">
+                  <label for="min-quality">Min face quality <output id="min-quality-value">0.00</output></label>
+                  <input id="min-quality" type="range" min="0.00" max="1.00" step="0.01" value="0.00" />
+                </div>
+              </div>
+
+              <div class="field-grid">
+                <label class="stacked">
+                  <span class="field-label">Assignment</span>
+                  <select id="assignment-mode" class="input">
+                    <option value="hungarian">Hungarian (one-to-one)</option>
+                    <option value="greedy">Greedy (best-first)</option>
+                    <option value="margin">Independent (per face)</option>
+                  </select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Template strategy</span>
+                  <select id="template-strategy" class="input">
+                    <option value="top_k_mean">Top-k mean</option>
+                    <option value="max">Max</option>
+                    <option value="mean">Mean</option>
+                    <option value="prototype">Prototype</option>
+                  </select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Multi-frame fusion</span>
+                  <select id="fusion-mode" class="input">
+                    <option value="k_of_n_voting">k-of-n voting</option>
+                    <option value="max_with_margin_gate">Max + margin gate</option>
+                    <option value="quality_weighted_embedding_cluster">Quality-weighted cluster</option>
+                  </select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Votes required (k)</span>
+                  <input id="fusion-k" class="input" type="number" min="1" max="12" step="1" value="2" />
+                </label>
+              </div>
+
+              <div class="toggle-row">
+                <label class="toggle">
+                  <input id="flip-aug" type="checkbox" checked />
+                  <span>Flip augmentation</span>
+                </label>
+                <label class="toggle">
+                  <input id="lowres-aug" type="checkbox" />
+                  <span>Low-res augmentation</span>
+                </label>
+                <label class="toggle">
+                  <input id="with-quality" type="checkbox" checked />
+                  <span>Quality score</span>
+                </label>
+                <label class="toggle">
+                  <input id="with-pose" type="checkbox" />
+                  <span>Head pose</span>
+                </label>
+              </div>
+
+              <button id="scan-btn" class="btn primary scan-btn" type="button">
+                Scan classroom
+              </button>
+
               <div class="enroll-note">
-                Matches <b id="scan-model">buffalo_l</b> templates only · results saved automatically
+                Matches <b id="scan-recognizer">ArcFace</b> templates only · results are cached for instant sweeps
               </div>
 
               <div id="scan-status" class="scan-status" hidden>
                 <span class="spinner"></span>
-                <span id="scan-status-text">Analyzing...</span>
+                <span id="scan-status-text">Analyzing…</span>
               </div>
               <div id="scan-error" class="banner error" hidden></div>
               <div id="scan-warnings" class="banner warn" hidden></div>
             </div>
+          </div>
+        </section>
 
+        <section class="pane" id="results-pane" aria-labelledby="results-title">
+          <div class="pane-head">
+            <div class="step">3</div>
+            <div class="pane-title">
+              <h2 id="results-title">Results</h2>
+              <p id="results-meta">Scan a classroom frame to see matches here.</p>
+            </div>
+            <a id="annotated-link" class="btn ghost small" target="_blank" rel="noopener" hidden>
+              Open annotated
+            </a>
+          </div>
+
+          <div class="pane-scroll">
             <section id="results" class="results" hidden>
-              <div class="results-head">
-                <div>
-                  <h3>Scan result</h3>
-                  <p id="results-meta" class="muted"></p>
-                </div>
-                <a
-                  id="annotated-link"
-                  class="btn ghost small"
-                  target="_blank"
-                  rel="noopener"
-                >
-                  Open annotated
-                </a>
-              </div>
-
               <div id="summary-grid" class="summary-grid"></div>
 
               <div class="results-body">
                 <div class="matches-col">
                   <div class="list-head">
-                    <span>Matched students</span>
+                    <span>Roster</span>
                     <span id="matched-count" class="muted"></span>
                   </div>
                   <div id="matches-list" class="matches-list"></div>
@@ -203,10 +287,16 @@
                   <div id="frame-view" class="frame-view"></div>
                   <div id="frame-meta" class="frame-meta muted"></div>
                   <div class="legend">
-                    <span class="legend-item"><i class="swatch matched"></i>matched</span>
+                    <span class="legend-item"><i class="swatch matched"></i>present</span>
+                    <span class="legend-item"><i class="swatch review"></i>review</span>
                     <span class="legend-item"><i class="swatch unknown"></i>unknown</span>
                   </div>
                 </div>
+              </div>
+
+              <div id="empty-results" class="empty">
+                <strong>No scan loaded</strong>
+                <span>Upload frames and press “Scan classroom”, or load a saved run below.</span>
               </div>
             </section>
 
@@ -219,10 +309,171 @@
             </section>
           </div>
         </section>
+
+        <aside id="inspector" class="inspector" hidden aria-label="Face inspector">
+          <div class="inspector-head">
+            <h3>Face inspector</h3>
+            <button id="inspector-close" class="icon-btn" type="button" title="Close">×</button>
+          </div>
+          <div id="inspector-body" class="inspector-body"></div>
+        </aside>
+      </main>
+
+      <!-- ============================= BENCHMARK ============================= -->
+      <main class="workspace" id="panel-benchmark" data-panel="benchmark" hidden>
+        <section class="pane" aria-labelledby="bench-setup-title">
+          <div class="pane-head">
+            <div class="step">1</div>
+            <div class="pane-title">
+              <h2 id="bench-setup-title">Benchmark setup</h2>
+              <p>Choose datasets, the model grid, and the operating parameters.</p>
+            </div>
+          </div>
+          <div class="pane-scroll">
+            <div class="list-head"><span>Datasets</span><span id="bench-dataset-count" class="muted">0</span></div>
+            <div id="bench-datasets" class="check-list"></div>
+
+            <div class="list-head"><span>Detectors</span><span class="muted">installed only</span></div>
+            <div id="bench-detectors" class="check-list"></div>
+
+            <div class="list-head"><span>Recognizers</span><span class="muted">installed only</span></div>
+            <div id="bench-recognizers" class="check-list"></div>
+
+            <div class="list-head"><span>Grid</span><span class="muted">resolution × tiling</span></div>
+            <div id="bench-det-sizes" class="chip-check"></div>
+            <div id="bench-tilings" class="chip-check"></div>
+
+            <details class="advanced" open>
+              <summary>Parameters</summary>
+              <div class="field-grid">
+                <label class="stacked">
+                  <span class="field-label">Accept threshold <span id="bench-accept-hint">auto</span></span>
+                  <input id="bench-accept" class="input" type="number" min="0.05" max="0.95" step="0.01" placeholder="auto (calibrated)" />
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Review threshold</span>
+                  <input id="bench-review" class="input" type="number" min="0.05" max="0.9" step="0.01" value="0.34" />
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Min margin</span>
+                  <input id="bench-margin" class="input" type="number" min="0" max="0.3" step="0.01" value="0.04" />
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Detector threshold</span>
+                  <input id="bench-det-thresh" class="input" type="number" min="0.05" max="0.9" step="0.01" value="0.35" />
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Assignment</span>
+                  <select id="bench-assignment" class="input">
+                    <option value="hungarian">Hungarian</option>
+                    <option value="greedy">Greedy</option>
+                    <option value="margin">Independent</option>
+                  </select>
+                </label>
+                <label class="stacked">
+                  <span class="field-label">Fusion</span>
+                  <select id="bench-fusion" class="input">
+                    <option value="k_of_n_voting">k-of-n voting</option>
+                    <option value="max_with_margin_gate">Max + margin gate</option>
+                    <option value="quality_weighted_embedding_cluster">Quality-weighted cluster</option>
+                  </select>
+                </label>
+              </div>
+              <div class="toggle-row">
+                <label class="toggle"><input id="bench-flip" type="checkbox" checked /><span>Flip avg</span></label>
+                <label class="toggle"><input id="bench-lowres" type="checkbox" /><span>Low-res aug</span></label>
+                <label class="toggle"><input id="bench-quality" type="checkbox" checked /><span>Quality</span></label>
+                <label class="toggle"><input id="bench-pose" type="checkbox" /><span>Pose</span></label>
+              </div>
+            </details>
+
+            <button id="bench-run-btn" class="btn primary scan-btn" type="button">Run benchmark</button>
+            <div id="bench-status" class="scan-status" hidden>
+              <span class="spinner"></span>
+              <span id="bench-status-text">Running…</span>
+            </div>
+            <div id="bench-error" class="banner error" hidden></div>
+          </div>
+        </section>
+
+        <section class="pane" aria-labelledby="bench-matrix-title">
+          <div class="pane-head">
+            <div class="step">2</div>
+            <div class="pane-title">
+              <h2 id="bench-matrix-title">Model matrix</h2>
+              <p>Calibrated F1, precision, recall, size-stratified recall, and latency.</p>
+            </div>
+            <span id="bench-row-count" class="count">0</span>
+          </div>
+          <div class="pane-scroll">
+            <div id="bench-matrix" class="matrix-wrap"></div>
+            <div id="bench-detail" class="bench-detail" hidden></div>
+
+            <section class="history">
+              <div class="list-head">
+                <span>Saved benchmark runs</span>
+                <span id="bench-history-count" class="muted">0</span>
+              </div>
+              <div id="bench-history" class="history-list"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+
+      <!-- ============================= DATASETS ============================= -->
+      <main class="workspace" id="panel-datasets" data-panel="datasets" hidden>
+        <section class="pane" aria-labelledby="dataset-add-title">
+          <div class="pane-head">
+            <div class="step">1</div>
+            <div class="pane-title">
+              <h2 id="dataset-add-title">Build a dataset</h2>
+              <p>Frames plus the students actually present — the ground truth benchmarks calibrate against.</p>
+            </div>
+          </div>
+          <div class="pane-scroll">
+            <form id="dataset-form" class="add-card">
+              <label class="field-label" for="dataset-name">Name</label>
+              <input id="dataset-name" class="input" type="text" maxlength="120" placeholder="e.g. Room 204 · morning" autocomplete="off" />
+
+              <label class="field-label" for="dataset-present">Present students</label>
+              <div id="dataset-present" class="present-picker"></div>
+
+              <label class="field-label" for="dataset-notes">Notes <span>(optional)</span></label>
+              <input id="dataset-notes" class="input" type="text" maxlength="500" placeholder="lighting, camera, row layout…" autocomplete="off" />
+
+              <label id="dataset-drop" class="dropzone" for="dataset-input">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h1.2l1-1.5h6.6l1 1.5h1.2A2.5 2.5 0 0 1 20 8.5v8A2.5 2.5 0 0 1 17.5 19h-11A2.5 2.5 0 0 1 4 16.5v-8Z" />
+                  <circle cx="12" cy="12.5" r="3.2" />
+                </svg>
+                <strong>Drop ground-truth frames</strong>
+                <span>the labelled students above are assumed present</span>
+                <input id="dataset-input" type="file" accept="image/*" multiple hidden />
+              </label>
+              <div id="dataset-files" class="file-chips"></div>
+              <div id="dataset-error" class="inline-error" hidden></div>
+              <button id="dataset-btn" class="btn primary" type="submit">Save dataset</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="pane" aria-labelledby="dataset-list-title">
+          <div class="pane-head">
+            <div class="step">2</div>
+            <div class="pane-title">
+              <h2 id="dataset-list-title">Datasets</h2>
+              <p>Reusable ground-truth sets. Sweeps never re-upload images.</p>
+            </div>
+            <span id="dataset-count" class="count">0</span>
+          </div>
+          <div class="pane-scroll">
+            <div id="dataset-list" class="dataset-list"></div>
+          </div>
+        </section>
       </main>
 
       <footer>
-        Standalone harness · each run is saved as JSON under <code>results/</code> via <code>/api/results</code>
+        Standalone harness · scans cached under <code>.data/cache</code> · benchmarks under <code>.data/benchmarks</code>
       </footer>
     </div>
 
