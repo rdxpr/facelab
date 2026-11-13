@@ -1,11 +1,21 @@
 """Configuration for the standalone FaceLab tool.
 
 All settings can be overridden with ``FACELAB_``-prefixed environment variables,
-for example ``FACELAB_DATA_DIR=/tmp/data`` on an ephemeral host.
+for example ``FACELAB_ENV=prod`` on a server.
+
+Storage modes:
+
+* ``FACELAB_ENV=dev`` (the default) keeps the roster, reference photos, frames,
+  and results in ``./.data`` so they survive restarts.
+* Any other ``env`` value stores them in an ephemeral directory that is wiped on
+  every start, so uploaded photos and generated results are never persisted.
+  Set ``FACELAB_EPHEMERAL_DATA=false`` to opt back into persistence.
 """
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 from pathlib import Path
 
 from pydantic import model_validator
@@ -29,6 +39,12 @@ class Settings(BaseSettings):
     # Where model packs (``models/<name>/*.onnx``) and runtime data live.
     models_dir: Path = BASE_DIR / "models"
     data_dir: Path = BASE_DIR / ".data"
+
+    # Ephemeral storage. ``None`` means "on whenever env != dev". When on,
+    # ``data_dir`` is replaced by ``ephemeral_dir`` and that directory is wiped
+    # at startup, so reference photos, frames, and results never persist.
+    ephemeral_data: bool | None = None
+    ephemeral_dir: Path = Path(tempfile.gettempdir()) / "facelab"
 
     # The default InsightFace model pack. Any pack present in ``models_dir`` can
     # be selected from the UI or API.
@@ -55,11 +71,20 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _resolve_paths(self) -> "Settings":
-        for field in ("models_dir", "data_dir"):
+        for field in ("models_dir", "data_dir", "ephemeral_dir"):
             path = getattr(self, field)
             if not path.is_absolute():
                 setattr(self, field, (BASE_DIR / path).resolve())
+        if self.ephemeral:
+            self.data_dir = self.ephemeral_dir
         return self
+
+    @property
+    def ephemeral(self) -> bool:
+        """Whether uploads/results are discarded on every start."""
+        if self.ephemeral_data is not None:
+            return self.ephemeral_data
+        return self.env.strip().lower() != "dev"
 
     @property
     def allowed_module_list(self) -> list[str]:
@@ -95,6 +120,25 @@ class Settings(BaseSettings):
         ):
             folder.mkdir(parents=True, exist_ok=True)
 
+    def prepare_dirs(self) -> None:
+        """Create storage directories, clearing data first in ephemeral mode."""
+        if self.ephemeral:
+            # Guarantee a clean slate on every process start, but never wipe an
+            # obviously wrong target (a typo in FACELAB_EPHEMERAL_DIR).
+            target = self.data_dir.resolve()
+            unsafe = {
+                Path(target.anchor),
+                Path.home().resolve(),
+                Path(tempfile.gettempdir()).resolve(),
+            }
+            if target in unsafe or target == BASE_DIR or BASE_DIR.is_relative_to(target):
+                raise RuntimeError(
+                    f"Refusing to clear ephemeral data dir {target}. "
+                    "Set FACELAB_EPHEMERAL_DIR to a dedicated directory."
+                )
+            shutil.rmtree(target, ignore_errors=True)
+        self.ensure_dirs()
+
 
 settings = Settings()
-settings.ensure_dirs()
+settings.prepare_dirs()

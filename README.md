@@ -1,9 +1,3 @@
----
-title: FaceLab
-sdk: docker
-app_port: 7860
----
-
 # FaceLab
 
 A standalone harness for **testing face-detection / recognition models** and
@@ -27,15 +21,16 @@ reference photo → embedding   →    frames → faces → match against
 - **Multiple models.** Every model pack in `models/<name>/` is selectable.
   Reference photos enroll under a model; scans only match templates for the
   selected model, so results from different models never mix.
-- **Structured results.** Each scan is written to
-  `.data/results/<scanId>.json` and served over the API, alongside the original
-  and annotated frames.
+- **Structured results.** Each scan is written under the data directory
+  (`./.data/results/<scanId>.json` in dev) and served over the API, alongside
+  the original and annotated frames.
 - **Offline-friendly models.** Weights are too large for git (GitHub rejects
   files over 100 MB), so `scripts/fetch_models.py` downloads them on demand and
   the local copy under `models/` is reused.
-- **Deployable.** Ships with a `Dockerfile`. The hosted image keeps everything
-  in `/tmp` (ephemeral) so photos and results are never persisted, while local
-  development keeps persistent storage.
+- **Storage modes.** Local development persists the roster, photos, and results
+  in `./.data`. When `FACELAB_ENV` is anything other than `dev`, uploads and
+  results go to an ephemeral directory that is wiped on every start, so nothing
+  about real people is retained on a server.
 
 ## Quick start (local)
 
@@ -86,8 +81,9 @@ extra ONNX files in a pack are ignored.
 2. **Scan.** Upload one or more classroom frames. Detection runs at the chosen
    detector size, faces are matched against the active model's templates with a
    greedy best-score assignment, and the busiest frame is annotated.
-3. **Reuse.** The run is saved to `.data/results/<scanId>.json` and listed under
-   *Saved runs*. Reload any run, open its JSON, or delete it.
+3. **Reuse.** The run is saved under the data directory (`./.data/results/...`
+   in dev) and listed under *Saved runs*. Reload any run, open its JSON, or
+   delete it.
 
 Legacy rosters (from before models existed) are treated as belonging to the
 default model pack.
@@ -145,7 +141,10 @@ most useful ones:
 | Variable | Default | Notes |
 | -------- | ------- | ----- |
 | `FACELAB_MODELS_DIR` | `./models` | One subfolder per model pack |
-| `FACELAB_DATA_DIR` | `./.data` | Roster, frames, and results |
+| `FACELAB_ENV` | `dev` | Any non-`dev` value enables ephemeral storage |
+| `FACELAB_EPHEMERAL_DATA` | auto | Force ephemeral (`true`) or persistent (`false`) |
+| `FACELAB_EPHEMERAL_DIR` | system temp `/facelab` | Where ephemeral data lives |
+| `FACELAB_DATA_DIR` | `./.data` | Persistent roster/frames/results (dev mode) |
 | `FACELAB_DEFAULT_MODEL` | `buffalo_l` | Used when a request omits `model` |
 | `FACELAB_ALLOWED_MODULES` | `detection,recognition` | Empty loads every model in a pack |
 | `FACELAB_FACE_DET_SIZE` | `640` | Enrollment detector size |
@@ -154,49 +153,50 @@ most useful ones:
 | `FACELAB_RESULTS_TO_KEEP` | `50` | Saved run JSONs retained |
 | `FACELAB_CORS_ORIGINS` | `*` | Comma-separated allowlist for the parent app |
 
-## Hosting on Hugging Face Spaces
+## Running on a server
 
-This repo is ready to run as a **Docker** Space. Create one at
-[huggingface.co/new-space](https://huggingface.co/new-space) with the **Docker**
-SDK, then push this repo to the Space's git remote or upload the files — the
-image builds automatically. Spaces reads its config from the YAML front matter
-at the top of this README (`sdk: docker`, `app_port: 7860`).
+`FACELAB_ENV` decides whether uploads survive a restart:
 
-### Hosted is ephemeral, local is persistent
+| `FACELAB_ENV` | Data location | Behaviour |
+| ------------- | ------------- | --------- |
+| `dev` (default) | `./.data` | Roster, photos, frames, and results persist |
+| anything else (e.g. `prod`) | `FACELAB_EPHEMERAL_DIR` (default `<system temp>/facelab`) | Directory is wiped on every start |
 
-The container image stores everything under `/tmp`:
+So a server started with `FACELAB_ENV=prod` keeps **no reference photos, scans,
+or results** across restarts — only the model weights under `./models` remain.
+Override the behaviour explicitly if you want something different:
 
-- `FACELAB_DATA_DIR=/tmp/data` — roster, reference photos, frames, results
-- `FACELAB_MODELS_DIR=/tmp/models` — downloaded ONNX packs
+```bash
+FACELAB_ENV=prod FACELAB_EPHEMERAL_DATA=false ./run.sh   # persist despite prod
+FACELAB_ENV=dev  FACELAB_EPHEMERAL_DATA=true  ./run.sh   # wipe despite dev
+```
 
-`/tmp` is wiped on every restart, so on a hosted Space **reference photos,
-scans, and results are never persisted** and each cold start begins from a clean
-slate. The model pack is re-downloaded from GitHub on the first boot (~1 minute).
+Set `FACELAB_HOST=0.0.0.0` (and optionally `PORT`) when running behind a reverse
+proxy or in a container. `scripts/start.sh` does this for you.
 
-Local development is unaffected: `./run.sh` uses the persistent `./models` and
-`./.data` directories.
+> **Privacy.** There is no authentication: anyone who can reach the port can
+> enroll faces, view results, or call `/api/reset`. Keep it on localhost or a
+> private network, or put an auth proxy in front of it. The InsightFace
+> pretrained models are licensed for non-commercial research use.
 
-> **Privacy.** Public Spaces have no authentication: anyone with the URL can
-> enroll faces, view results, or call `/api/reset`. Do not upload real people's
-> faces to a public Space — make the Space private or add auth first. The
-> InsightFace pretrained models are licensed for non-commercial research use.
+### Docker
 
-The free CPU tier (2 vCPU, 16 GB RAM, 50 GB disk) runs `buffalo_l` at 960 px
-comfortably. The server binds `0.0.0.0` and listens on `7860` (the image sets
-`PORT=7860`).
-
-### Run the container locally
+The image sets `FACELAB_ENV=prod`, `FACELAB_HOST=0.0.0.0`, and `PORT=8010`, so
+it is ephemeral by default.
 
 ```bash
 docker build -t facelab .
 
-# Ephemeral, like a Space:
-docker run --rm -p 7860:7860 facelab
+# Ephemeral: photos and results vanish when the container restarts.
+docker run --rm -p 8010:8010 facelab
 
-# Persistent: override the storage paths and mount volumes.
-docker run --rm -p 7860:7860 \
-  -e FACELAB_DATA_DIR=/data -e FACELAB_MODELS_DIR=/models \
-  -v facelab-data:/data -v facelab-models:/models facelab
+# Persistent: opt out of ephemeral storage and mount a volume for the data.
+docker run --rm -p 8010:8010 \
+  -e FACELAB_EPHEMERAL_DATA=false -e FACELAB_DATA_DIR=/data \
+  -v facelab-data:/data facelab
+
+# Keep downloaded model weights between container restarts (~326 MB).
+docker run --rm -p 8010:8010 -v facelab-models:/app/models facelab
 ```
 
 ## Project layout
@@ -211,8 +211,8 @@ scripts/
   fetch_models.py   Download model packs from the InsightFace model zoo
   start.sh          Container entrypoint (fetch model, then serve)
 models/<pack>/      ONNX weights (git-ignored, fetched on demand)
-.data/              Roster, frames, results (git-ignored, local runtime data)
-Dockerfile          Container image (libGL for OpenCV, ephemeral /tmp storage)
+.data/              Roster, frames, results (git-ignored, dev runtime data)
+Dockerfile          Container image (libGL for OpenCV, prod/ephemeral defaults)
 ```
 
 ## Notes

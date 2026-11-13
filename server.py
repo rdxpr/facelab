@@ -218,6 +218,9 @@ def _public_state() -> dict:
             "maxPhotosPerPerson": settings.max_photos_per_person,
             "defaultModel": settings.default_model,
             "modelsDir": str(settings.models_dir),
+            "env": settings.env,
+            "ephemeral": settings.ephemeral,
+            "dataDir": str(settings.data_dir),
         },
     }
 
@@ -898,8 +901,8 @@ def main() -> None:
     default_host = os.environ.get("FACELAB_HOST") or os.environ.get("HOST")
     default_port = os.environ.get("FACELAB_PORT") or os.environ.get("PORT")
     if default_host is None:
-        # Hugging Face Spaces / most PaaS expose the service on PORT and need
-        # the server on 0.0.0.0.
+        # Containers and PaaS deployments expose the server on PORT and need
+        # it on 0.0.0.0.
         default_host = "0.0.0.0" if default_port else "127.0.0.1"
 
     parser = argparse.ArgumentParser(description="FaceLab face-model playground")

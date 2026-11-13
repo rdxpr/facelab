@@ -1,10 +1,9 @@
-# FaceLab container image — runs on Hugging Face Spaces (Docker SDK) and
-# anywhere else Docker runs.
+# FaceLab container image — for self-hosting (a VPS, or any Docker host).
 #
-# Hosted instances are EPHEMERAL on purpose: data and models live under /tmp,
-# which is wiped on every restart, so enrolled photos and results are never
-# persisted. Local development keeps persistent storage (./models and ./.data)
-# through run.sh.
+# The image runs with FACELAB_ENV=prod, so uploaded photos and generated
+# results go to an ephemeral directory (see FACELAB_EPHEMERAL_DIR) that is
+# wiped on every start. Model weights are fetched to ./models on first boot;
+# mount a volume at /app/models if you want to keep them between restarts.
 FROM python:3.11-slim
 
 ENV PYTHONUNBUFFERED=1 \
@@ -13,9 +12,7 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \
     FACELAB_ENV=prod \
     FACELAB_HOST=0.0.0.0 \
-    FACELAB_DATA_DIR=/tmp/data \
-    FACELAB_MODELS_DIR=/tmp/models \
-    PORT=7860
+    PORT=8010
 
 WORKDIR /app
 
@@ -30,8 +27,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY . .
 
-# Hugging Face Spaces expects the app on port 7860.
-EXPOSE 7860
+EXPOSE 8010
 
 # Give the first boot time to fetch the model pack before declaring it unhealthy.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=5 \

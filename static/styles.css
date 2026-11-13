@@ -238,6 +238,12 @@ code {
   background: var(--warn-soft);
 }
 
+.banner.info {
+  color: #cfe0ff;
+  border-color: rgba(130, 184, 255, 0.3);
+  background: rgba(130, 184, 255, 0.08);
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(340px, 0.78fr) minmax(0, 1.42fr);

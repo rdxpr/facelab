@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Container entrypoint: make sure the default model pack exists, then start the
-# server. Fetching is skipped when the pack is already on disk; on an ephemeral
-# host (e.g. Hugging Face Spaces) that download happens again on each cold start.
+# server. Fetching is skipped when the pack is already on disk; on a host with
+# ephemeral storage (or a fresh container) it downloads again on each start.
 set -eu
 
 cd "$(dirname "$0")/.."

@@ -143,6 +143,7 @@ async function loadState() {
     const data = await api("/api/state");
     state.people = data.people;
     state.settings = { ...state.settings, ...data.settings };
+    $("#ephemeral-banner").hidden = !state.settings.ephemeral;
     $("#max-frames").textContent = state.settings.maxFrames;
     $("#threshold").value = String(state.settings.threshold);
     $("#threshold-value").textContent = Number(state.settings.threshold).toFixed(2);
