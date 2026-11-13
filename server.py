@@ -1,8 +1,8 @@
-"""FaceLab — a standalone harness for testing face-detection models.
+"""FaceLab — a multi-model benchmarking harness for classroom attendance.
 
-FaceLab runs the InsightFace pipeline locally, lets you enroll reference photos
-per model pack, scan classroom frames, and keeps every scan result as JSON so
-the parent Attendyrc project can reuse it.
+Detectors and recognizers are selected independently, scans are cached so
+threshold sweeps run in milliseconds, and ground-truth datasets drive automatic
+per-model threshold calibration.
 
 Run it with the project's own virtualenv:
 
@@ -27,15 +27,29 @@ from datetime import UTC, datetime
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from facelab import benchmark as bench
+from facelab import cache as cache_store
+from facelab import datasets as dataset_store
 from facelab import face as engine
-from facelab.config import STATIC_DIR, settings
+from facelab import matching
+from facelab.config import (
+    KNOWN_DETECTORS,
+    KNOWN_PACKS,
+    KNOWN_RECOGNIZERS,
+    STATIC_DIR,
+    default_detector_for_pack,
+    default_recognizer_for_pack,
+    detector_registry,
+    recognizer_registry,
+    settings,
+)
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
@@ -45,27 +59,129 @@ _people: dict[int, dict] = {}
 _next_number = 1
 
 
+# --------------------------------------------------------------------------- #
+# Request models
+# --------------------------------------------------------------------------- #
 class RenameRequest(BaseModel):
     name: str
 
 
+class ReEmbedRequest(BaseModel):
+    recognizer_ids: list[str] = []
+
+
+class BenchmarkRunRequest(BaseModel):
+    dataset_ids: list[str]
+    detectors: list[str] = []
+    recognizers: list[str] = []
+    det_sizes: list[int] = []
+    tiling_modes: list[str] = []
+    det_thresh: float = 0.35
+    nms_thresh: float = 0.45
+    flip_aug: bool = True
+    lowres_aug: bool = False
+    with_quality: bool = True
+    with_pose: bool = False
+    variant: str | None = None
+    accept_threshold: float | None = None
+    review_threshold: float = 0.34
+    min_margin: float = 0.04
+    assignment_mode: str = "hungarian"
+    template_strategy: str = "top_k_mean"
+    top_k: int = 2
+    fusion_mode: str = "k_of_n_voting"
+    k: int = 2
+    min_quality: float = 0.0
+
+
+class SweepRequest(BaseModel):
+    dataset_ids: list[str] = []
+    detector: str = ""
+    recognizer: str = ""
+    det_size: int = 0
+    tiling_mode: str = "none"
+    det_thresh: float = 0.35
+    nms_thresh: float = 0.45
+    flip_aug: bool = True
+    lowres_aug: bool = False
+    with_quality: bool = True
+    with_pose: bool = False
+    variant: str | None = None
+    accept_threshold: float = 0.42
+    review_threshold: float = 0.34
+    min_margin: float = 0.04
+    assignment_mode: str = "hungarian"
+    template_strategy: str = "top_k_mean"
+    top_k: int = 2
+    fusion_mode: str = "k_of_n_voting"
+    k: int = 2
+    min_quality: float = 0.0
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
 def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _photo_model(photo: dict) -> str:
-    """Legacy photos predate the model field; they came from the default pack."""
-    return photo.get("model") or settings.default_model
+def require_token(
+    authorization: str | None = Header(default=None),
+    x_api_token: str | None = Header(default=None),
+) -> None:
+    """Guard mutating endpoints when ``FACELAB_API_TOKEN`` is set."""
+    expected = settings.api_token
+    if not expected:
+        return
+    provided = x_api_token
+    if not provided and authorization and authorization.lower().startswith("bearer "):
+        provided = authorization[7:].strip()
+    if provided != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
+def _variant_for(flip_aug: bool, lowres_aug: bool) -> str:
+    if lowres_aug:
+        return "lowres_aug"
+    return "flip_avg" if flip_aug else "raw"
+
+
+def _variant_field(variant: str) -> str:
+    return {
+        "raw": "embedding",
+        "flip_avg": "embedding_flip_avg",
+        "lowres_aug": "embedding_lowres_aug",
+    }.get(variant, "embedding")
 
 
 # --------------------------------------------------------------------------- #
 # Persisted roster
 # --------------------------------------------------------------------------- #
+def _encode_embedding(entry: dict) -> dict:
+    encoded: dict[str, object] = {}
+    for name in ("raw", "flip_avg", "lowres_aug"):
+        vector = entry.get(name)
+        if vector is not None:
+            encoded[name] = np.asarray(vector, dtype=np.float32).tolist()
+    encoded["norm_magnitude"] = float(entry.get("norm_magnitude") or 0.0)
+    return encoded
+
+
+def _decode_embedding(entry: dict) -> dict:
+    decoded: dict[str, object] = {}
+    for name in ("raw", "flip_avg", "lowres_aug"):
+        vector = entry.get(name)
+        if vector is not None:
+            decoded[name] = np.asarray(vector, dtype=np.float32)
+    decoded["norm_magnitude"] = float(entry.get("norm_magnitude") or 0.0)
+    return decoded
+
+
 def _save_state() -> None:
     payload = {
-        "version": 2,
+        "version": 3,
         "nextNumber": _next_number,
-        "people": [
+        "students": [
             {
                 "id": person["id"],
                 "number": person["number"],
@@ -75,12 +191,15 @@ def _save_state() -> None:
                     {
                         "id": photo["id"],
                         "filename": photo["filename"],
-                        "quality": photo["quality"],
+                        "sha256": photo.get("sha256") or "",
+                        "qualityScore": photo.get("quality_score") or 0.0,
+                        "qualityNote": photo.get("quality_note") or "",
+                        "headPose": photo.get("head_pose"),
                         "createdAt": photo["createdAt"],
-                        "model": _photo_model(photo),
-                        "embedding": base64.b64encode(
-                            np.asarray(photo["embedding"], dtype=np.float32).tobytes()
-                        ).decode("ascii"),
+                        "embeddings": {
+                            rid: _encode_embedding(entry)
+                            for rid, entry in (photo.get("embeddings") or {}).items()
+                        },
                     }
                     for photo in person["photos"]
                 ],
@@ -88,42 +207,96 @@ def _save_state() -> None:
             for person in sorted(_people.values(), key=lambda item: item["number"])
         ],
     }
-    temp = settings.people_file.with_suffix(".json.tmp")
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    temp = settings.students_file.with_suffix(".json.tmp")
     temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temp.replace(settings.people_file)
+    temp.replace(settings.students_file)
+
+
+def _load_legacy_people(payload: dict) -> dict[int, dict]:
+    """Migrate the pre-registry ``people.json`` (v1/v2) roster."""
+    people: dict[int, dict] = {}
+    for person in payload.get("people", []):
+        photos = []
+        for photo in person.get("photos", []):
+            raw_bytes = photo.get("embedding")
+            if raw_bytes is None:
+                continue
+            vector = np.frombuffer(base64.b64decode(raw_bytes), dtype=np.float32).copy()
+            recognizer_id = default_recognizer_for_pack(
+                photo.get("model") or settings.default_model
+            )
+            photos.append(
+                {
+                    "id": photo.get("id") or uuid.uuid4().hex[:10],
+                    "filename": photo.get("filename"),
+                    "sha256": "",
+                    "quality_score": 0.0,
+                    "quality_note": photo.get("quality") or "",
+                    "head_pose": None,
+                    "createdAt": photo.get("createdAt") or _now(),
+                    "embeddings": {
+                        recognizer_id: {
+                            "raw": vector,
+                            "norm_magnitude": float(np.linalg.norm(vector)),
+                        }
+                    },
+                }
+            )
+        people[int(person["id"])] = {
+            "id": int(person["id"]),
+            "number": int(person["number"]),
+            "name": person.get("name") or f"Student {int(person['number']):02d}",
+            "createdAt": person.get("createdAt") or _now(),
+            "photos": photos,
+        }
+    return people
 
 
 def _load_state() -> None:
     global _next_number
-    path = settings.people_file
-    if not path.exists():
-        return
+    path = settings.students_file
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        people: dict[int, dict] = {}
-        for person in payload.get("people", []):
-            photos = []
-            for photo in person.get("photos", []):
-                raw = base64.b64decode(photo["embedding"])
-                photos.append(
-                    {
-                        "id": photo["id"],
-                        "filename": photo["filename"],
-                        "quality": photo.get("quality") or "",
-                        "createdAt": photo.get("createdAt") or _now(),
-                        "model": photo.get("model") or settings.default_model,
-                        "embedding": np.frombuffer(raw, dtype=np.float32).copy(),
-                    }
-                )
-            people[int(person["id"])] = {
-                "id": int(person["id"]),
-                "number": int(person["number"]),
-                "name": person["name"],
-                "createdAt": person.get("createdAt") or _now(),
-                "photos": photos,
-            }
-        _people.update(people)
-        _next_number = int(payload.get("nextNumber") or (max(people, default=0) + 1))
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            people: dict[int, dict] = {}
+            for person in payload.get("students", []):
+                photos = []
+                for photo in person.get("photos", []):
+                    photos.append(
+                        {
+                            "id": photo["id"],
+                            "filename": photo.get("filename"),
+                            "sha256": photo.get("sha256") or "",
+                            "quality_score": float(photo.get("qualityScore") or 0.0),
+                            "quality_note": photo.get("qualityNote") or "",
+                            "head_pose": photo.get("headPose"),
+                            "createdAt": photo.get("createdAt") or _now(),
+                            "embeddings": {
+                                rid: _decode_embedding(entry)
+                                for rid, entry in (photo.get("embeddings") or {}).items()
+                            },
+                        }
+                    )
+                people[int(person["id"])] = {
+                    "id": int(person["id"]),
+                    "number": int(person["number"]),
+                    "name": person.get("name"),
+                    "createdAt": person.get("createdAt") or _now(),
+                    "photos": photos,
+                }
+            _people.update(people)
+            _next_number = int(payload.get("nextNumber") or (max(people, default=0) + 1))
+            return
+
+        legacy = settings.legacy_people_file
+        if legacy.is_file():
+            payload = json.loads(legacy.read_text(encoding="utf-8"))
+            people = _load_legacy_people(payload)
+            _people.update(people)
+            _next_number = int(payload.get("nextNumber") or (max(people, default=0) + 1))
+            print(f"[facelab] migrated {len(people)} students from {legacy}")
+            _save_state()
     except Exception as exc:  # a corrupt local file should not brick the tool
         broken = path.with_suffix(f".broken-{int(time.time())}.json")
         try:
@@ -137,91 +310,158 @@ def _load_state() -> None:
 # Public shapes
 # --------------------------------------------------------------------------- #
 def _public_person(person: dict) -> dict:
-    models: dict[str, int] = {}
+    recognizer_usage: dict[str, int] = {}
     for photo in person["photos"]:
-        name = _photo_model(photo)
-        models[name] = models.get(name, 0) + 1
+        for recognizer_id in (photo.get("embeddings") or {}):
+            recognizer_usage[recognizer_id] = recognizer_usage.get(recognizer_id, 0) + 1
     return {
         "id": person["id"],
         "number": person["number"],
         "name": person["name"],
         "createdAt": person["createdAt"],
         "templates": len(person["photos"]),
-        "models": models,
+        "recognizers": recognizer_usage,
         "photos": [
             {
                 "id": photo["id"],
                 "url": f"/media/{photo['filename']}",
-                "quality": photo["quality"],
+                "quality": photo.get("quality_note") or "",
+                "qualityScore": photo.get("quality_score") or 0.0,
+                "headPose": photo.get("head_pose"),
                 "createdAt": photo["createdAt"],
-                "model": _photo_model(photo),
+                "recognizers": sorted((photo.get("embeddings") or {}).keys()),
             }
             for photo in person["photos"]
         ],
     }
 
 
-def _model_usage() -> dict[str, dict]:
+def _recognizer_usage() -> dict[str, dict]:
     usage: dict[str, dict] = {}
     for person in _people.values():
         for photo in person["photos"]:
-            name = _photo_model(photo)
-            entry = usage.setdefault(name, {"templates": 0, "people": set()})
-            entry["templates"] += 1
-            entry["people"].add(person["id"])
+            for recognizer_id in (photo.get("embeddings") or {}):
+                entry = usage.setdefault(recognizer_id, {"templates": 0, "people": set()})
+                entry["templates"] += 1
+                entry["people"].add(person["id"])
     return {
         name: {"templates": value["templates"], "people": len(value["people"])}
         for name, value in usage.items()
     }
 
 
-def _models_payload() -> dict:
+def _student_snapshot() -> dict[int, dict]:
+    with _state_lock:
+        return {
+            person["id"]: {
+                "id": person["id"],
+                "number": person["number"],
+                "name": person["name"],
+                "photos": [dict(photo) for photo in person["photos"]],
+            }
+            for person in _people.values()
+        }
+
+
+def _registry_state() -> dict:
+    payload = engine.registry_payload()
+    usage = _recognizer_usage()
+    for entry in payload["recognizers"]:
+        use = usage.get(entry["id"], {"templates": 0, "people": 0})
+        entry["templates"] = use["templates"]
+        entry["people"] = use["people"]
+    return payload
+
+
+def _packs_payload() -> list[dict]:
     installed = {item["name"]: item for item in engine.available_models()}
-    usage = _model_usage()
-    models = []
-    for name in sorted(set(installed) | set(usage)):
+    usage = _recognizer_usage()
+    packs = []
+    names = sorted(set(KNOWN_PACKS) | set(installed))
+    for name in names:
         info = installed.get(name, {})
-        use = usage.get(name, {"templates": 0, "people": 0})
-        models.append(
+        recognizer_id = default_recognizer_for_pack(name)
+        use = usage.get(recognizer_id, {"templates": 0, "people": 0})
+        packs.append(
             {
                 "name": name,
                 "files": info.get("files", []),
                 "fileCount": info.get("fileCount", 0),
                 "sizeBytes": info.get("sizeBytes", 0),
-                "loaded": info.get("loaded", False),
                 "installed": name in installed,
                 "default": name == settings.default_model,
+                "recognizer": recognizer_id,
                 "templates": use["templates"],
                 "people": use["people"],
             }
         )
-    return {"models": models, "defaultModel": settings.default_model, "modelsDir": str(settings.models_dir)}
+    return packs
+
+
+def _models_payload() -> dict:
+    registry = _registry_state()
+    packs = _packs_payload()
+    return {
+        "models": packs,  # legacy key
+        "packs": packs,
+        "detectors": registry["detectors"],
+        "recognizers": registry["recognizers"],
+        "defaultModel": settings.default_model,
+        "defaultDetector": settings.default_detector,
+        "defaultRecognizer": settings.default_recognizer,
+        "providers": settings.provider_list,
+        "modelsDir": str(settings.models_dir),
+    }
+
+
+def _settings_payload() -> dict:
+    return {
+        "threshold": settings.face_similarity_threshold,
+        "acceptThreshold": settings.accept_threshold,
+        "reviewThreshold": settings.review_threshold,
+        "minMargin": settings.min_margin,
+        "detSize": settings.face_scan_det_size,
+        "enrollDetSize": settings.face_det_size,
+        "detThresh": 0.35,
+        "nmsThresh": 0.45,
+        "tilingMode": settings.tiling_mode,
+        "assignmentMode": settings.assignment_mode,
+        "templateStrategy": settings.template_strategy,
+        "templateTopK": settings.template_top_k,
+        "fusionMode": settings.multi_frame_fusion,
+        "fusionK": settings.fusion_k,
+        "minFaceQuality": settings.min_face_quality,
+        "benchmarkDetSizes": settings.benchmark_det_size_list,
+        "benchmarkMaxRows": settings.benchmark_max_rows,
+        "maxFrames": settings.face_scan_max_frames,
+        "maxPhotosPerUpload": settings.max_photos_per_upload,
+        "maxPhotosPerPerson": settings.max_photos_per_person,
+        "defaultModel": settings.default_model,
+        "defaultDetector": settings.default_detector,
+        "defaultRecognizer": settings.default_recognizer,
+        "modelsDir": str(settings.models_dir),
+        "env": settings.env,
+        "ephemeral": settings.ephemeral,
+        "dataDir": str(settings.data_dir),
+        "providers": settings.provider_list,
+        "authRequired": bool(settings.api_token),
+    }
 
 
 def _public_state() -> dict:
     with _state_lock:
         people = [_public_person(person) for person in _people.values()]
-        usage = _model_usage()
+        usage = _recognizer_usage()
     people.sort(key=lambda item: item["number"])
     total_templates = sum(person["templates"] for person in people)
     return {
         "people": people,
+        "students": people,
         "nextNumber": _next_number,
         "totals": {"people": len(people), "templates": total_templates},
         "modelUsage": usage,
-        "settings": {
-            "threshold": settings.face_similarity_threshold,
-            "detSize": settings.face_scan_det_size,
-            "enrollDetSize": settings.face_det_size,
-            "maxFrames": settings.face_scan_max_frames,
-            "maxPhotosPerUpload": settings.max_photos_per_upload,
-            "maxPhotosPerPerson": settings.max_photos_per_person,
-            "defaultModel": settings.default_model,
-            "modelsDir": str(settings.models_dir),
-            "env": settings.env,
-            "ephemeral": settings.ephemeral,
-            "dataDir": str(settings.data_dir),
-        },
+        "settings": _settings_payload(),
+        "registry": _registry_state(),
     }
 
 
@@ -229,7 +469,6 @@ def _public_state() -> dict:
 # Scan results on disk
 # --------------------------------------------------------------------------- #
 def _result_path(scan_id: str) -> "os.PathLike[str] | None":
-    # Guard against path traversal from the {scan_id} path parameter.
     if not scan_id or any(char not in "0123456789abcdef-" for char in scan_id.lower()):
         return None
     return settings.results_dir / f"{scan_id}.json"
@@ -275,7 +514,9 @@ def _result_summary(result: dict) -> dict:
         "scanId": result.get("scanId"),
         "createdAt": result.get("createdAt"),
         "model": result.get("model"),
-        "threshold": summary.get("threshold"),
+        "detectorId": result.get("detectorId"),
+        "recognizerId": result.get("recognizerId"),
+        "threshold": summary.get("acceptThreshold"),
         "detSize": summary.get("detSize"),
         "frames": summary.get("frames"),
         "facesDetected": summary.get("facesDetected"),
@@ -298,7 +539,7 @@ def _list_results(model: str | None = None) -> list[dict]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if model and data.get("model") != model:
+        if model and data.get("model") != model and data.get("recognizerId") != model:
             continue
         items.append(_result_summary(data))
     items.sort(key=lambda item: (item.get("createdAt") or "", item.get("scanId") or ""), reverse=True)
@@ -335,54 +576,178 @@ def _decode(data: bytes, label: str) -> np.ndarray:
         raise HTTPException(status_code=422, detail=f"{label}: could not read image ({exc})") from exc
 
 
-def _require_installed_model(model: str) -> None:
-    if not engine.model_exists(model):
+def _require_detector(detector_id: str) -> None:
+    if detector_id not in KNOWN_DETECTORS:
+        raise HTTPException(status_code=422, detail=f"Unknown detector '{detector_id}'")
+    ok, reason = engine.detector_availability(detector_id)
+    if not ok:
+        raise HTTPException(status_code=422, detail=f"Detector '{detector_id}' is unavailable: {reason}")
+
+
+def _require_recognizer(recognizer_id: str) -> None:
+    if recognizer_id not in KNOWN_RECOGNIZERS:
+        raise HTTPException(status_code=422, detail=f"Unknown recognizer '{recognizer_id}'")
+    ok, reason = engine.recognizer_availability(recognizer_id)
+    if not ok:
+        raise HTTPException(status_code=422, detail=f"Recognizer '{recognizer_id}' is unavailable: {reason}")
+
+
+def _legacy_ids(model: str | None, detector_id: str | None, recognizer_id: str | None) -> tuple[str, str]:
+    if model:
+        if not engine.model_exists(model):
+            raise HTTPException(
+                status_code=422,
+                detail=f"Model pack '{model}' is not installed. Run scripts/fetch_models.py --model {model}.",
+            )
+        detector_id = detector_id or default_detector_for_pack(model)
+        recognizer_id = recognizer_id or default_recognizer_for_pack(model)
+    return (
+        detector_id or settings.default_detector,
+        recognizer_id or settings.default_recognizer,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Inference / caching
+# --------------------------------------------------------------------------- #
+def _analyze_or_cache(
+    image_bgr: np.ndarray,
+    data: bytes,
+    *,
+    detector_id: str,
+    recognizer_id: str,
+    det_params: dict,
+    flip_aug: bool,
+) -> tuple[dict, bool]:
+    image_sha = cache_store.sha256_bytes(data)
+    key = cache_store.cache_key(image_sha, detector_id, det_params, recognizer_id, flip_aug)
+    cached = cache_store.load_analysis(key)
+    if cached is not None:
+        cached["cache_key"] = key
+        return cached, True
+
+    payload = engine.analyze_frame(
+        image_bgr,
+        detector_id=detector_id,
+        recognizer_id=recognizer_id,
+        det_size=int(det_params["det_size"][0]),
+        det_thresh=float(det_params["det_thresh"]),
+        nms_thresh=float(det_params["nms_thresh"]),
+        tiling_mode=det_params.get("tiling_mode", "none"),
+        tile_size=int(det_params.get("tile_size", 640)),
+        tile_overlap=float(det_params.get("tile_overlap", 0.25)),
+        flip_aug=flip_aug,
+        lowres_aug=bool(det_params.get("lowres_aug", False)),
+        with_quality=bool(det_params.get("with_quality", True)),
+        with_pose=bool(det_params.get("with_pose", True)),
+        crops_dir=settings.crops_dir,
+        crop_prefix=image_sha[:12],
+    )
+    payload["cache_key"] = key
+    payload["image_sha256"] = image_sha
+    cache_store.save_analysis(payload)
+    return payload, False
+
+
+def _pick_detector(preferred: str | None = None) -> str:
+    for candidate in [preferred, settings.default_detector, *KNOWN_DETECTORS.keys()]:
+        if candidate and engine.detector_availability(candidate)[0]:
+            return candidate
+    raise engine.FaceEngineUnavailable(
+        "No detector weights are installed. Run scripts/fetch_models.py."
+    )
+
+
+def _embed_reference(
+    image_bgr: np.ndarray, data: bytes, recognizer_id: str, detector_id: str
+) -> dict:
+    payload = engine.analyze_frame(
+        image_bgr,
+        detector_id=detector_id,
+        recognizer_id=recognizer_id,
+        det_size=settings.face_det_size,
+        det_thresh=0.5,
+        nms_thresh=0.45,
+        tiling_mode="none",
+        flip_aug=True,
+        lowres_aug=True,
+        with_quality=True,
+        with_pose=True,
+    )
+    detections = payload["detections"]
+    if not detections:
         raise HTTPException(
             status_code=422,
-            detail=f"Model pack '{model}' is not installed. Add its ONNX files to {settings.models_dir / model} or run scripts/fetch_models.py.",
+            detail="No face detected. Ask the student to face the camera in good light.",
         )
+    if len(detections) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Multiple faces ({len(detections)}) detected. Use exactly one student per photo.",
+        )
+    det = detections[0]
+    return {
+        "id": uuid.uuid4().hex[:10],
+        "sha256": cache_store.sha256_bytes(data),
+        "quality_score": float(det.get("quality_score") or 0.0),
+        "quality_note": (
+            "Face is small in the frame; move closer for a stronger embedding."
+            if float(det.get("face_height_px") or 0.0) < 50
+            else "Face detected."
+        ),
+        "head_pose": det.get("head_pose"),
+        "createdAt": _now(),
+        "embeddings": {
+            recognizer_id: {
+                "raw": np.asarray(det["embedding"], dtype=np.float32),
+                "flip_avg": (
+                    np.asarray(det["embedding_flip_avg"], dtype=np.float32)
+                    if det.get("embedding_flip_avg") is not None
+                    else None
+                ),
+                "lowres_aug": (
+                    np.asarray(det["embedding_lowres_aug"], dtype=np.float32)
+                    if det.get("embedding_lowres_aug") is not None
+                    else None
+                ),
+                "norm_magnitude": float(det.get("embedding_norm_mag") or 0.0),
+            }
+        },
+    }
 
 
-# --------------------------------------------------------------------------- #
-# Enrollment
-# --------------------------------------------------------------------------- #
 def _process_reference_photos(
-    raw: list[tuple[bytes, str | None]], model: str
-) -> list[tuple[np.ndarray, np.ndarray, str]]:
-    processed: list[tuple[np.ndarray, np.ndarray, str]] = []
+    raw: list[tuple[bytes, str | None]], recognizer_id: str
+) -> list[tuple[np.ndarray, dict]]:
+    _require_recognizer(recognizer_id)
+    detector_id = _pick_detector()
+    processed: list[tuple[np.ndarray, dict]] = []
     with _model_lock:
         for data, filename in raw:
             label = filename or "photo"
             image_bgr = _decode(data, label)
             try:
-                ok, face_obj, message = engine.validate_registration_face(
-                    image_bgr, model_name=model
-                )
+                record = _embed_reference(image_bgr, data, recognizer_id, detector_id)
+            except HTTPException:
+                raise
             except engine.FaceEngineUnavailable as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             except Exception as exc:
-                raise HTTPException(
-                    status_code=422, detail=f"{label}: detection failed ({exc})"
-                ) from exc
-            if not ok or face_obj is None:
-                raise HTTPException(status_code=422, detail=f"{label}: {message}")
-            processed.append((image_bgr, engine.extract_embedding(face_obj), message))
+                raise HTTPException(status_code=422, detail=f"{label}: detection failed ({exc})") from exc
+            record.setdefault("quality_note", "")
+            processed.append((image_bgr, record))
     return processed
 
 
-def _create_person_sync(
-    name: str, model: str, raw: list[tuple[bytes, str | None]]
-) -> dict:
+def _create_person_sync(name: str, recognizer_id: str, raw: list[tuple[bytes, str | None]]) -> dict:
     global _next_number
     if not raw:
         raise HTTPException(status_code=422, detail="Add at least one face photo")
     if len(raw) > settings.max_photos_per_upload:
         raise HTTPException(
-            status_code=422,
-            detail=f"Up to {settings.max_photos_per_upload} photos per upload",
+            status_code=422, detail=f"Up to {settings.max_photos_per_upload} photos per upload"
         )
-    _require_installed_model(model)
-    processed = _process_reference_photos(raw, model)
+    processed = _process_reference_photos(raw, recognizer_id)
 
     with _state_lock:
         number = _next_number
@@ -395,27 +760,17 @@ def _create_person_sync(
             "createdAt": _now(),
             "photos": [],
         }
-        for image_bgr, embedding, message in processed:
-            photo_id = uuid.uuid4().hex[:10]
+        for image_bgr, record in processed:
+            photo_id = record["id"]
             relative = _write_jpeg_bgr(image_bgr, f"faces/p{number}/{photo_id}.jpg")
-            person["photos"].append(
-                {
-                    "id": photo_id,
-                    "filename": relative,
-                    "quality": message,
-                    "createdAt": _now(),
-                    "model": model,
-                    "embedding": embedding,
-                }
-            )
+            record["filename"] = relative
+            person["photos"].append(record)
         _people[person["id"]] = person
         _save_state()
         return _public_person(person)
 
 
-def _add_photos_sync(
-    person_id: int, model: str, raw: list[tuple[bytes, str | None]]
-) -> dict:
+def _add_photos_sync(person_id: int, recognizer_id: str, raw: list[tuple[bytes, str | None]]) -> dict:
     with _state_lock:
         person = _people.get(person_id)
         if person is None:
@@ -427,84 +782,186 @@ def _add_photos_sync(
             detail=f"This student already has {settings.max_photos_per_person} photos",
         )
     if len(raw) > remaining:
-        raise HTTPException(
-            status_code=422, detail=f"{remaining} more photo(s) fit for this student"
-        )
-    _require_installed_model(model)
-    processed = _process_reference_photos(raw, model)
+        raise HTTPException(status_code=422, detail=f"{remaining} more photo(s) fit for this student")
+
+    processed = _process_reference_photos(raw, recognizer_id)
 
     with _state_lock:
         person = _people.get(person_id)
         if person is None:
             raise HTTPException(status_code=404, detail="Student not found")
-        for image_bgr, embedding, message in processed:
-            photo_id = uuid.uuid4().hex[:10]
-            relative = _write_jpeg_bgr(
-                image_bgr, f"faces/p{person['number']}/{photo_id}.jpg"
-            )
-            person["photos"].append(
-                {
-                    "id": photo_id,
-                    "filename": relative,
-                    "quality": message,
-                    "createdAt": _now(),
-                    "model": model,
-                    "embedding": embedding,
-                }
-            )
+        for image_bgr, record in processed:
+            photo_id = record["id"]
+            relative = _write_jpeg_bgr(image_bgr, f"faces/p{person['number']}/{photo_id}.jpg")
+            record["filename"] = relative
+            person["photos"].append(record)
         _save_state()
         return _public_person(person)
+
+
+def _reembed_sync(recognizer_ids: list[str]) -> dict:
+    registry = recognizer_registry()
+    targets = [rid for rid in (recognizer_ids or list(registry.keys())) if rid in registry]
+    targets = [rid for rid in targets if engine.recognizer_availability(rid)[0]]
+    if not targets:
+        raise HTTPException(status_code=422, detail="No available recognizers to embed with")
+    detector_id = _pick_detector()
+
+    results = {rid: {"updated": 0, "skipped": 0} for rid in targets}
+    errors: list[str] = []
+    with _state_lock, _model_lock:
+        for recognizer_id in targets:
+            for person in _people.values():
+                for photo in person["photos"]:
+                    if (photo.get("embeddings") or {}).get(recognizer_id, {}).get("raw") is not None:
+                        results[recognizer_id]["skipped"] += 1
+                        continue
+                    path = settings.data_dir / (photo.get("filename") or "")
+                    image_bgr = cv2.imread(str(path)) if path.is_file() else None
+                    if image_bgr is None:
+                        results[recognizer_id]["skipped"] += 1
+                        errors.append(f"missing reference image for photo {photo['id']}")
+                        continue
+                    try:
+                        record = _embed_reference(
+                            image_bgr,
+                            path.read_bytes(),
+                            recognizer_id,
+                            detector_id,
+                        )
+                    except HTTPException as exc:
+                        results[recognizer_id]["skipped"] += 1
+                        errors.append(f"{recognizer_id}/{photo['id']}: {exc.detail}")
+                        continue
+                    entry = photo.setdefault("embeddings", {})
+                    entry[recognizer_id] = record["embeddings"][recognizer_id]
+                    if not photo.get("quality_score"):
+                        photo["quality_score"] = record["quality_score"]
+                    if not photo.get("head_pose"):
+                        photo["head_pose"] = record["head_pose"]
+                    results[recognizer_id]["updated"] += 1
+        _save_state()
+    return {"results": results, "errors": errors[:20], "state": _public_state()}
 
 
 # --------------------------------------------------------------------------- #
 # Scanning
 # --------------------------------------------------------------------------- #
-def _serialize_face(match: dict, width: int, height: int, person: dict | None) -> dict:
-    face = match["face"]
-    x1, y1, x2, y2 = (float(value) for value in face.bbox)
-    det_score = float(getattr(face, "det_score", 0.0))
+def _scan_det_params(
+    det_size: int, det_thresh: float, nms_thresh: float, tiling_mode: str,
+    lowres_aug: bool, with_quality: bool, with_pose: bool,
+) -> dict:
+    return cache_store.analysis_params(
+        det_size=det_size,
+        det_thresh=det_thresh,
+        nms_thresh=nms_thresh,
+        tiling_mode=tiling_mode,
+        lowres_aug=lowres_aug,
+        with_quality=with_quality,
+        with_pose=with_pose,
+    )
+
+
+def _serialize_candidates(candidates: list[dict], snapshot: dict[int, dict]) -> list[dict]:
+    return [
+        {
+            "studentId": candidate["student_id"],
+            "name": (snapshot.get(candidate["student_id"]) or {}).get("name", "?"),
+            "score": candidate["score"],
+        }
+        for candidate in candidates
+    ]
+
+
+def _serialize_face(decision: dict, det: dict, snapshot: dict[int, dict]) -> dict:
+    student_id = decision.get("matched_student_id")
+    person = snapshot.get(student_id) if student_id is not None else None
     return {
-        "box": [
-            round(max(0.0, x1), 1),
-            round(max(0.0, y1), 1),
-            round(min(float(width), x2), 1),
-            round(min(float(height), y2), 1),
-        ],
-        "detScore": round(det_score, 4),
-        "matched": bool(match["matched"]),
-        "personId": match["student_id"],
+        "box": [round(float(value), 1) for value in det["bbox"]],
+        "detScore": round(float(det.get("det_score") or 0.0), 4),
+        "status": decision.get("status", "unmatched"),
+        "matched": decision.get("status") == "present",
+        "personId": student_id,
         "number": person["number"] if person else None,
-        "name": match["student_name"],
-        "confidence": round(float(match["confidence"] or 0.0), 4),
+        "name": person["name"] if person else "Unknown",
+        "confidence": round(float(decision.get("score") or 0.0), 4),
+        "margin": round(float(decision.get("margin") or 0.0), 4),
+        "sizeBucket": det.get("size_bucket"),
+        "faceHeightPx": det.get("face_height_px"),
+        "quality": det.get("quality_score"),
+        "qualitySource": det.get("quality_source"),
+        "headPose": det.get("head_pose"),
+        "cropUrl": (
+            f"/media/{det['aligned_crop_path']}" if det.get("aligned_crop_path") else None
+        ),
+        "topCandidates": _serialize_candidates(
+            decision.get("top_candidates", []), snapshot
+        ),
     }
 
 
 def _run_scan_sync(
     raw: list[tuple[bytes, str | None]],
-    model: str,
-    threshold: float,
+    *,
+    detector_id: str,
+    recognizer_id: str,
     det_size: int,
+    det_thresh: float,
+    nms_thresh: float,
+    tiling_mode: str,
+    accept_threshold: float,
+    review_threshold: float,
+    min_margin: float,
+    assignment_mode: str,
+    template_strategy: str,
+    top_k: int,
+    fusion_mode: str,
+    fusion_k: int,
+    flip_aug: bool,
+    lowres_aug: bool,
+    with_quality: bool,
+    with_pose: bool,
+    min_quality: float,
 ) -> dict:
-    _require_installed_model(model)
+    _require_detector(detector_id)
+    _require_recognizer(recognizer_id)
     started = time.perf_counter()
     warnings: list[str] = []
-    decoded: list[dict] = []
+    det_params = _scan_det_params(
+        det_size, det_thresh, nms_thresh, tiling_mode, lowres_aug, with_quality, with_pose
+    )
+    variant = _variant_for(flip_aug, lowres_aug)
 
+    try:
+        engine.warm_up(detector_id, recognizer_id, det_size, tiling_mode)
+    except engine.FaceEngineUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    decoded: list[dict] = []
+    total_decode_ms = 0.0
     with _model_lock:
         for index, (data, filename) in enumerate(raw):
             label = filename or f"frame {index + 1}"
+            decode_started = time.perf_counter()
             try:
                 image_bgr = _decode(data, label)
-                faces = engine.detect_faces(image_bgr, det_size=det_size, model_name=model)
             except HTTPException as exc:
                 warnings.append(str(exc.detail))
                 continue
+            decode_ms = (time.perf_counter() - decode_started) * 1000
+            try:
+                payload, cached = _analyze_or_cache(
+                    image_bgr, data,
+                    detector_id=detector_id, recognizer_id=recognizer_id,
+                    det_params=det_params, flip_aug=flip_aug,
+                )
             except engine.FaceEngineUnavailable as exc:
                 raise HTTPException(status_code=503, detail=str(exc)) from exc
             except Exception as exc:
                 warnings.append(f"{label}: {exc}")
                 continue
             height, width = image_bgr.shape[:2]
+            total_decode_ms += decode_ms
             decoded.append(
                 {
                     "index": index,
@@ -512,91 +969,78 @@ def _run_scan_sync(
                     "bgr": image_bgr,
                     "width": width,
                     "height": height,
-                    "faces": faces,
+                    "detections": payload["detections"],
+                    "timings": payload["timings_ms"],
+                    "cache_key": payload.get("cache_key"),
+                    "cached": cached,
+                    "decode_ms": round(decode_ms, 3),
                 }
             )
 
         if not decoded:
-            raise HTTPException(
-                status_code=422, detail="No readable frames. " + " ".join(warnings)
-            )
+            raise HTTPException(status_code=422, detail="No readable frames. " + " ".join(warnings))
 
-        with _state_lock:
-            people_snapshot = {
-                person["id"]: {
-                    "id": person["id"],
-                    "number": person["number"],
-                    "name": person["name"],
-                    "photos": person["photos"],
-                }
-                for person in _people.values()
+        snapshot = _student_snapshot()
+        gallery = bench.build_gallery(snapshot, recognizer_id, variant)
+        enrolled_ids = set(gallery.keys())
+
+        fusion_frames = [
+            {
+                "frame_id": f"frame_{order + 1}",
+                "width": item["width"],
+                "height": item["height"],
+                "detections": [
+                    {
+                        "embedding": bench.select_embedding(det, variant),
+                        "bbox": det["bbox"],
+                        "quality": det.get("quality_score") or 0.0,
+                    }
+                    for det in item["detections"]
+                ],
             }
-
-        # Only templates enrolled for this model pack are comparable.
-        registered_rows: list[tuple[int, str, str | None, bytes]] = []
-        for person in people_snapshot.values():
-            for photo in person["photos"]:
-                if _photo_model(photo) != model:
-                    continue
-                registered_rows.append(
-                    (
-                        person["id"],
-                        person["name"],
-                        f"#{person['number']:02d}",
-                        photo["embedding"].tobytes(),
-                    )
-                )
-
-        # A student is on this model's roster only if they have a template for it.
-        enrolled_ids = {row[0] for row in registered_rows}
-        roster_rows = [
-            (person["id"], person["name"], f"#{person['number']:02d}")
-            for person in people_snapshot.values()
-            if person["id"] in enrolled_ids
+            for order, item in enumerate(decoded)
         ]
 
-        # Drop templates whose embedding dimension does not match this model's
-        # output, so a mixed roster can never break the similarity matrix.
-        detected_dim = 0
-        for item in decoded:
-            if item["faces"]:
-                detected_dim = len(engine.extract_embedding(item["faces"][0]))
-                break
-        if detected_dim:
-            mismatched = [row for row in registered_rows if len(row[3]) // 4 != detected_dim]
-            if mismatched:
-                warnings.append(
-                    f"Ignored {len(mismatched)} template(s) with a different embedding size for model '{model}'."
-                )
-                registered_rows = [
-                    row for row in registered_rows if len(row[3]) // 4 == detected_dim
-                ]
-                kept = {row[0] for row in registered_rows}
-                roster_rows = [row for row in roster_rows if row[0] in kept]
-
-        frame_faces = [item["faces"] for item in decoded]
-        _best_matches, roster, summary = engine.match_frames_to_students(
-            frame_faces, registered_rows, roster_rows, threshold
+        match_started = time.perf_counter()
+        fused = matching.fuse_multi_frame(
+            fusion_frames,
+            gallery,
+            mode=fusion_mode,
+            accept_threshold=accept_threshold,
+            review_threshold=review_threshold,
+            min_margin=min_margin,
+            assignment_mode=assignment_mode,
+            template_strategy=template_strategy,
+            top_k=top_k,
+            k=fusion_k,
+            min_quality=min_quality,
         )
-        per_frame_matches = [
-            engine.match_faces_to_students(faces, registered_rows, roster_rows, threshold)[0]
-            for faces in frame_faces
-        ]
+        match_ms = (time.perf_counter() - match_started) * 1000
 
         scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        annotate_started = time.perf_counter()
         frames_payload = []
-        for order, (item, matches) in enumerate(zip(decoded, per_frame_matches)):
+        for order, item in enumerate(decoded):
+            decisions = fused["per_frame"][order]
+            faces_payload = [
+                _serialize_face(decision, item["detections"][det_index], snapshot)
+                for det_index, decision in enumerate(decisions)
+            ]
             frame_rel = _write_jpeg_bgr(item["bgr"], f"scans/{scan_id}/frame-{order}.jpg")
-            annotated = engine.annotate_classroom_photo(item["bgr"], matches)
+            matches_for_annotation = [
+                {
+                    "bbox": face["box"],
+                    "status": face["status"],
+                    "student_name": face["name"],
+                    "confidence": face["confidence"],
+                    "matched": face["matched"],
+                }
+                for face in faces_payload
+            ]
+            annotated = engine.annotate_classroom_photo(item["bgr"], matches_for_annotation)
             annotated_rel = _write_jpeg_rgb(
                 annotated, f"scans/{scan_id}/frame-{order}-annotated.jpg"
             )
-            faces_payload = []
-            for match in matches:
-                person = people_snapshot.get(match["student_id"])
-                faces_payload.append(
-                    _serialize_face(match, item["width"], item["height"], person)
-                )
             frames_payload.append(
                 {
                     "order": order,
@@ -606,52 +1050,105 @@ def _run_scan_sync(
                     "height": item["height"],
                     "imageUrl": f"/media/{frame_rel}",
                     "annotatedUrl": f"/media/{annotated_rel}",
+                    "cacheKey": item["cache_key"],
+                    "cached": item["cached"],
+                    "timings": {**item["timings"], "decode_ms": item["decode_ms"]},
                     "faces": faces_payload,
                 }
             )
+        annotate_ms = (time.perf_counter() - annotate_started) * 1000
 
-        best_index = int(summary["bestIndex"])
         roster_payload = []
-        for row in roster:
-            person = people_snapshot.get(row["student_id"])
-            if person is None:
-                continue
-            primary = next(
-                (photo for photo in person["photos"] if _photo_model(photo) == model), None
+        student_status = fused["students"]
+        for student_id, person in sorted(snapshot.items(), key=lambda kv: kv[1]["number"]):
+            record = student_status.get(student_id, {"status": "absent", "score": 0.0, "frames_hit": 0})
+            templates = sum(
+                1 for photo in person["photos"] if (photo.get("embeddings") or {}).get(recognizer_id)
             )
             roster_payload.append(
                 {
-                    "personId": person["id"],
+                    "personId": student_id,
                     "number": person["number"],
                     "name": person["name"],
-                    "status": row["status"],
-                    "confidence": row["confidence"],
-                    "photoUrl": f"/media/{primary['filename']}" if primary else None,
-                    "templates": sum(
-                        1 for photo in person["photos"] if _photo_model(photo) == model
+                    "status": record["status"],
+                    "confidence": record["score"],
+                    "framesHit": record["frames_hit"],
+                    "enrolled": student_id in enrolled_ids,
+                    "photoUrl": (
+                        f"/media/{person['photos'][0]['filename']}"
+                        if person["photos"]
+                        else None
                     ),
+                    "templates": templates,
                 }
             )
+
+    present_count = sum(1 for row in roster_payload if row["status"] == "present")
+    unknown = max(
+        (sum(1 for face in frame["faces"] if face["status"] == "unmatched") for frame in frames_payload),
+        default=0,
+    )
+    faces_detected = max((len(frame["faces"]) for frame in frames_payload), default=0)
+    best_index = 0
+    best_present = -1
+    for order, frame in enumerate(frames_payload):
+        count = sum(1 for face in frame["faces"] if face["status"] == "present")
+        if count > best_present:
+            best_present = count
+            best_index = order
+
+    detect_ms = sum(float(item["timings"].get("detect_ms") or 0.0) for item in decoded)
+    align_ms = sum(float(item["timings"].get("align_embed_ms") or 0.0) for item in decoded)
+    quality_ms = sum(float(item["timings"].get("quality_pose_ms") or 0.0) for item in decoded)
+    elapsed_ms = (time.perf_counter() - started) * 1000
 
     result = {
         "scanId": scan_id,
         "createdAt": _now(),
-        "model": model,
+        "model": recognizer_id,
+        "detectorId": detector_id,
+        "recognizerId": recognizer_id,
         "people": roster_payload,
         "frames": frames_payload,
         "summary": {
-            "model": model,
-            "threshold": round(threshold, 4),
+            "model": recognizer_id,
+            "detectorId": detector_id,
+            "recognizerId": recognizer_id,
             "detSize": det_size,
+            "detThresh": det_thresh,
+            "nmsThresh": nms_thresh,
+            "tilingMode": tiling_mode,
+            "acceptThreshold": round(accept_threshold, 4),
+            "reviewThreshold": round(review_threshold, 4),
+            "minMargin": round(min_margin, 4),
+            "assignmentMode": assignment_mode,
+            "templateStrategy": template_strategy,
+            "fusionMode": fusion_mode,
+            "fusionK": fusion_k,
+            "variant": variant,
+            "flipAug": flip_aug,
+            "lowresAug": lowres_aug,
+            "detParams": det_params,
             "frames": len(decoded),
             "uploadedFrames": len(raw),
-            "facesDetected": int(summary["facesDetected"]),
-            "unknown": int(summary["unknown"]),
-            "matchedCount": len(summary["matched"]),
+            "facesDetected": faces_detected,
+            "unknown": unknown,
+            "matchedCount": present_count,
+            "needsReview": sum(1 for row in roster_payload if row["status"] == "needs_review"),
             "peopleCount": len(roster_payload),
-            "templateCount": len(registered_rows),
+            "templateCount": sum(row["templates"] for row in roster_payload),
             "bestIndex": best_index,
-            "elapsedMs": round((time.perf_counter() - started) * 1000),
+            "cachedFrames": sum(1 for item in decoded if item["cached"]),
+            "elapsedMs": round(elapsed_ms),
+            "timings": {
+                "decode_ms": round(total_decode_ms, 3),
+                "detect_ms": round(detect_ms, 3),
+                "align_embed_ms": round(align_ms, 3),
+                "quality_pose_ms": round(quality_ms, 3),
+                "match_ms": round(match_ms, 3),
+                "annotate_ms": round(annotate_ms, 3),
+                "total_ms": round(elapsed_ms, 3),
+            },
         },
         "warnings": warnings,
     }
@@ -660,41 +1157,59 @@ def _run_scan_sync(
     return result
 
 
-def _model_info_sync(model: str) -> dict:
+def _model_info_sync(name: str | None = None, detector_id: str | None = None,
+                     recognizer_id: str | None = None) -> dict:
+    if detector_id or recognizer_id:
+        detector_id = detector_id or settings.default_detector
+        recognizer_id = recognizer_id or settings.default_recognizer
+        started = time.perf_counter()
+        _require_detector(detector_id)
+        _require_recognizer(recognizer_id)
+        try:
+            engine.warm_up(detector_id, recognizer_id, settings.face_scan_det_size, "none")
+        except engine.FaceEngineUnavailable as exc:
+            return {"ready": False, "error": str(exc), "detectorId": detector_id,
+                    "recognizerId": recognizer_id}
+        return {
+            "ready": True,
+            "detectorId": detector_id,
+            "recognizerId": recognizer_id,
+            "detector": KNOWN_DETECTORS[detector_id],
+            "recognizer": KNOWN_RECOGNIZERS[recognizer_id],
+            "providers": settings.provider_list,
+            "loadMs": round((time.perf_counter() - started) * 1000),
+            "python": sys.version.split()[0],
+        }
+
+    name = name or settings.default_model
     started = time.perf_counter()
-    path = engine.model_path(model)
-    if not engine.model_exists(model):
+    path = engine.model_path(name)
+    if not engine.model_exists(name):
         return {
             "ready": False,
-            "error": f"Model pack '{model}' is not installed at {path}.",
-            "name": model,
+            "error": f"Model pack '{name}' is not installed at {path}.",
+            "name": name,
             "path": str(path),
             "installed": False,
         }
     try:
-        engine.get_face_analyzer(model)
+        engine.get_face_analyzer(name)
     except engine.FaceEngineUnavailable as exc:
-        return {
-            "ready": False,
-            "error": str(exc),
-            "name": model,
-            "path": str(path),
-            "installed": True,
-        }
-    except Exception as exc:  # pragma: no cover - surfaced to the UI
+        return {"ready": False, "error": str(exc), "name": name, "path": str(path), "installed": True}
+    except Exception as exc:  # pragma: no cover
         return {
             "ready": False,
             "error": f"Model could not be loaded: {exc}",
-            "name": model,
+            "name": name,
             "path": str(path),
             "installed": True,
         }
     return {
         "ready": True,
         "installed": True,
-        "name": model,
+        "name": name,
         "path": str(path),
-        "providers": ["CPUExecutionProvider"],
+        "providers": settings.provider_list,
         "enrollDetSize": settings.face_det_size,
         "scanDetSize": settings.face_scan_det_size,
         "threshold": settings.face_similarity_threshold,
@@ -705,9 +1220,399 @@ def _model_info_sync(model: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Benchmark + sweep
+# --------------------------------------------------------------------------- #
+def _resolve_benchmark_config(request: BenchmarkRunRequest) -> dict:
+    registry = engine.registry_payload()
+    available_detectors = [item["id"] for item in registry["detectors"] if item["available"]]
+    available_recognizers = [item["id"] for item in registry["recognizers"] if item["available"]]
+    detectors = [item for item in (request.detectors or available_detectors) if item in available_detectors]
+    recognizers = [item for item in (request.recognizers or available_recognizers) if item in available_recognizers]
+    det_sizes = [int(size) for size in (request.det_sizes or settings.benchmark_det_size_list) if 320 <= int(size) <= 2048]
+    tiling_modes = request.tiling_modes or ["none"]
+    if not detectors:
+        raise HTTPException(status_code=422, detail="No available detectors to benchmark")
+    if not recognizers:
+        raise HTTPException(status_code=422, detail="No available recognizers to benchmark")
+    combos = [
+        (detector, recognizer, size, tiling)
+        for detector in detectors
+        for recognizer in recognizers
+        for size in det_sizes
+        for tiling in tiling_modes
+    ][: settings.benchmark_max_rows]
+    return {
+        "detectors": detectors,
+        "recognizers": recognizers,
+        "det_sizes": det_sizes,
+        "tiling_modes": tiling_modes,
+        "combos": combos,
+    }
+
+
+def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
+    if not request.dataset_ids:
+        raise HTTPException(status_code=422, detail="Pick at least one dataset")
+    manifests = {}
+    for dataset_id in request.dataset_ids:
+        manifest = dataset_store.load_manifest(dataset_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
+        manifests[dataset_id] = manifest
+
+    config = _resolve_benchmark_config(request)
+    if not config["combos"]:
+        raise HTTPException(status_code=422, detail="Benchmark grid is empty")
+
+    variant = request.variant or _variant_for(request.flip_aug, request.lowres_aug)
+    snapshot = _student_snapshot()
+    rows = []
+    warmups: dict[tuple, float] = {}
+
+    with _model_lock:
+        for detector_id, recognizer_id, det_size, tiling_mode in config["combos"]:
+            warm_key = (detector_id, recognizer_id, det_size, tiling_mode)
+            if warm_key not in warmups:
+                try:
+                    info = engine.warm_up(detector_id, recognizer_id, det_size, tiling_mode)
+                    warmups[warm_key] = float(info.get("warmup_ms") or 0.0)
+                except engine.FaceEngineUnavailable as exc:
+                    rows.append(
+                        {
+                            "detector": detector_id,
+                            "recognizer": recognizer_id,
+                            "detSize": det_size,
+                            "tilingMode": tiling_mode,
+                            "error": str(exc),
+                        }
+                    )
+                    continue
+            warmup_ms = warmups.get(warm_key, 0.0)
+
+            gallery = bench.build_gallery(snapshot, recognizer_id, variant)
+            det_params = cache_store.analysis_params(
+                det_size=det_size,
+                det_thresh=request.det_thresh,
+                nms_thresh=request.nms_thresh,
+                tiling_mode=tiling_mode,
+                lowres_aug=request.lowres_aug,
+                with_quality=request.with_quality,
+                with_pose=request.with_pose,
+            )
+
+            all_frames: list[dict] = []
+            timings: list[dict] = []
+            expected_faces = 0
+            annotated_boxes: list[dict] = []
+            present_ids: list[int] = []
+            try:
+                for dataset_id, manifest in manifests.items():
+                    gt = manifest.get("ground_truth", {})
+                    present_ids.extend(gt.get("present_student_ids", []))
+                    annotated_boxes.extend(gt.get("annotated_boxes", []))
+                    expected_faces += int(
+                        gt.get("expected_total_faces") or len(manifest.get("frames", []))
+                    )
+                    for frame in manifest["frames"][: settings.benchmark_max_frames]:
+                        path = dataset_store.dataset_dir(dataset_id) / frame["filename"]
+                        if not path.is_file():
+                            continue
+                        data = path.read_bytes()
+                        image_bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if image_bgr is None:
+                            continue
+                        payload, _cached = _analyze_or_cache(
+                            image_bgr, data,
+                            detector_id=detector_id, recognizer_id=recognizer_id,
+                            det_params=det_params, flip_aug=request.flip_aug,
+                        )
+                        all_frames.append(
+                            {
+                                "frame_id": frame["frame_id"],
+                                "width": frame["width"],
+                                "height": frame["height"],
+                                "detections": payload["detections"],
+                                "timings": payload["timings_ms"],
+                            }
+                        )
+                        timings.append(payload["timings_ms"])
+            except engine.FaceEngineUnavailable as exc:
+                rows.append(
+                    {
+                        "detector": detector_id,
+                        "recognizer": recognizer_id,
+                        "detSize": det_size,
+                        "tilingMode": tiling_mode,
+                        "error": str(exc),
+                    }
+                )
+                continue
+
+            if not all_frames:
+                rows.append(
+                    {
+                        "detector": detector_id,
+                        "recognizer": recognizer_id,
+                        "detSize": det_size,
+                        "tilingMode": tiling_mode,
+                        "error": "no readable frames in the selected datasets",
+                    }
+                )
+                continue
+
+            curve = bench.threshold_curve(
+                all_frames,
+                gallery,
+                present_ids,
+                variant=variant,
+                review_ratio=(request.review_threshold / request.accept_threshold)
+                if request.accept_threshold else 0.8,
+                min_margin=request.min_margin,
+                assignment_mode=request.assignment_mode,
+                template_strategy=request.template_strategy,
+                top_k=request.top_k,
+                fusion_mode=request.fusion_mode,
+                k=request.k,
+            )
+            points = bench.pick_operating_points(curve)
+            chosen_threshold = request.accept_threshold or (
+                points["best_f1"]["threshold"] if points["best_f1"] else request.review_threshold
+            )
+            evaluation = bench.evaluate_frames(
+                all_frames,
+                gallery,
+                present_ids,
+                variant=variant,
+                accept_threshold=chosen_threshold,
+                review_threshold=request.review_threshold,
+                min_margin=request.min_margin,
+                assignment_mode=request.assignment_mode,
+                template_strategy=request.template_strategy,
+                top_k=request.top_k,
+                fusion_mode=request.fusion_mode,
+                k=request.k,
+                min_quality=request.min_quality,
+                annotated_boxes=annotated_boxes,
+            )
+            rows.append(
+                {
+                    "detector": detector_id,
+                    "recognizer": recognizer_id,
+                    "detSize": det_size,
+                    "tilingMode": tiling_mode,
+                    "variant": variant,
+                    "acceptThreshold": chosen_threshold,
+                    "reviewThreshold": request.review_threshold,
+                    "minMargin": request.min_margin,
+                    "assignmentMode": request.assignment_mode,
+                    "templateStrategy": request.template_strategy,
+                    "fusionMode": request.fusion_mode,
+                    "metrics": evaluation["attendance"],
+                    "tauF1": points["best_f1"]["threshold"] if points["best_f1"] else None,
+                    "bestF1": points["best_f1"]["f1"] if points["best_f1"] else 0.0,
+                    "far0": points["far0"],
+                    "prec98": points["prec98"],
+                    "detection": evaluation["detection"],
+                    "facesDetected": evaluation["faces_detected"],
+                    "expectedFaces": expected_faces,
+                    "latency": bench.latency_percentiles(timings),
+                    "warmupMs": round(warmup_ms, 3),
+                    "curve": curve,
+                }
+            )
+
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    run = {
+        "runId": run_id,
+        "createdAt": _now(),
+        "config": {
+            "datasetIds": request.dataset_ids,
+            "detectors": config["detectors"],
+            "recognizers": config["recognizers"],
+            "detSizes": config["det_sizes"],
+            "tilingModes": config["tiling_modes"],
+            "detThresh": request.det_thresh,
+            "nmsThresh": request.nms_thresh,
+            "variant": variant,
+            "flipAug": request.flip_aug,
+            "lowresAug": request.lowres_aug,
+            "withQuality": request.with_quality,
+            "withPose": request.with_pose,
+        },
+        "rows": rows,
+    }
+    _save_benchmark(run)
+    return run
+
+
+def _save_benchmark(run: dict) -> None:
+    path = settings.benchmarks_dir / f"{run['runId']}.json"
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(run, indent=2), encoding="utf-8")
+    temp.replace(path)
+    files = sorted(settings.benchmarks_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in files[10:]:
+        stale.unlink(missing_ok=True)
+
+
+def _list_benchmarks() -> list[dict]:
+    if not settings.benchmarks_dir.exists():
+        return []
+    items = []
+    for path in settings.benchmarks_dir.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        items.append(
+            {
+                "runId": data.get("runId"),
+                "createdAt": data.get("createdAt"),
+                "rows": len(data.get("rows", [])),
+                "config": data.get("config"),
+            }
+        )
+    items.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
+    return items
+
+
+def _sweep_dataset(
+    dataset_ids: list[str],
+    detector_id: str,
+    recognizer_id: str,
+    det_size: int,
+    det_params: dict,
+    flip_aug: bool,
+    variant: str,
+    accept_threshold: float,
+    review_threshold: float,
+    min_margin: float,
+    assignment_mode: str,
+    template_strategy: str,
+    top_k: int,
+    fusion_mode: str,
+    fusion_k: int,
+    min_quality: float,
+) -> dict:
+    snapshot = _student_snapshot()
+    gallery = bench.build_gallery(snapshot, recognizer_id, variant)
+    per_dataset = []
+    total_tp = total_fp = total_fn = 0
+    for dataset_id in dataset_ids:
+        manifest = dataset_store.load_manifest(dataset_id)
+        if manifest is None:
+            raise HTTPException(status_code=404, detail=f"Dataset '{dataset_id}' not found")
+        frames, missing = bench.load_cached_frames(
+            dataset_id,
+            detector_id=detector_id,
+            recognizer_id=recognizer_id,
+            det_params=det_params,
+            flip_aug=flip_aug,
+        )
+        if missing or not frames:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Dataset '{dataset_id}' has no cached inference for this model "
+                    f"({missing} frame(s) missing). Run the benchmark first."
+                ),
+            )
+        gt = manifest.get("ground_truth", {})
+        evaluation = bench.evaluate_frames(
+            frames,
+            gallery,
+            gt.get("present_student_ids", []),
+            variant=variant,
+            accept_threshold=accept_threshold,
+            review_threshold=review_threshold,
+            min_margin=min_margin,
+            assignment_mode=assignment_mode,
+            template_strategy=template_strategy,
+            top_k=top_k,
+            fusion_mode=fusion_mode,
+            k=fusion_k,
+            min_quality=min_quality,
+            annotated_boxes=gt.get("annotated_boxes", []),
+        )
+        total_tp += evaluation["attendance"]["tp"]
+        total_fp += evaluation["attendance"]["fp"]
+        total_fn += evaluation["attendance"]["fn"]
+        per_dataset.append(
+            {
+                "datasetId": dataset_id,
+                "name": manifest.get("name"),
+                "attendance": evaluation["attendance"],
+                "detection": evaluation["detection"],
+                "students": {str(k): v for k, v in evaluation["students"].items()},
+                "faces": [
+                    [
+                        _serialize_face(decision, det, snapshot)
+                        for det, decision in zip(frame["detections"], decisions)
+                    ]
+                    for frame, decisions in zip(frames, evaluation["per_frame"])
+                ],
+            }
+        )
+
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    return {
+        "attendance": {
+            "tp": total_tp,
+            "fp": total_fp,
+            "fn": total_fn,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+        },
+        "datasets": per_dataset,
+        "params": {
+            "detector": detector_id,
+            "recognizer": recognizer_id,
+            "detSize": det_size,
+            "variant": variant,
+            "acceptThreshold": accept_threshold,
+            "reviewThreshold": review_threshold,
+            "minMargin": min_margin,
+            "assignmentMode": assignment_mode,
+            "templateStrategy": template_strategy,
+            "fusionMode": fusion_mode,
+            "fusionK": fusion_k,
+        },
+    }
+
+
+def _run_sweep_sync(request: SweepRequest) -> dict:
+    if not request.dataset_ids:
+        raise HTTPException(status_code=422, detail="Pick at least one dataset")
+    detector_id = request.detector or settings.default_detector
+    recognizer_id = request.recognizer or settings.default_recognizer
+    _require_detector(detector_id)
+    _require_recognizer(recognizer_id)
+    det_size = request.det_size or settings.face_scan_det_size
+    det_params = cache_store.analysis_params(
+        det_size=det_size,
+        det_thresh=request.det_thresh,
+        nms_thresh=request.nms_thresh,
+        tiling_mode=request.tiling_mode,
+        lowres_aug=request.lowres_aug,
+        with_quality=request.with_quality,
+        with_pose=request.with_pose,
+    )
+    variant = request.variant or _variant_for(request.flip_aug, request.lowres_aug)
+    return _sweep_dataset(
+        request.dataset_ids, detector_id, recognizer_id, det_size, det_params,
+        request.flip_aug, variant, request.accept_threshold, request.review_threshold,
+        request.min_margin, request.assignment_mode, request.template_strategy,
+        request.top_k, request.fusion_mode, request.k, request.min_quality,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
-app = FastAPI(title="FaceLab", version="0.2.0")
+app = FastAPI(title="FaceLab", version="0.3.0")
 
 if settings.cors_origin_list:
     app.add_middleware(
@@ -720,6 +1625,8 @@ if settings.cors_origin_list:
 
 app.mount("/media/faces", StaticFiles(directory=str(settings.faces_dir)), name="faces")
 app.mount("/media/scans", StaticFiles(directory=str(settings.scans_dir)), name="scans")
+app.mount("/media/crops", StaticFiles(directory=str(settings.crops_dir)), name="crops")
+app.mount("/media/datasets", StaticFiles(directory=str(settings.datasets_dir)), name="datasets")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -738,6 +1645,9 @@ def health() -> dict:
     return {
         "status": "ok",
         "defaultModel": settings.default_model,
+        "defaultDetector": settings.default_detector,
+        "defaultRecognizer": settings.default_recognizer,
+        "providers": settings.provider_list,
         "models": [item["name"] for item in engine.available_models()],
     }
 
@@ -747,28 +1657,50 @@ def state() -> dict:
     return _public_state()
 
 
+@app.get("/api/registry")
+def registry() -> dict:
+    return _registry_state()
+
+
 @app.get("/api/models")
 def models() -> dict:
     return _models_payload()
 
 
 @app.get("/api/model")
-async def model(name: str | None = None) -> dict:
-    return await run_in_threadpool(_model_info_sync, name or settings.default_model)
+async def model(
+    name: str | None = None,
+    detector: str | None = None,
+    recognizer: str | None = None,
+) -> dict:
+    return await run_in_threadpool(_model_info_sync, name, detector, recognizer)
 
 
+@app.get("/api/cache")
+def cache_stats() -> dict:
+    files = list(settings.cache_dir.glob("*.json")) if settings.cache_dir.exists() else []
+    return {
+        "cacheDir": str(settings.cache_dir),
+        "entries": len(files),
+        "bytes": sum(path.stat().st_size for path in files),
+        "crops": len(list(settings.crops_dir.glob("*.jpg"))) if settings.crops_dir.exists() else 0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Students / enrollment
+# --------------------------------------------------------------------------- #
 @app.post("/api/people")
 async def create_person(
     images: list[UploadFile] = File(...),
     name: str = Form(""),
     model: str = Form(""),
+    recognizer: str = Form(""),
+    _: None = Depends(require_token),
 ) -> dict:
-    raw = []
-    for image in images:
-        raw.append((await image.read(), image.filename))
-    person = await run_in_threadpool(
-        _create_person_sync, name, model or settings.default_model, raw
-    )
+    raw = [(await image.read(), image.filename) for image in images]
+    recognizer_id = recognizer or (default_recognizer_for_pack(model) if model else settings.default_recognizer)
+    person = await run_in_threadpool(_create_person_sync, name, recognizer_id, raw)
     return {"person": person, "state": _public_state()}
 
 
@@ -777,18 +1709,22 @@ async def add_photos(
     person_id: int,
     images: list[UploadFile] = File(...),
     model: str = Form(""),
+    recognizer: str = Form(""),
+    _: None = Depends(require_token),
 ) -> dict:
-    raw = []
-    for image in images:
-        raw.append((await image.read(), image.filename))
-    person = await run_in_threadpool(
-        _add_photos_sync, person_id, model or settings.default_model, raw
-    )
+    raw = [(await image.read(), image.filename) for image in images]
+    recognizer_id = recognizer or (default_recognizer_for_pack(model) if model else settings.default_recognizer)
+    person = await run_in_threadpool(_add_photos_sync, person_id, recognizer_id, raw)
     return {"person": person, "state": _public_state()}
 
 
+@app.post("/api/students/re-embed")
+async def re_embed(payload: ReEmbedRequest, _: None = Depends(require_token)) -> dict:
+    return await run_in_threadpool(_reembed_sync, payload.recognizer_ids)
+
+
 @app.patch("/api/people/{person_id}")
-def rename_person(person_id: int, payload: RenameRequest) -> dict:
+def rename_person(person_id: int, payload: RenameRequest, _: None = Depends(require_token)) -> dict:
     clean_name = payload.name.strip()[:80]
     if not clean_name:
         raise HTTPException(status_code=422, detail="Name cannot be empty")
@@ -802,7 +1738,7 @@ def rename_person(person_id: int, payload: RenameRequest) -> dict:
 
 
 @app.delete("/api/people/{person_id}/photos/{photo_id}")
-def delete_photo(person_id: int, photo_id: str) -> dict:
+def delete_photo(person_id: int, photo_id: str, _: None = Depends(require_token)) -> dict:
     with _state_lock:
         person = _people.get(person_id)
         if person is None:
@@ -813,14 +1749,14 @@ def delete_photo(person_id: int, photo_id: str) -> dict:
         person["photos"].remove(photo)
         try:
             (settings.data_dir / photo["filename"]).unlink(missing_ok=True)
-        except OSError:
+        except (OSError, TypeError):
             pass
         _save_state()
     return {"person": _public_person(person), "state": _public_state()}
 
 
 @app.delete("/api/people/{person_id}")
-def delete_person(person_id: int) -> dict:
+def delete_person(person_id: int, _: None = Depends(require_token)) -> dict:
     with _state_lock:
         person = _people.pop(person_id, None)
         if person is None:
@@ -828,6 +1764,80 @@ def delete_person(person_id: int) -> dict:
         shutil.rmtree(settings.faces_dir / f"p{person['number']}", ignore_errors=True)
         _save_state()
     return {"ok": True, "state": _public_state()}
+
+
+# --------------------------------------------------------------------------- #
+# Scanning
+# --------------------------------------------------------------------------- #
+@app.post("/api/scan")
+async def scan(
+    images: list[UploadFile] = File(...),
+    model: str = Form(""),
+    detector: str = Form(""),
+    recognizer: str = Form(""),
+    threshold: float | None = Form(None),
+    accept_threshold: float | None = Form(None, alias="acceptThreshold"),
+    review_threshold: float | None = Form(None, alias="reviewThreshold"),
+    min_margin: float | None = Form(None, alias="minMargin"),
+    det_size: int | None = Form(None, alias="detSize"),
+    det_thresh: float | None = Form(None, alias="detThresh"),
+    nms_thresh: float | None = Form(None, alias="nmsThresh"),
+    tiling_mode: str = Form("", alias="tilingMode"),
+    assignment_mode: str = Form("", alias="assignmentMode"),
+    template_strategy: str = Form("", alias="templateStrategy"),
+    top_k: int | None = Form(None, alias="topK"),
+    fusion_mode: str = Form("", alias="fusionMode"),
+    fusion_k: int | None = Form(None, alias="fusionK"),
+    flip_aug: bool = Form(True, alias="flipAug"),
+    lowres_aug: bool = Form(False, alias="lowresAug"),
+    with_quality: bool = Form(True, alias="withQuality"),
+    with_pose: bool = Form(True, alias="withPose"),
+    min_quality: float | None = Form(None, alias="minQuality"),
+    _: None = Depends(require_token),
+) -> dict:
+    if not images:
+        raise HTTPException(status_code=422, detail="Add at least one classroom frame")
+    if len(images) > settings.face_scan_max_frames:
+        raise HTTPException(
+            status_code=422, detail=f"Up to {settings.face_scan_max_frames} frames per scan"
+        )
+    detector_id, recognizer_id = _legacy_ids(model or None, detector or None, recognizer or None)
+    det_size = det_size or settings.face_scan_det_size
+    if not 320 <= det_size <= 2048:
+        raise HTTPException(status_code=422, detail="Detector size must be 320-2048")
+    accept = accept_threshold if accept_threshold is not None else (
+        threshold if threshold is not None else settings.accept_threshold
+    )
+    for name, value in (("acceptThreshold", accept), ("reviewThreshold", review_threshold),
+                        ("minMargin", min_margin)):
+        if value is not None and not 0.0 <= value <= 1.0:
+            raise HTTPException(status_code=422, detail=f"{name} must be between 0 and 1")
+    raw = [(await image.read(), image.filename) for image in images]
+    return await run_in_threadpool(
+        _run_scan_sync,
+        raw,
+        detector_id=detector_id,
+        recognizer_id=recognizer_id,
+        det_size=det_size,
+        det_thresh=det_thresh if det_thresh is not None else 0.35,
+        nms_thresh=nms_thresh if nms_thresh is not None else 0.45,
+        tiling_mode=tiling_mode or settings.tiling_mode,
+        accept_threshold=accept,
+        review_threshold=(
+            review_threshold if review_threshold is not None else settings.review_threshold
+        ),
+        min_margin=min_margin if min_margin is not None else settings.min_margin,
+        assignment_mode=assignment_mode or settings.assignment_mode,
+        template_strategy=template_strategy or settings.template_strategy,
+        top_k=top_k if top_k is not None else settings.template_top_k,
+        fusion_mode=fusion_mode or settings.multi_frame_fusion,
+        fusion_k=fusion_k if fusion_k is not None else settings.fusion_k,
+        flip_aug=flip_aug,
+        lowres_aug=lowres_aug,
+        with_quality=with_quality,
+        with_pose=with_pose,
+        min_quality=min_quality if min_quality is not None else settings.min_face_quality,
+    )
 
 
 @app.get("/api/results")
@@ -844,7 +1854,7 @@ def get_result(scan_id: str) -> dict:
 
 
 @app.delete("/api/results/{scan_id}")
-def delete_result(scan_id: str) -> dict:
+def delete_result(scan_id: str, _: None = Depends(require_token)) -> dict:
     path = _result_path(scan_id)
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="Result not found")
@@ -853,46 +1863,198 @@ def delete_result(scan_id: str) -> dict:
     return {"ok": True, "results": _list_results()}
 
 
-@app.post("/api/reset")
-def reset() -> dict:
-    global _next_number
-    with _state_lock:
-        _people.clear()
-        _next_number = 1
-        _save_state()
-    shutil.rmtree(settings.faces_dir, ignore_errors=True)
-    shutil.rmtree(settings.scans_dir, ignore_errors=True)
-    shutil.rmtree(settings.results_dir, ignore_errors=True)
-    settings.ensure_dirs()
-    return {"ok": True, "state": _public_state()}
+@app.post("/api/results/{scan_id}/sweep")
+def sweep_result(scan_id: str, payload: SweepRequest) -> dict:
+    """Re-score a saved scan from its cache when the threshold sliders move."""
+    path = _result_path(scan_id)
+    if path is None or not path.exists():
+        raise HTTPException(status_code=404, detail="Result not found")
+    result = json.loads(path.read_text(encoding="utf-8"))
+    summary = result.get("summary", {})
+    detector_id = payload.detector or result.get("detectorId") or settings.default_detector
+    recognizer_id = payload.recognizer or result.get("recognizerId") or settings.default_recognizer
+    det_params = summary.get("detParams") or cache_store.analysis_params(
+        det_size=summary.get("detSize") or settings.face_scan_det_size,
+        det_thresh=summary.get("detThresh", 0.35),
+        nms_thresh=summary.get("nmsThresh", 0.45),
+        tiling_mode=summary.get("tilingMode", "none"),
+        lowres_aug=summary.get("lowresAug", False),
+    )
+    variant = payload.variant or summary.get("variant") or _variant_for(
+        summary.get("flipAug", True), summary.get("lowresAug", False)
+    )
+    snapshot = _student_snapshot()
+    gallery = bench.build_gallery(snapshot, recognizer_id, variant)
+
+    frames = []
+    missing = 0
+    for frame in result.get("frames", []):
+        key = frame.get("cacheKey")
+        cached = cache_store.load_analysis(key) if key else None
+        if cached is None:
+            missing += 1
+            continue
+        frames.append(
+            {
+                "frame_id": f"frame_{frame['order'] + 1}",
+                "width": frame["width"],
+                "height": frame["height"],
+                "detections": cached["detections"],
+            }
+        )
+    if missing or not frames:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cached inference for this scan is missing ({missing} frame(s)). Re-run the scan.",
+        )
+
+    # Attendance ground truth is unknown for ad-hoc scans, so report the
+    # per-student decisions and per-face statuses only.
+    fusion_frames = bench._fusion_frames(frames, variant)
+    fused = matching.fuse_multi_frame(
+        fusion_frames,
+        gallery,
+        mode=payload.fusion_mode,
+        accept_threshold=payload.accept_threshold,
+        review_threshold=payload.review_threshold,
+        min_margin=payload.min_margin,
+        assignment_mode=payload.assignment_mode,
+        template_strategy=payload.template_strategy,
+        top_k=payload.top_k,
+        k=payload.k,
+        min_quality=payload.min_quality,
+    )
+    faces = [
+        [
+            _serialize_face(decision, det, snapshot)
+            for det, decision in zip(frame["detections"], decisions)
+        ]
+        for frame, decisions in zip(frames, fused["per_frame"])
+    ]
+    return {
+        "students": {str(k): v for k, v in fused["students"].items()},
+        "faces": faces,
+        "matchedCount": sum(1 for record in fused["students"].values() if record["status"] == "present"),
+        "unknown": sum(
+            1 for frame in faces for face in frame if face["status"] == "unmatched"
+        ),
+        "params": payload.model_dump(),
+    }
 
 
-@app.post("/api/scan")
-async def scan(
+# --------------------------------------------------------------------------- #
+# Datasets
+# --------------------------------------------------------------------------- #
+@app.get("/api/datasets")
+def list_datasets() -> dict:
+    return {"datasets": dataset_store.list_datasets()}
+
+
+@app.post("/api/datasets")
+async def create_dataset(
     images: list[UploadFile] = File(...),
-    model: str = Form(""),
-    threshold: float | None = Form(None),
-    det_size: int | None = Form(None, alias="detSize"),
+    name: str = Form(""),
+    present_ids: str = Form("", alias="presentIds"),
+    boxes: str = Form(""),
+    notes: str = Form(""),
+    dataset_id: str = Form("", alias="datasetId"),
+    _: None = Depends(require_token),
 ) -> dict:
     if not images:
         raise HTTPException(status_code=422, detail="Add at least one classroom frame")
     if len(images) > settings.face_scan_max_frames:
         raise HTTPException(
-            status_code=422, detail=f"Up to {settings.face_scan_max_frames} frames per scan"
+            status_code=422,
+            detail=f"Up to {settings.face_scan_max_frames} frames per dataset",
         )
-    value = settings.face_similarity_threshold if threshold is None else threshold
-    if not 0.0 <= value <= 1.0:
-        raise HTTPException(status_code=422, detail="Threshold must be between 0 and 1")
-    size = settings.face_scan_det_size if det_size is None else det_size
-    if not 320 <= size <= 2048:
-        raise HTTPException(status_code=422, detail="Detector size must be 320-2048")
+    try:
+        present_list = json.loads(present_ids) if present_ids else []
+        box_list = json.loads(boxes) if boxes else []
+        assert isinstance(present_list, list) and isinstance(box_list, list)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid ground-truth JSON: {exc}") from exc
 
-    raw = []
-    for image in images:
-        raw.append((await image.read(), image.filename))
-    return await run_in_threadpool(
-        _run_scan_sync, raw, model or settings.default_model, value, size
-    )
+    raw = [(await image.read(), image.filename) for image in images]
+    try:
+        manifest = await run_in_threadpool(
+            dataset_store.create_dataset,
+            name,
+            raw,
+            present_list,
+            box_list,
+            notes,
+            dataset_id or None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"dataset": manifest, "datasets": dataset_store.list_datasets()}
+
+
+@app.get("/api/datasets/{dataset_id}")
+def get_dataset(dataset_id: str) -> dict:
+    manifest = dataset_store.load_manifest(dataset_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return manifest
+
+
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id: str, _: None = Depends(require_token)) -> dict:
+    if not dataset_store.delete_dataset(dataset_id):
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return {"ok": True, "datasets": dataset_store.list_datasets()}
+
+
+# --------------------------------------------------------------------------- #
+# Benchmarking
+# --------------------------------------------------------------------------- #
+@app.post("/api/benchmark/run")
+async def benchmark_run(payload: BenchmarkRunRequest, _: None = Depends(require_token)) -> dict:
+    return await run_in_threadpool(_run_benchmark_sync, payload)
+
+
+@app.post("/api/benchmark/sweep")
+async def benchmark_sweep(payload: SweepRequest) -> dict:
+    return await run_in_threadpool(_run_sweep_sync, payload)
+
+
+@app.get("/api/benchmarks")
+def list_benchmarks() -> dict:
+    return {"benchmarks": _list_benchmarks()}
+
+
+@app.get("/api/benchmarks/{run_id}")
+def get_benchmark(run_id: str) -> dict:
+    if not run_id or any(char not in "0123456789abcdef-" for char in run_id.lower()):
+        raise HTTPException(status_code=404, detail="Benchmark not found")
+    path = settings.benchmarks_dir / f"{run_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Benchmark not found")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+# --------------------------------------------------------------------------- #
+# Reset
+# --------------------------------------------------------------------------- #
+@app.post("/api/reset")
+def reset(_: None = Depends(require_token)) -> dict:
+    global _next_number
+    with _state_lock:
+        _people.clear()
+        _next_number = 1
+        _save_state()
+    for folder in (
+        settings.faces_dir,
+        settings.scans_dir,
+        settings.results_dir,
+        settings.crops_dir,
+        settings.cache_dir,
+        settings.datasets_dir,
+        settings.benchmarks_dir,
+    ):
+        shutil.rmtree(folder, ignore_errors=True)
+    settings.ensure_dirs()
+    return {"ok": True, "state": _public_state()}
 
 
 def main() -> None:
@@ -901,21 +2063,21 @@ def main() -> None:
     default_host = os.environ.get("FACELAB_HOST") or os.environ.get("HOST")
     default_port = os.environ.get("FACELAB_PORT") or os.environ.get("PORT")
     if default_host is None:
-        # Containers and PaaS deployments expose the server on PORT and need
-        # it on 0.0.0.0.
         default_host = "0.0.0.0" if default_port else "127.0.0.1"
 
-    parser = argparse.ArgumentParser(description="FaceLab face-model playground")
+    parser = argparse.ArgumentParser(description="FaceLab face-model benchmark harness")
     parser.add_argument("--host", default=default_host)
     parser.add_argument("--port", type=int, default=int(default_port or 8010))
     parser.add_argument("--log-level", default="info")
     args = parser.parse_args()
 
-    print(f"[facelab] env:     {settings.env}")
-    print(f"[facelab] models:  {settings.models_dir}")
-    print(f"[facelab] data:    {settings.data_dir}")
-    print(f"[facelab] default: {settings.default_model}")
-    print(f"[facelab] open:    http://{args.host}:{args.port}")
+    print(f"[facelab] env:       {settings.env}")
+    print(f"[facelab] models:    {settings.models_dir}")
+    print(f"[facelab] data:      {settings.data_dir}")
+    print(f"[facelab] providers: {settings.provider_list}")
+    print(f"[facelab] detector:  {settings.default_detector}")
+    print(f"[facelab] recognizer:{settings.default_recognizer}")
+    print(f"[facelab] open:      http://{args.host}:{args.port}")
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
 
 

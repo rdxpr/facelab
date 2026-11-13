@@ -36,6 +36,34 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def analysis_params(
+    det_size: int,
+    det_thresh: float = 0.35,
+    nms_thresh: float = 0.45,
+    tiling_mode: str = "none",
+    tile_size: int = 640,
+    tile_overlap: float = 0.25,
+    lowres_aug: bool = False,
+    with_quality: bool = True,
+    with_pose: bool = True,
+) -> dict:
+    """Build the analysis parameter dict shared by the scan/benchmark paths.
+
+    Two callers must build this identically or their cache keys will not match.
+    """
+    return {
+        "det_size": [int(det_size), int(det_size)],
+        "det_thresh": float(det_thresh),
+        "nms_thresh": float(nms_thresh),
+        "tiling_mode": tiling_mode,
+        "tile_size": int(tile_size),
+        "tile_overlap": float(tile_overlap),
+        "lowres_aug": bool(lowres_aug),
+        "with_quality": bool(with_quality),
+        "with_pose": bool(with_pose),
+    }
+
+
 def _param_fingerprint(
     image_sha256: str,
     detector_id: str,
@@ -53,6 +81,9 @@ def _param_fingerprint(
         "tiling_mode": det_params.get("tiling_mode", "none"),
         "tile_size": int(det_params.get("tile_size", 640)),
         "tile_overlap": round(float(det_params.get("tile_overlap", 0.25)), 3),
+        "lowres_aug": bool(det_params.get("lowres_aug", False)),
+        "with_quality": bool(det_params.get("with_quality", True)),
+        "with_pose": bool(det_params.get("with_pose", True)),
         "recognizer_id": recognizer_id,
         "flip_aug": bool(flip_aug),
     }
