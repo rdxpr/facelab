@@ -1335,24 +1335,29 @@ function renderBenchmark(run) {
 function curveSvg(curve) {
   if (!curve?.length) return "";
   const width = 520;
-  const height = 120;
-  const pad = 6;
+  const height = 130;
+  const pad = 10;
   const x = (index) => pad + (index / (curve.length - 1)) * (width - pad * 2);
-  const y = (value) => height - pad - value * (height - pad * 2);
+  const y = (value) => height - pad - clamp(value, 0, 1) * (height - pad * 2);
   const path = (key) =>
-    curve.map((point, index) => `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(clamp(point[key], 0, 1)).toFixed(1)}`).join(" ");
+    curve.map((point, index) => `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(point[key]).toFixed(1)}`).join(" ");
   const bestIndex = curve.reduce((best, point, index) => (point.f1 > curve[best].f1 ? index : best), 0);
   const best = curve[bestIndex];
+  const grid = [0.25, 0.5, 0.75]
+    .map((tick) => `<line x1="${pad}" y1="${y(tick).toFixed(1)}" x2="${width - pad}" y2="${y(tick).toFixed(1)}" class="curve-grid" />`)
+    .join("");
   return `
-    <svg class="curve" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="precision, recall, F1 vs threshold">
-      <line x1="${x(bestIndex)}" y1="${pad}" x2="${x(bestIndex)}" y2="${height - pad}" class="curve-marker" />
-      <path d="${path("precision")}" class="curve-line precision" />
-      <path d="${path("recall")}" class="curve-line recall" />
-      <path d="${path("f1")}" class="curve-line f1" />
-      <text x="${pad}" y="${height - 2}">τ=${fixed(curve[0].threshold, 2)}</text>
-      <text x="${width - pad}" y="${height - 2}" text-anchor="end">τ=${fixed(curve[curve.length - 1].threshold, 2)}</text>
-      <text x="${x(bestIndex)}" y="${pad + 10}" text-anchor="middle" class="curve-best">F1 ${fixed(best.f1)} @ ${fixed(best.threshold, 2)}</text>
-    </svg>
+    <div class="curve-wrap">
+      <svg class="curve" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img" aria-label="precision, recall and F1 against threshold">
+        ${grid}
+        <line x1="${x(bestIndex).toFixed(1)}" y1="${pad}" x2="${x(bestIndex).toFixed(1)}" y2="${height - pad}" class="curve-marker" />
+        <path d="${path("precision")}" class="curve-line precision" />
+        <path d="${path("recall")}" class="curve-line recall" />
+        <path d="${path("f1")}" class="curve-line f1" />
+      </svg>
+      <span class="curve-note">F1 ${fixed(best.f1)} @ τ ${fixed(best.threshold, 2)}</span>
+      <div class="curve-axis"><span>τ ${fixed(curve[0].threshold, 2)}</span><span>τ ${fixed(curve[curve.length - 1].threshold, 2)}</span></div>
+    </div>
     <div class="curve-legend"><span class="curve-key precision"></span>precision <span class="curve-key recall"></span>recall <span class="curve-key f1"></span>F1</div>`;
 }
 
@@ -1448,11 +1453,17 @@ async function handleBenchHistoryClick(event) {
 
 /* ------------------------------------------------------------- tab + reset */
 
-function switchTab(name) {
+const TABS = ["attendance", "benchmark", "datasets"];
+
+function switchTab(name, options = {}) {
+  if (!TABS.includes(name)) name = "attendance";
   for (const tab of $$("#tabs .tab")) tab.classList.toggle("active", tab.dataset.tab === name);
   for (const panel of $$(".workspace[data-panel]")) panel.hidden = panel.dataset.panel !== name;
   if (name === "datasets") { renderDatasets(); renderPresentPicker(); }
   if (name === "benchmark") { renderBenchDatasets(); renderBenchOptions(); }
+  if (!options.silent && window.location.hash.slice(1) !== name) {
+    window.location.hash = name;
+  }
 }
 
 function setBanner(selector, message) {
@@ -1569,6 +1580,7 @@ function wireEvents() {
     const tab = event.target.closest(".tab");
     if (tab) switchTab(tab.dataset.tab);
   });
+  window.addEventListener("hashchange", () => switchTab(window.location.hash.slice(1), { silent: true }));
 
   $("#add-person-form").addEventListener("submit", addPerson);
   $("#face-input").addEventListener("change", (event) => {
@@ -1651,6 +1663,7 @@ async function init() {
     await loadDatasets();
     await loadBenchmarks();
     await refreshModelStatus();
+    switchTab(window.location.hash.slice(1) || "attendance", { silent: true });
   } catch (error) {
     toast(`Startup problem: ${error.message}`, "error");
   }
