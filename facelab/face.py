@@ -94,11 +94,16 @@ def _uniface_enum(value: str):
 
     for name in dir(constants):
         candidate = getattr(constants, name)
-        if isinstance(candidate, type) and issubclass(candidate, _enum.Enum):
-            try:
-                return candidate(value)
-            except ValueError:
-                continue
+        if not (isinstance(candidate, type) and issubclass(candidate, _enum.Enum)):
+            continue
+        # Skip the bare `Enum` base and any memberless class: calling them with a
+        # value raises TypeError rather than the ValueError we look for.
+        if candidate is _enum.Enum or not list(candidate):
+            continue
+        try:
+            return candidate(value)
+        except ValueError:
+            continue
     raise FaceEngineUnavailable(f"UniFace has no weights entry named '{value}'.")
 
 

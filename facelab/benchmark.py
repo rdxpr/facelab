@@ -56,10 +56,13 @@ def build_gallery(
                 candidates = [
                     entry.get(name)
                     for name in ("raw", "flip_avg", "lowres_aug")
-                    if entry.get(name)
+                    if entry.get(name) is not None
                 ]
             else:
-                candidates = [entry.get(variant) or entry.get("raw")]
+                candidate = entry.get(variant)
+                if candidate is None:
+                    candidate = entry.get("raw")
+                candidates = [candidate]
             for vector in candidates:
                 if vector is None:
                     continue

@@ -18,7 +18,7 @@ Examples:
     python scripts/fetch_models.py                       # default pack
     python scripts/fetch_models.py --pack buffalo_l --pack antelopev2
     python scripts/fetch_models.py --uniface adaface_ir_101 --uniface retinaface_r50
-    python scripts/fetch_models.py --all                 # every known model
+    python scripts/fetch_models.py --all                 # every pack + YuNet + FaceLab's UniFace weights
     python scripts/fetch_models.py --force               # re-download packs
 """
 
@@ -45,7 +45,12 @@ YUNET_URL = (
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from facelab.config import KNOWN_PACKS, KNOWN_RECOGNIZERS, KNOWN_DETECTORS  # noqa: E402
+from facelab.config import (  # noqa: E402
+    KNOWN_PACKS,
+    KNOWN_RECOGNIZERS,
+    KNOWN_DETECTORS,
+    Settings,
+)
 
 # Backwards-compatible alias: older docs call packs "models".
 KNOWN_MODELS = {name: spec["required"] for name, spec in KNOWN_PACKS.items()}
@@ -55,6 +60,28 @@ for entry in list(KNOWN_DETECTORS.values()) + list(KNOWN_RECOGNIZERS.values()):
     value = entry.get("uniface_weights")
     if value:
         UNIFACE_WEIGHTS[value] = entry["id"]
+
+
+def required_uniface_weights() -> list[str]:
+    """UniFace weights the registry can actually use, plus the predictors.
+
+    UniFace ships dozens of models (gaze, matting, parsing, ...) that FaceLab
+    never loads, so ``--all`` targets this set instead of every enum member.
+    """
+    values = set(UNIFACE_WEIGHTS)
+    try:
+        settings = Settings()
+        predictors = (settings.quality_predictor, settings.head_pose_predictor)
+    except Exception:
+        predictors = ("uniface:ediffiqa_s", "uniface:headpose_6d")
+    for predictor_id in predictors:
+        if not predictor_id or not predictor_id.startswith("uniface:"):
+            continue
+        value = predictor_id.split(":", 1)[-1]
+        if value in ("6d", "headpose_6d"):
+            value = "headpose_mobilenetv2"
+        values.add(value)
+    return sorted(values)
 
 
 def default_models_dir() -> Path:
@@ -225,6 +252,10 @@ def fetch_uniface(names: list[str], force: bool) -> bool:
         for enum_cls in vars(constants).values():
             if not (isinstance(enum_cls, type) and issubclass(enum_cls, _enum.Enum)):
                 continue
+            # The bare `Enum` base and memberless classes raise TypeError when
+            # called with a value, so skip them before probing membership.
+            if enum_cls is _enum.Enum or not list(enum_cls):
+                continue
             try:
                 enums.append(enum_cls(name))
                 break
@@ -304,7 +335,7 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="List known packs and exit.")
     parser.add_argument(
         "--all", action="store_true", dest="all_models",
-        help="Fetch every known pack, YuNet, and every UniFace weight (if uniface is installed).",
+        help="Fetch every known pack, YuNet, and the UniFace weights FaceLab uses.",
     )
     parser.add_argument(
         "--yunet", action="store_true",
@@ -316,12 +347,12 @@ def main() -> None:
         for name, spec in sorted(KNOWN_PACKS.items()):
             print(f"  {name:12s} needs: {', '.join(spec['required'])}")
         print("  yunet        needs: face_detection_yunet_2023mar.onnx (--yunet)")
-        print("  uniface weights:", ", ".join(sorted(UNIFACE_WEIGHTS)))
+        print("  uniface weights:", ", ".join(required_uniface_weights()))
         return
 
     if args.all_models:
         packs = sorted(KNOWN_PACKS)
-        uniface_names = ["all"]
+        uniface_names = required_uniface_weights()
     else:
         packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
         uniface_names = args.uniface
