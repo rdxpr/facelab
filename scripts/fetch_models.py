@@ -20,6 +20,9 @@ Examples:
     python scripts/fetch_models.py --uniface adaface_ir_101 --uniface retinaface_r50
     python scripts/fetch_models.py --all                 # every pack + YuNet + FaceLab's UniFace weights
     python scripts/fetch_models.py --force               # re-download packs
+
+The script re-execs into ``./.venv/bin/python`` when present, so ``./fetch_models.py``
+works even though the registry pulls in pydantic-settings.
 """
 
 from __future__ import annotations
@@ -45,12 +48,35 @@ YUNET_URL = (
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from facelab.config import (  # noqa: E402
-    KNOWN_PACKS,
-    KNOWN_RECOGNIZERS,
-    KNOWN_DETECTORS,
-    Settings,
-)
+# ``facelab.config`` imports pydantic-settings, which only lives in the project
+# virtualenv. Re-exec into it so ``./fetch_models.py`` works straight from the
+# shebang; set FACELAB_SKIP_REEXEC=1 (and a matching interpreter) to opt out.
+_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+if (
+    _VENV_PYTHON.is_file()
+    and os.environ.get("FACELAB_SKIP_REEXEC") != "1"
+    and Path(sys.executable).resolve() != _VENV_PYTHON.resolve()
+):
+    os.execv(
+        str(_VENV_PYTHON),
+        [str(_VENV_PYTHON), str(Path(__file__).resolve()), *sys.argv[1:]],
+    )
+
+try:
+    from facelab.config import (  # noqa: E402
+        KNOWN_PACKS,
+        KNOWN_RECOGNIZERS,
+        KNOWN_DETECTORS,
+        Settings,
+    )
+except ModuleNotFoundError as exc:  # pragma: no cover - setup guidance
+    raise SystemExit(
+        f"[fetch_models] missing dependency '{exc.name}'. Run this with the "
+        "project virtualenv:\n"
+        "  .venv/bin/python scripts/fetch_models.py ...\n"
+        "If the venv doesn't exist yet:\n"
+        "  uv sync    # or: python -m venv .venv && .venv/bin/pip install -r requirements.txt"
+    ) from exc
 
 # Backwards-compatible alias: older docs call packs "models".
 KNOWN_MODELS = {name: spec["required"] for name, spec in KNOWN_PACKS.items()}
