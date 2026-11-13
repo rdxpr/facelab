@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
-"""Download InsightFace model packs into the FaceLab ``models/`` directory.
+"""Fetch model weights for FaceLab and record their SHA-256 hashes.
 
-The ONNX weights are far too large for git, so they are kept out of the
-repository and fetched on demand. This runs automatically at container start
-(see ``scripts/start.sh``) and can be run by hand locally:
+Two families are supported:
 
-    python scripts/fetch_models.py                 # default pack
-    python scripts/fetch_models.py --model buffalo_s --model buffalo_sc
-    python scripts/fetch_models.py --force          # re-download
+* **InsightFace model packs** (``buffalo_l``, ``buffalo_m``, ``buffalo_s``,
+  ``antelopev2``, ``raccoon_l``) downloaded from the official model zoo and
+  extracted into ``models/<pack>/``.
+* **UniFace weights** (RetinaFace, YOLOv8-Face, AdaFace, EdgeFace, SphereFace,
+  eDifFIQA, head pose) downloaded into the UniFace cache by the ``uniface``
+  package itself.
 
-Packs come from the official InsightFace model zoo release:
+Every ``.onnx`` file under ``models/`` is hashed and recorded in
+``.data/models_manifest.json`` so benchmark runs can be tied to exact weights.
 
-    https://github.com/deepinsight/insightface/releases/download/model-zoo/<name>.zip
+Examples:
+
+    python scripts/fetch_models.py                       # default pack
+    python scripts/fetch_models.py --pack buffalo_l --pack antelopev2
+    python scripts/fetch_models.py --uniface adaface_ir_101 --uniface retinaface_r50
+    python scripts/fetch_models.py --all                 # every known model
+    python scripts/fetch_models.py --force               # re-download packs
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import sys
@@ -29,14 +39,18 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BASE_URL = "https://github.com/deepinsight/insightface/releases/download/model-zoo"
 
-# Known packs and the files we need for detection + recognition. Only the listed
-# files are required for FaceLab; extra files in a pack are harmless.
-KNOWN_MODELS: dict[str, list[str]] = {
-    "buffalo_l": ["det_10g.onnx", "w600k_r50.onnx"],
-    "buffalo_s": ["det_500m.onnx", "w600k_mbf.onnx"],
-    "buffalo_sc": ["det_500m.onnx", "w600k_mbf.onnx"],
-    "antelopev2": ["scrfd_10g_bnkps.onnx", "glintr100.onnx"],
-}
+sys.path.insert(0, str(REPO_ROOT))
+
+from facelab.config import KNOWN_PACKS, KNOWN_RECOGNIZERS, KNOWN_DETECTORS  # noqa: E402
+
+# Backwards-compatible alias: older docs call packs "models".
+KNOWN_MODELS = {name: spec["required"] for name, spec in KNOWN_PACKS.items()}
+
+UNIFACE_WEIGHTS: dict[str, str] = {}
+for entry in list(KNOWN_DETECTORS.values()) + list(KNOWN_RECOGNIZERS.values()):
+    value = entry.get("uniface_weights")
+    if value:
+        UNIFACE_WEIGHTS[value] = entry["id"]
 
 
 def default_models_dir() -> Path:
@@ -47,15 +61,21 @@ def default_models_dir() -> Path:
     return REPO_ROOT / "models"
 
 
+def default_data_dir() -> Path:
+    env = os.environ.get("FACELAB_DATA_DIR")
+    if env:
+        path = Path(env).expanduser()
+        return path if path.is_absolute() else (REPO_ROOT / path).resolve()
+    return REPO_ROOT / ".data"
+
+
 def needs_download(target: Path, required: list[str], force: bool) -> bool:
     if force:
         return True
     if not target.is_dir():
         return True
-    onnx_files = list(target.glob("*.onnx"))
-    if not onnx_files:
+    if not list(target.glob("*.onnx")):
         return True
-    # If the pack is a known one, make sure the files we actually need are here.
     if required and not all((target / name).exists() for name in required):
         return True
     return False
@@ -77,7 +97,35 @@ def download(url: str, destination: Path, retries: int = 3) -> None:
     raise SystemExit(f"[fetch_models] could not download {url}: {last_error}")
 
 
-def fetch_one(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
+def _extract_flat(zf: zipfile.ZipFile, target: Path) -> None:
+    """Extract a model-zoo archive, flattening an optional single top folder."""
+    names = zf.namelist()
+    roots = {name.split("/", 1)[0] for name in names if "/" in name.strip("/")}
+    prefix = ""
+    if len(roots) == 1:
+        candidate = roots.pop()
+        if all(
+            name == candidate or name.startswith(candidate + "/")
+            for name in names
+            if name.strip("/")
+        ):
+            prefix = candidate + "/"
+    for member in zf.infolist():
+        if member.is_dir():
+            continue
+        relative = member.filename
+        if prefix and relative.startswith(prefix):
+            relative = relative[len(prefix) :]
+        relative = relative.lstrip("/")
+        if not relative or ".." in Path(relative).parts:
+            continue
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as source, destination.open("wb") as sink:
+            shutil.copyfileobj(source, sink)
+
+
+def fetch_pack(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
     target = models_dir / name
     required = KNOWN_MODELS.get(name, [])
     if not needs_download(target, required, force):
@@ -97,9 +145,7 @@ def fetch_one(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
 
     onnx_files = sorted(target.glob("*.onnx"))
     if not onnx_files:
-        raise SystemExit(
-            f"[fetch_models] {name}: archive had no .onnx files; check {url}"
-        )
+        raise SystemExit(f"[fetch_models] {name}: archive had no .onnx files; check {url}")
     missing = [item for item in required if not (target / item).exists()]
     if missing:
         print(
@@ -107,49 +153,106 @@ def fetch_one(name: str, models_dir: Path, force: bool, base_url: str) -> bool:
             file=sys.stderr,
         )
     size_mb = sum(p.stat().st_size for p in target.rglob("*") if p.is_file()) / 1e6
-    print(
-        f"[fetch_models] {name}: ready at {target} ({len(onnx_files)} models, {size_mb:.0f} MB)"
-    )
+    print(f"[fetch_models] {name}: ready at {target} ({len(onnx_files)} models, {size_mb:.0f} MB)")
     return True
 
 
-def _extract_flat(zf: zipfile.ZipFile, target: Path) -> None:
-    """Extract a model-zoo archive, flattening an optional single top folder."""
-    names = zf.namelist()
-    roots = {name.split("/", 1)[0] for name in names if "/" in name.strip("/")}
-    prefix = ""
-    if len(roots) == 1:
-        candidate = roots.pop()
-        # Only treat it as a wrapper dir if every entry starts with it.
-        if all(name == candidate or name.startswith(candidate + "/") for name in names if name.strip("/")):
-            prefix = candidate + "/"
-    for member in zf.infolist():
-        if member.is_dir():
+def fetch_uniface(names: list[str], force: bool) -> bool:
+    try:
+        from uniface.model_store import download_models
+        from uniface import constants
+        import enum as _enum
+    except Exception as exc:
+        print(
+            f"[fetch_models] uniface is not installed ({exc}); skipping UniFace weights. "
+            'Install with `uv pip install "uniface[cpu]"`.',
+            file=sys.stderr,
+        )
+        return False
+
+    enums = []
+    for name in names:
+        if name == "all":
+            for enum_cls in vars(constants).values():
+                if isinstance(enum_cls, type) and issubclass(enum_cls, _enum.Enum):
+                    enums.extend(list(enum_cls))
             continue
-        relative = member.filename
-        if prefix and relative.startswith(prefix):
-            relative = relative[len(prefix) :]
-        relative = relative.lstrip("/")
-        if not relative or ".." in Path(relative).parts:
+        for enum_cls in vars(constants).values():
+            if not (isinstance(enum_cls, type) and issubclass(enum_cls, _enum.Enum)):
+                continue
+            try:
+                enums.append(enum_cls(name))
+                break
+            except ValueError:
+                continue
+        else:
+            print(f"[fetch_models] unknown uniface weights '{name}'", file=sys.stderr)
+
+    if not enums:
+        return False
+    seen = set()
+    unique = []
+    for item in enums:
+        if item in seen:
             continue
-        destination = target / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(member) as source, destination.open("wb") as sink:
-            shutil.copyfileobj(source, sink)
+        seen.add(item)
+        unique.append(item)
+    print(f"[fetch_models] fetching {len(unique)} UniFace weight files...")
+    results = download_models(unique)
+    for item, path in results.items():
+        print(f"[fetch_models]   {item.value}: {path}")
+    return bool(results)
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_manifest(models_dir: Path, data_dir: Path) -> Path:
+    license_by_file: dict[str, str] = {}
+    for entry in list(KNOWN_DETECTORS.values()) + list(KNOWN_RECOGNIZERS.values()):
+        for name in entry.get("file_candidates", []):
+            license_by_file.setdefault(Path(name).name, entry.get("license", "unknown"))
+
+    models = []
+    for path in sorted(models_dir.rglob("*.onnx")):
+        models.append(
+            {
+                "file": str(path.relative_to(models_dir)),
+                "size_bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+                "license": license_by_file.get(path.name, "unknown"),
+            }
+        )
+    manifest = {"models_dir": str(models_dir), "models": models}
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target = data_dir / "models_manifest.json"
+    target.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    print(f"[fetch_models] wrote manifest for {len(models)} files to {target}")
+    return target
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch InsightFace model packs for FaceLab")
+    parser = argparse.ArgumentParser(description="Fetch face models for FaceLab")
     parser.add_argument(
-        "--model",
-        action="append",
-        dest="models",
-        help="Model pack to fetch (repeatable). Defaults to buffalo_l.",
+        "--model", "--pack", action="append", dest="packs",
+        help="InsightFace pack to fetch (repeatable). Defaults to buffalo_l.",
     )
     parser.add_argument(
-        "--models-dir",
-        default=None,
+        "--uniface", action="append", dest="uniface", default=[],
+        help="UniFace weights value to prefetch, or 'all' (repeatable).",
+    )
+    parser.add_argument(
+        "--models-dir", default=None,
         help="Where to place packs (default: $FACELAB_MODELS_DIR or ./models).",
+    )
+    parser.add_argument(
+        "--data-dir", default=None,
+        help="Where to write models_manifest.json (default: $FACELAB_DATA_DIR or ./.data).",
     )
     parser.add_argument("--base-url", default=BASE_URL, help="Model zoo release URL.")
     parser.add_argument("--force", action="store_true", help="Re-download even if present.")
@@ -157,8 +260,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.list:
-        for name, files in sorted(KNOWN_MODELS.items()):
-            print(f"  {name:12s} needs: {', '.join(files)}")
+        for name, spec in sorted(KNOWN_PACKS.items()):
+            print(f"  {name:12s} needs: {', '.join(spec['required'])}")
+        print("  uniface weights:", ", ".join(sorted(UNIFACE_WEIGHTS)))
         return
 
     models_dir = (
@@ -166,12 +270,19 @@ def main() -> None:
         if args.models_dir
         else default_models_dir()
     )
-    names = args.models or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
+    data_dir = (
+        Path(args.data_dir).expanduser().resolve() if args.data_dir else default_data_dir()
+    )
 
+    packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
     print(f"[fetch_models] models dir: {models_dir}")
     fetched = False
-    for name in names:
-        fetched = fetch_one(name, models_dir, args.force, args.base_url) or fetched
+    for name in packs:
+        fetched = fetch_pack(name, models_dir, args.force, args.base_url) or fetched
+    if args.uniface:
+        fetched = fetch_uniface(args.uniface, args.force) or fetched
+
+    write_manifest(models_dir, data_dir)
     print("[fetch_models] done" + ("" if fetched else " (nothing to download)"))
 
 
