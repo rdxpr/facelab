@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Local runtime data: roster, reference frames, saved scans, and model results.
+.data/
+
+# Model weights are far too large for git (w600k_r50.onnx alone is 174 MB, over
+# GitHub's 100 MB limit). Fetch them with `python scripts/fetch_models.py`.
+models/
+
+# Secrets / local overrides.
+.env
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

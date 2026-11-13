@@ -1,0 +1,15 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+
+# Runtime data and local model weights are never baked into the image; the
+# model pack is fetched at container start instead (scripts/start.sh).
+.data
+models
+.env

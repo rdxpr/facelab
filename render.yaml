@@ -1,0 +1,35 @@
+# Render Blueprint for FaceLab.
+#
+# Models and results are kept on a persistent disk so the ~330 MB of ONNX
+# weights are downloaded once and reused across deploys and restarts.
+#
+# The disk needs a paid instance type. On the free tier, delete the `disk:`
+# block and the FACELAB_MODELS_DIR variable; models are then re-fetched into the
+# ephemeral filesystem on every cold start (slower, but works).
+services:
+  - type: web
+    name: facelab
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    # 2 GB: buffalo_l detection at 960 px wants headroom beyond the 512 MB tier.
+    plan: standard
+    healthCheckPath: /api/health
+    envVars:
+      - key: FACELAB_ENV
+        value: prod
+      - key: FACELAB_DEFAULT_MODEL
+        value: buffalo_l
+      - key: FACELAB_ALLOWED_MODULES
+        value: detection,recognition
+      - key: FACELAB_FACE_SCAN_DET_SIZE
+        value: "960"
+      - key: FACELAB_RESULTS_TO_KEEP
+        value: "100"
+      - key: FACELAB_DATA_DIR
+        value: /var/data
+      - key: FACELAB_MODELS_DIR
+        value: /var/data/models
+    disk:
+      name: facelab-data
+      mountPath: /var/data
+      sizeGB: 5
