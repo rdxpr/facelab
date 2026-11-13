@@ -32,6 +32,8 @@ const state = {
   sweepTimer: null,
   // benchmark display
   benchmarkRun: null,
+  benchSort: { key: "f1", dir: -1 },
+  benchSelected: null,
   // transient UI
   faceFiles: [],
   frameFiles: [],
@@ -455,6 +457,25 @@ function applyState(payload) {
   renderBenchOptions();
 }
 
+async function reembedAll() {
+  const button = $("#reembed-btn");
+  const original = button.textContent;
+  button.textContent = "Embedding…";
+  try {
+    const data = await api("/api/students/re-embed", jsonRequest({ recognizer_ids: [] }));
+    applyState(data.state);
+    const summary = Object.entries(data.results || {})
+      .map(([id, row]) => `${id.split(":").pop()} +${row.updated}`)
+      .join(" · ");
+    toast(summary ? `Embeddings updated: ${summary}` : "No photos needed re-embedding", "ok");
+    if (data.errors?.length) toast(`${data.errors.length} photo(s) skipped`, "error");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    button.textContent = original;
+  }
+}
+
 /* ------------------------------------------------------------ file chips */
 
 function renderFileChips(containerId, files, onRemove) {
@@ -875,6 +896,14 @@ function topCandidatesHtml(candidates) {
     .join("");
 }
 
+function landmarksSvg(points) {
+  if (!points?.length) return "";
+  const dots = points
+    .map(([x, y]) => `<circle cx="${Number(x).toFixed(1)}" cy="${Number(y).toFixed(1)}" r="2.4" class="landmark-dot" />`)
+    .join("");
+  return `<svg class="landmark-layer" viewBox="0 0 112 112" preserveAspectRatio="none" aria-hidden="true">${dots}</svg>`;
+}
+
 function openInspector(faceIndex) {
   const frame = state.scan?.frames[state.selectedFrame];
   const face = frame?.faces[faceIndex];
@@ -889,7 +918,10 @@ function openInspector(faceIndex) {
   const qualityText = face.quality != null ? `${fixed(face.quality, 3)} (${face.qualitySource || "n/a"})` : "n/a";
 
   $("#inspector-body").innerHTML = `
-    ${face.cropUrl ? `<img class="inspect-crop" src="${esc(face.cropUrl)}" alt="Aligned face crop">` : `<div class="inspect-crop placeholder">no aligned crop</div>`}
+    <div class="inspect-crop-wrap">
+      ${face.cropUrl ? `<img class="inspect-crop" src="${esc(face.cropUrl)}" alt="Aligned face crop">` : `<div class="inspect-crop placeholder">no aligned crop</div>`}
+      ${landmarksSvg(face.landmarksCrop)}
+    </div>
     <div class="inspect-title">
       <span class="status-tag ${face.status}">${esc(face.status)}</span>
       <strong>${esc(face.name || "Unknown")}</strong>
@@ -1186,6 +1218,9 @@ async function runBenchmark() {
   try {
     const run = await api("/api/benchmark/run", jsonRequest(payload));
     state.benchmarkRun = run;
+    state.benchSelected = null;
+    state.benchSort = { key: "f1", dir: -1 };
+    $("#bench-detail").hidden = true;
     renderBenchmark(run);
     await loadBenchmarks();
     const ok = run.rows.filter((row) => !row.error).length;
@@ -1206,6 +1241,30 @@ function metricClass(value) {
   return "bad";
 }
 
+const BENCH_COLUMNS = [
+  { key: "detector", label: "Detector", text: (row) => row.detector.split(":").pop() },
+  { key: "recognizer", label: "Recognizer", text: (row) => row.recognizer.split(":").pop() },
+  { key: "detSize", label: "Res", text: (row) => row.detSize, value: (row) => row.detSize },
+  { key: "tiling", label: "Tiling", text: (row) => row.tilingMode, value: (row) => row.tilingMode },
+  { key: "f1", label: "F1", text: (row) => fixed(row.metrics?.f1), value: (row) => row.metrics?.f1 ?? -1, cls: (row) => metricClass(row.metrics?.f1 ?? 0) },
+  { key: "precision", label: "Prec", text: (row) => fixed(row.metrics?.precision), value: (row) => row.metrics?.precision ?? -1 },
+  { key: "recall", label: "Rec", text: (row) => fixed(row.metrics?.recall), value: (row) => row.metrics?.recall ?? -1 },
+  { key: "tauF1", label: "τ*", text: (row) => fixed(row.tauF1, 2), value: (row) => row.tauF1 ?? -1 },
+  {
+    key: "buckets",
+    label: "L/M/S recall",
+    text: (row) => {
+      const b = row.detection?.buckets || {};
+      return `${fixed(b.large?.identification_recall)} / ${fixed(b.medium?.identification_recall)} / ${fixed(b.small?.identification_recall)}`;
+    },
+    value: (row) => row.detection?.buckets?.medium?.identification_recall ?? -1,
+  },
+  { key: "detP50", label: "det p50", text: (row) => fixed(row.latency?.detect_ms_p50, 0), value: (row) => row.latency?.detect_ms_p50 ?? -1 },
+  { key: "totalP50", label: "total p50", text: (row) => fixed(row.latency?.total_inference_ms_p50, 0), value: (row) => row.latency?.total_inference_ms_p50 ?? -1 },
+];
+
+const comboKey = (row) => `${row.detector}|${row.recognizer}|${row.detSize}|${row.tilingMode}`;
+
 function renderBenchmark(run) {
   $("#bench-row-count").textContent = String(run.rows.length);
   const wrap = $("#bench-matrix");
@@ -1213,45 +1272,63 @@ function renderBenchmark(run) {
     wrap.innerHTML = `<div class="empty"><strong>No combinations</strong><span>Widen the grid and run again.</span></div>`;
     return;
   }
-  const rows = run.rows
-    .map((row, index) => {
+
+  const sort = state.benchSort;
+  const column = BENCH_COLUMNS.find((item) => item.key === sort.key);
+  const rows = [...run.rows];
+  if (column?.value) {
+    rows.sort((a, b) => {
+      const left = column.value(a);
+      const right = column.value(b);
+      if (left === right) return 0;
+      return (left > right ? 1 : -1) * sort.dir;
+    });
+  }
+
+  const header = BENCH_COLUMNS.map((item) => {
+    const sorted = sort.key === item.key ? (sort.dir === 1 ? " ▲" : " ▼") : "";
+    return `<th class="sortable" data-sort="${item.key}">${item.label}${sorted}</th>`;
+  }).join("");
+
+  const body = rows
+    .map((row) => {
       if (row.error) {
         return `<tr class="error-row"><td>${esc(row.detector.split(":").pop())}</td><td>${esc(row.recognizer.split(":").pop())}</td><td>${row.detSize ?? "—"}</td><td>${esc(row.tilingMode || "—")}</td><td colspan="7">${esc(row.error)}</td></tr>`;
       }
-      const buckets = row.detection?.buckets || {};
-      const latency = row.latency || {};
-      const rec = row.metrics || {};
-      return `
-        <tr data-index="${index}">
-          <td title="${esc(row.detector)}">${esc(row.detector.split(":").pop())}</td>
-          <td title="${esc(row.recognizer)}">${esc(row.recognizer.split(":").pop())}</td>
-          <td>${row.detSize}</td>
-          <td>${esc(row.tilingMode)}</td>
-          <td class="mono ${metricClass(rec.f1)}">${fixed(rec.f1)}</td>
-          <td class="mono">${fixed(rec.precision)}</td>
-          <td class="mono">${fixed(rec.recall)}</td>
-          <td class="mono">${fixed(row.tauF1, 2)}</td>
-          <td class="mono" title="recall on large / medium / small faces">${fixed(buckets.large?.identification_recall)} / ${fixed(buckets.medium?.identification_recall)} / ${fixed(buckets.small?.identification_recall)}</td>
-          <td class="mono">${fixed(latency.detect_ms_p50, 0)}</td>
-          <td class="mono">${fixed(latency.total_inference_ms_p50, 0)}</td>
-        </tr>`;
+      const key = comboKey(row);
+      const cells = BENCH_COLUMNS.map((item) => {
+        if (item.key === "detector" || item.key === "recognizer") {
+          return `<td title="${esc(item.key === "detector" ? row.detector : row.recognizer)}">${esc(item.text(row))}</td>`;
+        }
+        const cls = item.cls ? ` ${item.cls(row)}` : "";
+        return `<td class="mono${cls}">${esc(String(item.text(row)))}</td>`;
+      }).join("");
+      return `<tr data-combo="${esc(key)}" class="${state.benchSelected === key ? "selected" : ""}">${cells}</tr>`;
     })
     .join("");
 
-  wrap.innerHTML = `
-    <table class="matrix">
-      <thead>
-        <tr>
-          <th>Detector</th><th>Recognizer</th><th>Res</th><th>Tiling</th>
-          <th>F1</th><th>Prec</th><th>Rec</th><th>τ*</th>
-          <th>L/M/S recall</th><th>det p50</th><th>total p50</th>
-        </tr>
-      </thead>
-      <tbody>${rows}</tbody>
-    </table>`;
+  wrap.innerHTML = `<table class="matrix"><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`;
 
-  for (const tr of $$("tbody tr[data-index]", wrap)) {
-    tr.addEventListener("click", () => showBenchmarkRow(run.rows[Number(tr.dataset.index)], tr));
+  for (const th of $$("th.sortable", wrap)) {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sort;
+      if (state.benchSort.key === key) state.benchSort.dir *= -1;
+      else state.benchSort = { key, dir: key === "detector" || key === "recognizer" ? 1 : -1 };
+      renderBenchmark(run);
+    });
+  }
+  for (const tr of $$("tbody tr[data-combo]", wrap)) {
+    tr.addEventListener("click", () => {
+      const row = run.rows.find((item) => !item.error && comboKey(item) === tr.dataset.combo);
+      showBenchmarkRow(row, tr);
+    });
+  }
+  if (state.benchSelected) {
+    const row = run.rows.find((item) => !item.error && comboKey(item) === state.benchSelected);
+    if (row) {
+      const tr = $(`tbody tr[data-combo="${CSS.escape(state.benchSelected)}"]`, wrap);
+      showBenchmarkRow(row, tr, { scroll: false });
+    }
   }
 }
 
@@ -1279,7 +1356,9 @@ function curveSvg(curve) {
     <div class="curve-legend"><span class="curve-key precision"></span>precision <span class="curve-key recall"></span>recall <span class="curve-key f1"></span>F1</div>`;
 }
 
-function showBenchmarkRow(row, tr) {
+function showBenchmarkRow(row, tr, options = {}) {
+  if (!row) return;
+  state.benchSelected = comboKey(row);
   for (const other of $$("tbody tr")) other.classList.remove("selected");
   tr?.classList.add("selected");
   const detail = $("#bench-detail");
@@ -1293,6 +1372,11 @@ function showBenchmarkRow(row, tr) {
     ["large", "medium", "small"]
       .map((name) => `<div class="bucket"><span class="muted">${name}</span><b class="mono">${fixed(buckets[name]?.[key])}</b><span class="muted small">${buckets[name]?.gt || 0} gt</span></div>`)
       .join("");
+  const weightBits = [
+    row.detectorSha256 ? `det ${row.detectorSha256.slice(0, 10)}` : "",
+    row.recognizerSha256 ? `rec ${row.recognizerSha256.slice(0, 10)}` : "",
+    (row.providers || []).length ? `EP: ${(row.providers || []).join(", ")}` : "",
+  ].filter(Boolean).join(" · ");
   detail.innerHTML = `
     <div class="bench-detail-head">
       <strong>${esc(row.detector)}</strong> + <strong>${esc(row.recognizer)}</strong>
@@ -1305,6 +1389,7 @@ function showBenchmarkRow(row, tr) {
       <div><span class="muted">τ (P≥0.98)</span><b>${row.prec98 ? fixed(row.prec98.threshold, 2) : "—"}</b></div>
       <div><span class="muted">Detected / expected</span><b>${row.facesDetected} / ${row.expectedFaces}</b></div>
       <div><span class="muted">Latency p50 / p95</span><b>${fixed(row.latency?.total_inference_ms_p50, 0)} / ${fixed(row.latency?.total_inference_ms_p95, 0)} ms</b></div>
+      ${weightBits ? `<div class="wide"><span class="muted">Weights / provider</span><b class="mono small">${esc(weightBits)}</b></div>` : ""}
     </div>
     ${curveSvg(row.curve)}
     <div class="inspect-section">
@@ -1315,7 +1400,7 @@ function showBenchmarkRow(row, tr) {
       <span class="field-label">Detection recall by face size</span>
       <div class="bucket-row">${reading("detection_recall")}</div>
     </div>`;
-  detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (options.scroll !== false) detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 async function loadBenchmarks() {
@@ -1354,6 +1439,8 @@ async function handleBenchHistoryClick(event) {
   try {
     const run = await api(`/api/benchmarks/${encodeURIComponent(row.dataset.run)}`);
     state.benchmarkRun = run;
+    state.benchSelected = null;
+    $("#bench-detail").hidden = true;
     renderBenchmark(run);
     toast(`Loaded benchmark ${run.runId}`, "ok");
   } catch (error) { toast(error.message, "error"); }
@@ -1519,6 +1606,7 @@ function wireEvents() {
 
   $("#scan-btn").addEventListener("click", runScan);
   $("#reset-btn").addEventListener("click", resetEverything);
+  $("#reembed-btn").addEventListener("click", reembedAll);
   $("#inspector-close").addEventListener("click", closeInspector);
 
   $("#people-list").addEventListener("click", handlePeopleClick);

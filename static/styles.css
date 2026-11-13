@@ -1863,6 +1863,33 @@ label.stacked .input {
   image-rendering: auto;
 }
 
+.inspect-crop-wrap {
+  position: relative;
+  width: 112px;
+  height: 112px;
+}
+
+.landmark-layer {
+  position: absolute;
+  inset: 0;
+  width: 112px;
+  height: 112px;
+  pointer-events: none;
+}
+
+.landmark-dot {
+  fill: #ff5d7a;
+  stroke: rgba(255, 255, 255, 0.9);
+  stroke-width: 0.9;
+}
+
+table.matrix th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+table.matrix th.sortable:hover { color: var(--text); }
+
 .inspect-crop.placeholder {
   display: grid;
   place-items: center;

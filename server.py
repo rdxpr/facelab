@@ -592,6 +592,39 @@ def _require_recognizer(recognizer_id: str) -> None:
         raise HTTPException(status_code=422, detail=f"Recognizer '{recognizer_id}' is unavailable: {reason}")
 
 
+_MANIFEST_CACHE: dict[str, str] | None = None
+
+
+def _manifest_hashes() -> dict[str, str]:
+    """Map weight filename -> SHA-256 from the last fetch_models.py manifest."""
+    global _MANIFEST_CACHE
+    if _MANIFEST_CACHE is not None:
+        return _MANIFEST_CACHE
+    out: dict[str, str] = {}
+    path = settings.models_manifest_file
+    if path.is_file():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for entry in data.get("models", []):
+                name = os.path.basename(entry.get("file", ""))
+                if name:
+                    out[name] = entry.get("sha256", "")
+        except Exception:
+            out = {}
+    _MANIFEST_CACHE = out
+    return out
+
+
+def _weight_sha256(entry: dict) -> str | None:
+    """SHA-256 of the ONNX file a registry entry resolves to, if recorded."""
+    hashes = _manifest_hashes()
+    for candidate in entry.get("file_candidates", []):
+        name = os.path.basename(candidate)
+        if name in hashes:
+            return hashes[name]
+    return None
+
+
 def _legacy_ids(model: str | None, detector_id: str | None, recognizer_id: str | None) -> tuple[str, str]:
     if model:
         if not engine.model_exists(model):
@@ -894,6 +927,8 @@ def _serialize_face(decision: dict, det: dict, snapshot: dict[int, dict]) -> dic
         "cropUrl": (
             f"/media/{det['aligned_crop_path']}" if det.get("aligned_crop_path") else None
         ),
+        "landmarksCrop": det.get("landmarks_crop"),
+        "landmarks5pt": det.get("landmarks_5pt"),
         "topCandidates": _serialize_candidates(
             decision.get("top_candidates", []), snapshot
         ),
@@ -1401,6 +1436,9 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     "detSize": det_size,
                     "tilingMode": tiling_mode,
                     "variant": variant,
+                    "providers": settings.provider_list,
+                    "detectorSha256": _weight_sha256(KNOWN_DETECTORS.get(detector_id, {})),
+                    "recognizerSha256": _weight_sha256(KNOWN_RECOGNIZERS.get(recognizer_id, {})),
                     "acceptThreshold": chosen_threshold,
                     "reviewThreshold": request.review_threshold,
                     "minMargin": request.min_margin,
@@ -1438,6 +1476,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             "lowresAug": request.lowres_aug,
             "withQuality": request.with_quality,
             "withPose": request.with_pose,
+            "providers": settings.provider_list,
         },
         "rows": rows,
     }

@@ -672,6 +672,24 @@ def align_face(image_bgr: np.ndarray, kps: np.ndarray, size: int = 112) -> np.nd
     return face_align.norm_crop(image_bgr, kps, image_size=size)
 
 
+def _project_landmarks_to_crop(kps: np.ndarray, size: int = 112) -> np.ndarray | None:
+    """Map 5-point landmarks from the source image into ``size``×``size`` crop space.
+
+    Mirrors the affine transform ``face_align.norm_crop`` applies, so the UI can
+    overlay the landmarks on the saved aligned crop for alignment diagnosis.
+    """
+    try:
+        from insightface.utils import face_align
+
+        matrix = face_align.estimate_norm(np.asarray(kps, dtype=np.float32), image_size=size)
+        homogenous = np.hstack(
+            [np.asarray(kps, dtype=np.float32), np.ones((len(kps), 1), dtype=np.float32)]
+        )
+        return (homogenous @ matrix.T).astype(np.float32)
+    except Exception:
+        return None
+
+
 def lowres_augment(crop: np.ndarray, tiny: int = 24, size: int = 112) -> np.ndarray:
     """Simulate a back-row face: downsample to ``tiny`` then bicubic upscale."""
     down = cv2.resize(crop, (tiny, tiny), interpolation=cv2.INTER_AREA)
@@ -730,8 +748,11 @@ def analyze_frame(
         height_px = float(bbox[3] - bbox[1])
         crop = None
         crop_rel = None
+        landmarks_crop = None
         if det.kps is not None:
-            crop = align_face(image_bgr, det.kps.astype(np.float32), 112)
+            kps = det.kps.astype(np.float32)
+            crop = align_face(image_bgr, kps, 112)
+            landmarks_crop = _project_landmarks_to_crop(kps, 112)
         if crop is not None:
             crops.append(crop)
             if crops_dir is not None:
@@ -748,6 +769,9 @@ def analyze_frame(
                 "size_bucket": matching.size_bucket(height_px),
                 "det_score": round(float(det.score), 4),
                 "landmarks_5pt": det.kps.tolist() if det.kps is not None else None,
+                "landmarks_crop": (
+                    landmarks_crop.tolist() if landmarks_crop is not None else None
+                ),
                 "aligned_crop_path": crop_rel,
                 "embedding": None,
                 "embedding_flip_avg": None,
