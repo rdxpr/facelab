@@ -28,14 +28,6 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def analysis_params(
     det_size: int,
     det_thresh: float = 0.35,
@@ -108,10 +100,6 @@ def cache_key(
     return f"{image_sha256[:12]}_{det_slug}_{rec_slug}_{digest}"
 
 
-def describe_key(key: str) -> str:
-    return key
-
-
 def cache_path(key: str) -> Path:
     return settings.cache_dir / f"{key}.json"
 
@@ -137,6 +125,21 @@ def load_analysis(key: str) -> dict | None:
         return _decode(json.loads(path.read_text(encoding="utf-8")))
     except Exception:
         return None
+
+
+def prune_cache(keep: int | None = None) -> int:
+    """Delete the oldest cached artifacts and their aligned crop JPEGs."""
+    keep = settings.cache_entries_to_keep if keep is None else keep
+    if not settings.cache_dir.exists():
+        return 0
+    files = sorted(
+        settings.cache_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    for stale in files[keep:]:
+        for crop in settings.crops_dir.glob(f"{stale.stem}_det*.jpg"):
+            crop.unlink(missing_ok=True)
+        stale.unlink(missing_ok=True)
+    return max(0, len(files) - keep)
 
 
 def _encode(payload: dict) -> dict:
@@ -174,7 +177,7 @@ def _decode(payload: dict) -> dict:
 
 def _decode_detection(det: dict) -> dict:
     out: dict[str, Any] = dict(det)
-    for key in ("bbox", "kps", "embedding", "embedding_flip_avg", "embedding_lowres_aug"):
+    for key in ("bbox", "embedding", "embedding_flip_avg", "embedding_lowres_aug"):
         value = out.get(key)
         if isinstance(value, list):
             out[key] = np.asarray(value, dtype=np.float32)

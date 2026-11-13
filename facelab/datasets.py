@@ -66,72 +66,78 @@ def create_dataset(
     frames_dir = target / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    frame_records = []
-    for index, (data, filename) in enumerate(frames):
-        image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Frame {filename or index + 1} could not be decoded")
-        height, width = image.shape[:2]
-        extension = ".jpg"
-        if filename and "." in filename:
-            extension = "." + filename.rsplit(".", 1)[-1].lower()
-            if extension not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
-                extension = ".jpg"
-        frame_id = f"frame_{index + 1:02d}"
-        stored_name = f"{frame_id}{extension}"
-        (frames_dir / stored_name).write_bytes(data)
-        frame_records.append(
-            {
-                "frame_id": frame_id,
-                "filename": f"frames/{stored_name}",
-                "original_name": filename,
-                "sha256": sha256_bytes(data),
-                "width": int(width),
-                "height": int(height),
-            }
-        )
+    try:
+        frame_records = []
+        for index, (data, filename) in enumerate(frames):
+            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Frame {filename or index + 1} could not be decoded")
+            height, width = image.shape[:2]
+            extension = ".jpg"
+            if filename and "." in filename:
+                extension = "." + filename.rsplit(".", 1)[-1].lower()
+                if extension not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+                    extension = ".jpg"
+            frame_id = f"frame_{index + 1:02d}"
+            stored_name = f"{frame_id}{extension}"
+            (frames_dir / stored_name).write_bytes(data)
+            frame_records.append(
+                {
+                    "frame_id": frame_id,
+                    "filename": f"frames/{stored_name}",
+                    "original_name": filename,
+                    "sha256": sha256_bytes(data),
+                    "width": int(width),
+                    "height": int(height),
+                }
+            )
 
-    boxes = []
-    for box in annotated_boxes or []:
-        try:
-            bbox = [float(value) for value in box["bbox"][:4]]
-        except (KeyError, TypeError, IndexError, ValueError):
-            continue
-        height_px = bbox[3] - bbox[1]
-        row = box.get("row_bucket")
-        if not row:
-            row = "large" if height_px >= 55 else ("medium" if height_px >= 30 else "small")
-        boxes.append(
-            {
-                "frame_id": box.get("frame_id") or frame_records[0]["frame_id"],
-                "bbox": bbox,
-                "student_id": box.get("student_id"),
-                "occlusion": box.get("occlusion") or "none",
-                "row_bucket": row,
-            }
-        )
+        boxes = []
+        for box in annotated_boxes or []:
+            try:
+                bbox = [float(value) for value in box["bbox"][:4]]
+            except (KeyError, TypeError, IndexError, ValueError):
+                continue
+            height_px = bbox[3] - bbox[1]
+            row = box.get("row_bucket")
+            if not row:
+                row = "large" if height_px >= 55 else ("medium" if height_px >= 30 else "small")
+            boxes.append(
+                {
+                    "frame_id": box.get("frame_id") or frame_records[0]["frame_id"],
+                    "bbox": bbox,
+                    "student_id": box.get("student_id"),
+                    "occlusion": box.get("occlusion") or "none",
+                    "row_bucket": row,
+                }
+            )
 
-    present_count = len(present_student_ids or [])
-    expected_faces = len(boxes) or (present_count * len(frame_records)) or len(frame_records)
-    manifest = {
-        "dataset_id": identifier,
-        "datasetId": identifier,
-        "name": (name or identifier).strip()[:120] or identifier,
-        "notes": notes.strip()[:500],
-        "createdAt": _now(),
-        "frames": frame_records,
-        "ground_truth": {
-            "present_student_ids": [int(value) for value in (present_student_ids or [])],
-            "expected_total_faces": int(expected_faces),
-            "annotated_boxes": boxes,
-        },
-    }
-    manifest_path(identifier).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        present_count = len(present_student_ids or [])
+        expected_faces = len(boxes) or (present_count * len(frame_records)) or len(frame_records)
+        manifest = {
+            "dataset_id": identifier,
+            "datasetId": identifier,
+            "name": (name or identifier).strip()[:120] or identifier,
+            "notes": notes.strip()[:500],
+            "createdAt": _now(),
+            "frames": frame_records,
+            "ground_truth": {
+                "present_student_ids": [int(value) for value in (present_student_ids or [])],
+                "expected_total_faces": int(expected_faces),
+                "annotated_boxes": boxes,
+            },
+        }
+        manifest_path(identifier).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    except Exception:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
     _prune_datasets()
     return manifest
 
 
 def load_manifest(dataset_id: str) -> dict | None:
+    if not valid_dataset_id(dataset_id):
+        return None
     path = manifest_path(dataset_id)
     if not path.is_file():
         return None
@@ -176,6 +182,8 @@ def _thumb_url(manifest: dict) -> str | None:
 
 
 def delete_dataset(dataset_id: str) -> bool:
+    if not valid_dataset_id(dataset_id):
+        return False
     target = dataset_dir(dataset_id)
     if not target.exists():
         return False

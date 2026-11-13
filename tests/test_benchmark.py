@@ -179,6 +179,27 @@ def test_threshold_curve_datasets_aggregates_across_datasets():
     assert row["fp"] == 0
 
 
+def test_curve_row_matches_evaluate_frames_with_fixed_review():
+    students = {1: make_student(1, [1.0, 0.0, 0.0])}
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    frames = [frame("frame_01", [det(unit(1.0, 0.05, 0.0))])]
+    curve = benchmark.threshold_curve_datasets(
+        [(frames, [1])], gallery, variant="raw",
+        low=0.5, high=0.5, step=0.1, review_threshold=0.34, k=1,
+    )
+    direct = benchmark.evaluate_frames(
+        frames, gallery, [1], variant="raw",
+        accept_threshold=0.5, review_threshold=0.34, k=1,
+    )["attendance"]
+    assert {key: curve[0][key] for key in direct} == direct
+
+
+def test_dataset_id_traversal_rejected():
+    from facelab import datasets
+    assert datasets.delete_dataset("..") is False
+    assert datasets.load_manifest("../x") is None
+
+
 def test_aggregate_detection_sums_buckets():
     results = [
         {"has_annotations": True, "buckets": {"large": {"gt": 2, "detected": 2, "identified": 1}}},

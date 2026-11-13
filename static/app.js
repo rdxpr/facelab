@@ -11,6 +11,7 @@
  */
 
 const STORAGE_KEY = "facelab.selection.v3";
+const TOKEN_KEY = "facelab.token";
 
 const state = {
   // roster / registry
@@ -56,6 +57,9 @@ const state = {
     fusionK: 2,
     minFaceQuality: 0,
     maxFrames: 12,
+    maxPhotosPerUpload: 8,
+    maxPhotosPerPerson: 12,
+    templateTopK: 2,
     benchmarkDetSizes: [640, 1024, 1280],
     defaultDetector: "insightface:scrfd_10g_bnkps",
     defaultRecognizer: "insightface:w600k_r50",
@@ -108,14 +112,32 @@ function debounce(fn, delay) {
   };
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, options);
+function storedToken() {
+  try { return window.localStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+
+async function api(path, options = {}, retry = true) {
+  const headers = new Headers(options.headers || {});
+  const token = storedToken();
+  if (token) headers.set("X-API-Token", token);
+  const response = await fetch(path, { ...options, headers });
+  if (response.status === 401 && retry) {
+    const entered = window.prompt("This server requires an API token:");
+    if (entered) {
+      try { window.localStorage.setItem(TOKEN_KEY, entered.trim()); } catch { /* ignore */ }
+      return api(path, options, false);
+    }
+  }
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try {
       const body = await response.json();
       if (body && body.detail) {
-        detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
+        detail = typeof body.detail === "string"
+          ? body.detail
+          : Array.isArray(body.detail)
+            ? body.detail.map((d) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("; ")
+            : JSON.stringify(body.detail);
       }
     } catch { /* keep the status text */ }
     const error = new Error(detail);
@@ -177,7 +199,7 @@ function readSelection() {
   return {
     detector: $("#detector-select").value,
     recognizer: $("#recognizer-select").value,
-    detSize: parseInt($("#det-size").value, 10),
+    detSize: parseInt($("#det-size").value, 10) || state.settings.detSize || 1280,
     tilingMode: $("#tiling-mode").value,
     detThresh: readNumber("det-thresh", 0.35),
     nmsThresh: readNumber("nms-thresh", 0.45),
@@ -188,7 +210,7 @@ function readSelection() {
     assignmentMode: $("#assignment-mode").value,
     templateStrategy: $("#template-strategy").value,
     fusionMode: $("#fusion-mode").value,
-    fusionK: readNumber("fusion-k", 2),
+    fusionK: Math.max(1, Math.round(readNumber("fusion-k", 2))),
     flipAug: $("#flip-aug").checked,
     lowresAug: $("#lowres-aug").checked,
     withQuality: $("#with-quality").checked,
@@ -233,12 +255,16 @@ function renderModelPickers() {
   $("#scan-recognizer").textContent = recognizerEntry?.label || state.recognizer;
 }
 
+let modelStatusSeq = 0;
+
 async function refreshModelStatus() {
+  const seq = ++modelStatusSeq;
   setModelPill("loading", "Checking models…");
   try {
     const info = await api(
       `/api/model?detector=${encodeURIComponent(state.detector)}&recognizer=${encodeURIComponent(state.recognizer)}`,
     );
+    if (seq !== modelStatusSeq) return;
     if (info.ready) {
       setModelPill(
         "ready",
@@ -252,6 +278,7 @@ async function refreshModelStatus() {
       $("#model-banner").textContent = info.error || "The selected models could not load.";
     }
   } catch (error) {
+    if (seq !== modelStatusSeq) return;
     setModelPill("error", "Models unavailable", error.message);
     $("#model-banner").hidden = false;
     $("#model-banner").textContent = error.message;
@@ -570,6 +597,7 @@ function scanForm() {
 }
 
 async function runScan() {
+  if (state.busy) return;
   setBanner("#scan-error", "");
   $("#scan-warnings").hidden = true;
   if (!state.frameFiles.length) { setBanner("#scan-error", "Add at least one classroom frame."); return; }
@@ -579,6 +607,7 @@ async function runScan() {
   const status = $("#scan-status");
   const startedAt = performance.now();
   button.textContent = "Scanning…";
+  button.disabled = true;
   status.hidden = false;
   state.busy = true;
   const timer = window.setInterval(() => {
@@ -590,10 +619,10 @@ async function runScan() {
     const result = await api("/api/scan", { method: "POST", body: scanForm() });
     state.scan = result;
     state.liveSweep = null;
-    state.inspector = null;
+    closeInspector();
     state.selectedFrame = result.summary.bestIndex >= 0 ? result.summary.bestIndex : 0;
     renderResults();
-    await loadResults();
+    loadResults().catch((error) => toast(error.message, "error"));
     toast(
       `Scanned ${plural(result.summary.frames, "frame")} · ${result.summary.facesDetected} faces · ${(result.summary.elapsedMs / 1000).toFixed(1)}s`,
       "ok",
@@ -605,54 +634,68 @@ async function runScan() {
     window.clearInterval(timer);
     status.hidden = true;
     button.textContent = original;
+    button.disabled = false;
     state.busy = false;
   }
 }
 
+let sweepSeq = 0;
+
 /* Re-score the loaded scan from cached embeddings — no inference. */
 async function liveSweep() {
-  if (!state.scan) return;
+  if (!state.scan || state.busy) return;
+  const scan = state.scan;
+  const seq = ++sweepSeq;
   const selection = readSelection();
   const payload = {
-    detector: state.scan.detectorId,
-    recognizer: state.scan.recognizerId,
-    det_size: state.scan.summary?.detSize || selection.detSize,
-    tiling_mode: state.scan.summary?.tilingMode || selection.tilingMode,
+    detector: scan.detectorId,
+    recognizer: scan.recognizerId,
+    det_size: scan.summary?.detSize || selection.detSize,
+    tiling_mode: scan.summary?.tilingMode || selection.tilingMode,
     det_thresh: selection.detThresh,
     nms_thresh: selection.nmsThresh,
-    flip_aug: state.scan.summary?.flipAug ?? selection.flipAug,
-    lowres_aug: state.scan.summary?.lowresAug ?? false,
+    flip_aug: scan.summary?.flipAug ?? selection.flipAug,
+    lowres_aug: scan.summary?.lowresAug ?? false,
     with_quality: selection.withQuality,
     with_pose: selection.withPose,
-    variant: state.scan.summary?.variant,
+    variant: scan.summary?.variant,
     accept_threshold: selection.acceptThreshold,
     review_threshold: selection.reviewThreshold,
     min_margin: selection.minMargin,
     assignment_mode: selection.assignmentMode,
     template_strategy: selection.templateStrategy,
+    top_k: scan.summary?.topK ?? state.settings.templateTopK ?? 2,
     fusion_mode: selection.fusionMode,
     k: Math.round(selection.fusionK),
     min_quality: selection.minQuality,
   };
   try {
-    const data = await api(`/api/results/${encodeURIComponent(state.scan.scanId)}/sweep`, jsonRequest(payload));
+    const data = await api(`/api/results/${encodeURIComponent(scan.scanId)}/sweep`, jsonRequest(payload));
+    if (seq !== sweepSeq || state.scan !== scan) return;
     state.liveSweep = data;
-    const frames = state.scan.frames;
+    const frames = scan.frames;
     data.faces.forEach((faces, index) => { if (frames[index]) frames[index].faces = faces; });
-    state.scan.roster = Object.entries(data.students).map(([id, record]) => ({
-      personId: Number(id),
-      ...record,
-    }));
-    state.scan.summary.acceptThreshold = payload.accept_threshold;
-    state.scan.summary.reviewThreshold = payload.review_threshold;
-    state.scan.summary.minMargin = payload.min_margin;
-    state.scan.summary.assignmentMode = payload.assignment_mode;
-    state.scan.summary.fusionMode = payload.fusion_mode;
+    delete scan.roster;
+    scan.people = (scan.people || []).map((row) => {
+      const record = data.students[String(row.personId)];
+      return record
+        ? { ...row, status: record.status, confidence: record.score ?? 0, framesHit: record.frames_hit ?? 0 }
+        : { ...row, status: "absent", confidence: 0, framesHit: 0 };
+    });
+    scan.summary.matchedCount = data.matchedCount;
+    scan.summary.templateStrategy = payload.template_strategy;
+    scan.summary.acceptThreshold = payload.accept_threshold;
+    scan.summary.reviewThreshold = payload.review_threshold;
+    scan.summary.minMargin = payload.min_margin;
+    scan.summary.assignmentMode = payload.assignment_mode;
+    scan.summary.fusionMode = payload.fusion_mode;
     renderSummary();
     renderRoster();
     renderFrame();
+    if (state.inspector) openInspector(state.inspector.faceIndex);
     toast("Re-scored from cache — no re-inference", "");
   } catch (error) {
+    if (seq !== sweepSeq) return;
     toast(`Live sweep needs a fresh scan: ${error.message}`, "error");
   }
 }
@@ -772,7 +815,7 @@ function renderFrameTabs() {
     button.innerHTML = `Frame <b>${index + 1}</b> <span>${plural(frame.faces.length, "face")}</span>`;
     button.addEventListener("click", () => {
       state.selectedFrame = index;
-      state.inspector = null;
+      closeInspector();
       renderFrameTabs();
       renderFrame();
       renderSummary();
@@ -988,7 +1031,7 @@ async function loadResult(scanId) {
     const data = await api(`/api/results/${encodeURIComponent(scanId)}`);
     state.scan = data;
     state.liveSweep = null;
-    state.inspector = null;
+    closeInspector();
     state.selectedFrame = Number.isInteger(data.summary?.bestIndex) && data.summary.bestIndex >= 0 ? data.summary.bestIndex : 0;
     switchTab("attendance");
     renderResults();
@@ -1003,7 +1046,7 @@ async function deleteResult(scanId) {
   try {
     const data = await api(`/api/results/${encodeURIComponent(scanId)}`, { method: "DELETE" });
     state.results = data.results || [];
-    if (state.scan?.scanId === scanId) { state.scan = null; state.inspector = null; renderResults(); }
+    if (state.scan?.scanId === scanId) { state.scan = null; closeInspector(); renderResults(); }
     renderHistory();
     toast("Saved run deleted", "ok");
   } catch (error) { toast(error.message, "error"); }
@@ -1073,8 +1116,10 @@ async function createDataset(event) {
     return;
   }
   const button = $("#dataset-btn");
+  if (button.disabled) return;
   const original = button.textContent;
   button.textContent = "Saving…";
+  button.disabled = true;
   const form = new FormData();
   form.append("name", $("#dataset-name").value.trim());
   form.append("notes", $("#dataset-notes").value.trim());
@@ -1100,6 +1145,7 @@ async function createDataset(event) {
     errorElement.textContent = error.message;
   } finally {
     button.textContent = original;
+    button.disabled = false;
   }
 }
 
@@ -1129,25 +1175,32 @@ async function handleDatasetListClick(event) {
 /* -------------------------------------------------------------- benchmark */
 
 function renderBenchOptions() {
+  const prior = (id) => {
+    const inputs = $$(`#${id} input`);
+    return inputs.length ? new Set(inputs.filter((i) => i.checked).map((i) => i.value)) : null;
+  };
+  const keep = { det: prior("bench-detectors"), rec: prior("bench-recognizers"), size: prior("bench-det-sizes"), tile: prior("bench-tilings") };
+  const on = (set, value, fallback) => ((set ? set.has(String(value)) : fallback) ? "checked" : "");
+
   const detectors = state.registry.detectors.filter((entry) => entry.available);
   const recognizers = state.registry.recognizers.filter((entry) => entry.available);
   $("#bench-detectors").innerHTML = detectors.length
-    ? detectors.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" checked><span>${esc(entry.label)}</span></label>`).join("")
+    ? detectors.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.det, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")
     : `<div class="muted small">No detectors installed.</div>`;
   $("#bench-recognizers").innerHTML = recognizers.length
-    ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" checked><span>${esc(entry.label)}</span></label>`).join("")
+    ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.rec, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")
     : `<div class="muted small">No recognizers installed.</div>`;
 
   const sizes = [...new Set([...(state.settings.benchmarkDetSizes || []), 640, 1024, 1280])].sort((a, b) => a - b);
   $("#bench-det-sizes").innerHTML = sizes
-    .map((size) => `<label class="chip"><input type="checkbox" value="${size}" ${size === 640 || size === 1280 ? "checked" : ""}><span>${size}px</span></label>`)
+    .map((size) => `<label class="chip"><input type="checkbox" value="${size}" ${on(keep.size, size, size === 640 || size === 1280)}><span>${size}px</span></label>`)
     .join("");
   $("#bench-tilings").innerHTML = [
     ["none", "Off"],
     ["sahi_upper_band", "Upper band"],
     ["sahi_full", "Full SAHI"],
   ]
-    .map(([value, label]) => `<label class="chip"><input type="checkbox" value="${value}" ${value === "none" ? "checked" : ""}><span>${label}</span></label>`)
+    .map(([value, label]) => `<label class="chip"><input type="checkbox" value="${value}" ${on(keep.tile, value, value === "none")}><span>${label}</span></label>`)
     .join("");
 }
 
@@ -1197,13 +1250,23 @@ async function runBenchmark() {
     review_threshold: readNumber("bench-review", 0.34),
     min_margin: readNumber("bench-margin", 0.04),
     assignment_mode: $("#bench-assignment").value,
+    template_strategy: state.settings.templateStrategy || "top_k_mean",
+    top_k: state.settings.templateTopK ?? 2,
     fusion_mode: $("#bench-fusion").value,
-    k: 1,
+    k: state.settings.fusionK ?? 2,
+    min_quality: state.settings.minFaceQuality ?? 0,
   };
 
+  if (!payload.det_sizes.length || !payload.tiling_modes.length) {
+    setBanner("#bench-error", "Select at least one resolution and one tiling mode.");
+    return;
+  }
+
   const button = $("#bench-run-btn");
+  if (button.disabled) return;
   const original = button.textContent;
   button.textContent = "Running…";
+  button.disabled = true;
   $("#bench-status").hidden = false;
   const startedAt = performance.now();
   const timer = window.setInterval(() => {
@@ -1217,7 +1280,7 @@ async function runBenchmark() {
     state.benchSort = { key: "f1", dir: -1 };
     $("#bench-detail").hidden = true;
     renderBenchmark(run);
-    await loadBenchmarks();
+    loadBenchmarks();
     const ok = run.rows.filter((row) => !row.error).length;
     toast(`Benchmark finished · ${ok}/${run.rows.length} combinations scored`, "ok");
   } catch (error) {
@@ -1227,6 +1290,7 @@ async function runBenchmark() {
     window.clearInterval(timer);
     $("#bench-status").hidden = true;
     button.textContent = original;
+    button.disabled = false;
   }
 }
 
@@ -1237,8 +1301,8 @@ function metricClass(value) {
 }
 
 const BENCH_COLUMNS = [
-  { key: "detector", label: "Detector", text: (row) => row.detector.split(":").pop() },
-  { key: "recognizer", label: "Recognizer", text: (row) => row.recognizer.split(":").pop() },
+  { key: "detector", label: "Detector", text: (row) => row.detector.split(":").pop(), value: (row) => row.detector },
+  { key: "recognizer", label: "Recognizer", text: (row) => row.recognizer.split(":").pop(), value: (row) => row.recognizer },
   { key: "detSize", label: "Res", text: (row) => row.detSize, value: (row) => row.detSize },
   { key: "tiling", label: "Tiling", text: (row) => row.tilingMode, value: (row) => row.tilingMode },
   { key: "f1", label: "F1", text: (row) => fixed(row.metrics?.f1), value: (row) => row.metrics?.f1 ?? -1, cls: (row) => metricClass(row.metrics?.f1 ?? 0) },
@@ -1473,6 +1537,7 @@ async function resetEverything() {
     const data = await api("/api/reset", { method: "POST" });
     state.people = data.state.people;
     state.scan = null;
+    closeInspector();
     state.results = [];
     state.datasets = [];
     state.benchmarks = [];
@@ -1481,7 +1546,11 @@ async function resetEverything() {
     state.datasetFiles = [];
     state.datasetPresent = new Set();
     state.benchmarkRun = null;
+    state.benchSelected = null;
+    state.liveSweep = null;
+    state.datasetBoxes = {};
     state.selectedFrame = 0;
+    $("#bench-row-count").textContent = "0";
     renderFaceFiles();
     renderFrameFiles();
     renderDatasetFiles();
@@ -1501,21 +1570,30 @@ async function resetEverything() {
 
 /* ------------------------------------------------------------------- load */
 
+function setSelectValue(id, value, label = String(value)) {
+  const select = $(`#${id}`);
+  const text = String(value ?? "");
+  if (text && ![...select.options].some((option) => option.value === text)) {
+    select.append(new Option(label, text));
+  }
+  if (text) select.value = text;
+}
+
 function applySettings(settings) {
   if (!settings) return;
   state.settings = { ...state.settings, ...settings };
   $("#max-frames").textContent = state.settings.maxFrames;
-  $("#det-size").value = String(state.settings.detSize);
-  $("#tiling-mode").value = state.settings.tilingMode;
+  setSelectValue("det-size", state.settings.detSize, `${state.settings.detSize} px`);
+  setSelectValue("tiling-mode", state.settings.tilingMode);
   $("#det-thresh").value = String(state.settings.detThresh);
   $("#nms-thresh").value = String(state.settings.nmsThresh);
   $("#accept-threshold").value = String(state.settings.acceptThreshold);
   $("#review-threshold").value = String(state.settings.reviewThreshold);
   $("#min-margin").value = String(state.settings.minMargin);
   $("#min-quality").value = String(state.settings.minFaceQuality);
-  $("#assignment-mode").value = state.settings.assignmentMode;
-  $("#template-strategy").value = state.settings.templateStrategy;
-  $("#fusion-mode").value = state.settings.fusionMode;
+  setSelectValue("assignment-mode", state.settings.assignmentMode);
+  setSelectValue("template-strategy", state.settings.templateStrategy);
+  setSelectValue("fusion-mode", state.settings.fusionMode);
   $("#fusion-k").value = String(state.settings.fusionK);
   for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality"]) {
     $(`#${id}`).dispatchEvent(new Event("input"));
@@ -1539,17 +1617,13 @@ async function loadModels() {
   if (data.detectors) state.registry.detectors = data.detectors;
   if (data.recognizers) state.registry.recognizers = data.recognizers;
   const remembered = recall();
-  const available = (entry) => entry.available;
-  state.detector =
-    (remembered.detector && state.registry.detectors.some((entry) => entry.id === remembered.detector) && remembered.detector) ||
-    state.settings.defaultDetector ||
-    state.registry.detectors.find(available)?.id ||
-    state.registry.detectors[0]?.id;
-  state.recognizer =
-    (remembered.recognizer && state.registry.recognizers.some((entry) => entry.id === remembered.recognizer) && remembered.recognizer) ||
-    state.settings.defaultRecognizer ||
-    state.registry.recognizers.find(available)?.id ||
-    state.registry.recognizers[0]?.id;
+  const pick = (entries, rememberedId, fallback) => {
+    const usable = (id) => id && entries.some((entry) => entry.id === id && entry.available !== false);
+    return (usable(rememberedId) && rememberedId) || (usable(fallback) && fallback) ||
+      entries.find((entry) => entry.available !== false)?.id || entries[0]?.id || fallback;
+  };
+  state.detector = pick(state.registry.detectors, remembered.detector, state.settings.defaultDetector);
+  state.recognizer = pick(state.registry.recognizers, remembered.recognizer, state.settings.defaultRecognizer);
   renderModelPickers();
   renderModelUsage();
   renderBenchOptions();
@@ -1596,7 +1670,7 @@ function wireEvents() {
 
   // Detector thresholds change detection itself, so they need a fresh scan;
   // only the embedding-space knobs can be swept from the cache.
-  for (const id of ["accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode", "flip-aug", "lowres-aug"]) {
+  for (const id of ["accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode"]) {
     $(`#${id}`).addEventListener("change", scheduleSweep);
   }
 
@@ -1653,17 +1727,13 @@ async function init() {
   renderHistory();
   renderResults();
 
-  try {
-    await loadState();
-    await loadModels();
-    await loadResults();
-    await loadDatasets();
-    await loadBenchmarks();
-    await refreshModelStatus();
-    switchTab(window.location.hash.slice(1) || "attendance", { silent: true });
-  } catch (error) {
-    toast(`Startup problem: ${error.message}`, "error");
+  for (const step of [loadState, loadModels]) {
+    try { await step(); } catch (error) { toast(`Startup problem: ${error.message}`, "error"); }
   }
+  const settled = await Promise.allSettled([loadResults(), loadDatasets(), loadBenchmarks(), refreshModelStatus()]);
+  const failed = settled.find((item) => item.status === "rejected");
+  if (failed) toast(`Startup problem: ${failed.reason.message}`, "error");
+  switchTab(window.location.hash.slice(1) || "attendance", { silent: true });
 }
 
 document.addEventListener("DOMContentLoaded", init);

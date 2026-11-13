@@ -292,6 +292,7 @@ def fuse_multi_frame(
         # Vote on the *assigned* decision per frame, not the raw max similarity:
         # otherwise the Hungarian one-to-one assignment, the margin gate and the
         # min_quality filter are all bypassed here.
+        required = max(1, min(int(k), num_frames or 1))
         hits: dict[Any, int] = {sid: 0 for sid in student_ids}
         present_hits: dict[Any, int] = {sid: 0 for sid in student_ids}
         for frame_index, frame in enumerate(frames):
@@ -312,11 +313,12 @@ def fuse_multi_frame(
                     record["score"] = round(score, 4)
         for sid, record in student_status.items():
             record["frames_hit"] = hits[sid]
-            if hits[sid] >= k and present_hits[sid] >= 1:
+            if hits[sid] >= required and present_hits[sid] >= 1:
                 record["status"] = "present"
             elif hits[sid] >= 1:
                 record["status"] = "needs_review"
     elif mode == "max_with_margin_gate":
+        review_sids: set = set()
         for frame_index, frame in enumerate(frames):
             detections = frame.get("detections", [])
             assignments = per_frame[frame_index]
@@ -324,12 +326,11 @@ def fuse_multi_frame(
                 sid = decision["matched_student_id"]
                 if sid is None or sid not in student_status:
                     continue
-                if decision["status"] != "present":
-                    continue
-                if decision["margin"] < min_margin:
-                    continue
                 quality = float(detections[det_index].get("quality") or 0.0)
                 if quality < min_quality:
+                    continue
+                if decision["status"] != "present" or decision["margin"] < min_margin:
+                    review_sids.add(sid)
                     continue
                 score = float(sims[frame_index][det_index, student_index(sid)])
                 record = student_status[sid]
@@ -340,7 +341,7 @@ def fuse_multi_frame(
         for sid, record in student_status.items():
             if record["score"] >= accept_threshold:
                 record["status"] = "present"
-            elif record["frames_hit"]:
+            elif record["frames_hit"] or sid in review_sids:
                 record["status"] = "needs_review"
     elif mode == "quality_weighted_embedding_cluster":
         tracks = _cluster_tracks(frames)
@@ -356,10 +357,8 @@ def fuse_multi_frame(
             min_margin=min_margin,
             assignment_mode=assignment_mode,
         )
-        track_status: dict[int, str] = {}
         for track_index, decision in enumerate(decisions):
             sid = decision["matched_student_id"]
-            track_status[track_index] = decision["status"]
             if sid is None or sid not in student_status:
                 continue
             record = student_status[sid]
@@ -374,33 +373,17 @@ def fuse_multi_frame(
         # Rewrite per-frame decisions so every detection inherits its track's
         # final status (annotation and UI colours).
         for track_index, track in enumerate(tracks):
-            status = track_status.get(track_index, "unmatched")
+            if track_index >= len(decisions):
+                continue
+            track_decision = decisions[track_index]
             for member in track["members"]:
                 frame_index, det_index = member
-                decisions = per_frame[frame_index]
-                if det_index < len(decisions):
-                    decisions[det_index]["status"] = status
+                frame_decisions = per_frame[frame_index]
+                if det_index < len(frame_decisions):
+                    for field in ("status", "matched_student_id", "score"):
+                        frame_decisions[det_index][field] = track_decision[field]
     else:
         raise ValueError(f"Unknown multi-frame fusion mode: {mode}")
-
-    if num_frames <= 1 and mode == "k_of_n_voting":
-        # A single frame cannot vote (k >= 2 would always fail), so use its own
-        # decisions directly.
-        for frame_index, decisions in enumerate(per_frame):
-            for det_index, decision in enumerate(decisions):
-                sid = decision["matched_student_id"]
-                if sid is None:
-                    continue
-                record = student_status.get(sid)
-                if record is None:
-                    continue
-                record["frames_hit"] = max(record["frames_hit"], 1)
-                if decision["score"] > record["score"]:
-                    record["score"] = decision["score"]
-                if decision["status"] == "present":
-                    record["status"] = "present"
-                elif decision["status"] == "needs_review" and record["status"] == "absent":
-                    record["status"] = "needs_review"
 
     return {
         "mode": mode,
@@ -441,7 +424,7 @@ def _cluster_tracks(frames: list[dict]) -> list[dict]:
                     {
                         "centroid": embedding.copy(),
                         "box": box,
-                        "weight": quality,
+                        "weight": max(quality, 1e-3),
                         "quality": quality,
                         "count": 1,
                         "members": [(frame_index, det_index)],

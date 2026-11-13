@@ -23,13 +23,6 @@ import numpy as np
 
 from facelab import cache, datasets, matching
 
-DEFAULT_VARIANT_BY_MODE = {
-    "flip_averaged": "flip_avg",
-    "lowres_matched": "lowres_aug",
-    "raw": "raw",
-}
-
-
 # --------------------------------------------------------------------------- #
 # Galleries
 # --------------------------------------------------------------------------- #
@@ -180,9 +173,14 @@ def stratified_metrics(
             used.add(best_index)
             buckets[bucket]["detected"] += 1
             decision = frame_decisions[best_index] if best_index < len(frame_decisions) else None
-            if decision and decision.get("status") == "present" and decision.get(
-                "matched_student_id"
-            ) == gt.get("student_id"):
+            matched = decision.get("matched_student_id") if decision else None
+            if (
+                decision
+                and decision.get("status") == "present"
+                and matched is not None
+                and gt.get("student_id") is not None
+                and str(matched) == str(gt.get("student_id"))
+            ):
                 buckets[bucket]["identified"] += 1
 
     for value in buckets.values():
@@ -263,41 +261,12 @@ def threshold_curve(
     frames: Sequence[dict],
     gallery: dict[int, np.ndarray],
     present_student_ids: Sequence[int],
-    *,
-    variant: str = "flip_avg",
-    low: float = 0.15,
-    high: float = 0.75,
-    step: float = 0.01,
-    review_ratio: float = 0.8,
-    min_margin: float = 0.04,
-    assignment_mode: str = "hungarian",
-    template_strategy: str = "top_k_mean",
-    top_k: int = 2,
-    fusion_mode: str = "k_of_n_voting",
-    k: int = 2,
+    **kwargs,
 ) -> list[dict]:
     """Sweep ``accept_threshold`` and record attendance confusion per step."""
-    rows = []
-    threshold = low
-    while threshold <= high + 1e-9:
-        result = evaluate_frames(
-            frames,
-            gallery,
-            present_student_ids,
-            variant=variant,
-            accept_threshold=threshold,
-            review_threshold=round(threshold * review_ratio, 4),
-            min_margin=min_margin,
-            assignment_mode=assignment_mode,
-            template_strategy=template_strategy,
-            top_k=top_k,
-            fusion_mode=fusion_mode,
-            k=k,
-        )
-        metrics = result["attendance"]
-        rows.append({"threshold": round(threshold, 4), **metrics})
-        threshold = round(threshold + step, 4)
-    return rows
+    return threshold_curve_datasets(
+        [(frames, present_student_ids)], gallery, **kwargs
+    )
 
 
 def threshold_curve_datasets(
@@ -309,6 +278,8 @@ def threshold_curve_datasets(
     high: float = 0.75,
     step: float = 0.01,
     review_ratio: float = 0.8,
+    review_threshold: float | None = None,
+    min_quality: float = 0.0,
     min_margin: float = 0.04,
     assignment_mode: str = "hungarian",
     template_strategy: str = "top_k_mean",
@@ -325,6 +296,11 @@ def threshold_curve_datasets(
     rows = []
     threshold = low
     while threshold <= high + 1e-9:
+        review = (
+            min(review_threshold, threshold)
+            if review_threshold is not None
+            else round(threshold * review_ratio, 4)
+        )
         results = [
             evaluate_frames(
                 frames,
@@ -332,13 +308,14 @@ def threshold_curve_datasets(
                 present_ids,
                 variant=variant,
                 accept_threshold=threshold,
-                review_threshold=round(threshold * review_ratio, 4),
+                review_threshold=review,
                 min_margin=min_margin,
                 assignment_mode=assignment_mode,
                 template_strategy=template_strategy,
                 top_k=top_k,
                 fusion_mode=fusion_mode,
                 k=k,
+                min_quality=min_quality,
             )
             for frames, present_ids in datasets
         ]

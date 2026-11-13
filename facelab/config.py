@@ -343,6 +343,8 @@ class Settings(BaseSettings):
     results_to_keep: int = 50
     scans_to_keep: int = 50
     datasets_to_keep: int = 25
+    # Inference-cache JSON artifacts (and their aligned crop JPEGs) to retain.
+    cache_entries_to_keep: int = 2000
 
     # Useful when the parent Attendyrc app calls this API from another origin.
     cors_origins: str = "http://127.0.0.1:8010,http://localhost:8010"

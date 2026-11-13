@@ -13,7 +13,7 @@ Public entry points used by the API:
 * :func:`warm_up` — excluded-from-metrics first pass.
 * :func:`registry_payload` — availability + license table for the UI.
 
-Legacy helpers (``get_face_analyzer``, ``match_faces_to_students``, ...) are
+Legacy model-pack helpers (``get_face_analyzer``, ``model_exists``, ...) are
 retained so older callers keep working.
 """
 
@@ -23,6 +23,7 @@ import inspect
 import io
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -47,7 +48,8 @@ class FaceEngineUnavailable(RuntimeError):
 
 _ENGINE_LOCK = threading.RLock()
 _ANALYZERS: dict[str, object] = {}
-_DETECTORS: dict[tuple, "BaseDetector"] = {}
+_MAX_DETECTORS = 6
+_DETECTORS: "OrderedDict[tuple, BaseDetector]" = OrderedDict()
 _RECOGNIZERS: dict[tuple, "BaseRecognizer"] = {}
 _QUALITY: dict[str, Any] = {}
 _POSE: dict[str, Any] = {}
@@ -241,9 +243,6 @@ class BaseDetector:
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         raise NotImplementedError
 
-    def set_options(self, det_thresh: float | None = None, nms_thresh: float | None = None) -> None:
-        return None
-
     def warm_up(self) -> None:
         image = np.zeros((480, 640, 3), dtype=np.uint8)
         self.detect(image)
@@ -285,9 +284,7 @@ class InsightFaceDetector(BaseDetector):
         self.nms_thresh = nms_thresh
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
-        boxes, kps = self.model.detect(
-            image_bgr, input_size=self.det_size, det_thresh=self.det_thresh
-        )
+        boxes, kps = self.model.detect(image_bgr, input_size=self.det_size)
         detections: list[Detection] = []
         for index in range(len(boxes)):
             detections.append(
@@ -428,6 +425,10 @@ def get_detector(detector_id: str | None = None, det_size: int | tuple[int, int]
         if detector is None:
             detector = _build_detector(detector_id, size, det_thresh, nms_thresh)
             _DETECTORS[key] = detector
+            while len(_DETECTORS) > _MAX_DETECTORS:
+                _DETECTORS.popitem(last=False)
+        else:
+            _DETECTORS.move_to_end(key)
         return detector
 
 
@@ -900,6 +901,7 @@ def analyze_frame(
         payloads.append(
             {
                 "det_index": det_index,
+                "crop_index": (len(crops) - 1) if crop is not None else None,
                 "bbox": [round(float(v), 2) for v in bbox],
                 "face_height_px": round(height_px, 2),
                 "size_bucket": matching.size_bucket(height_px),
@@ -923,22 +925,27 @@ def analyze_frame(
     if crops:
         raw = recognizer.embed(crops)
         raw = np.asarray(raw, dtype=np.float32)
-        for index, payload in enumerate(payloads):
-            vector = raw[index]
+        indexed = [
+            (payload, payload["crop_index"])
+            for payload in payloads
+            if payload["crop_index"] is not None
+        ]
+        for payload, crop_index in indexed:
+            vector = raw[crop_index]
             payload["embedding"] = vector
             payload["embedding_norm_mag"] = round(float(np.linalg.norm(vector)), 4)
         if flip_aug:
             flipped = [cv2.flip(crop, 1) for crop in crops]
             mirror = np.asarray(recognizer.embed(flipped), dtype=np.float32)
-            for index, payload in enumerate(payloads):
+            for payload, crop_index in indexed:
                 payload["embedding_flip_avg"] = matching.flip_averaged(
-                    raw[index], mirror[index]
+                    raw[crop_index], mirror[crop_index]
                 )
         if lowres_aug:
             augmented = [lowres_augment(crop) for crop in crops]
             extra = np.asarray(recognizer.embed(augmented), dtype=np.float32)
-            for index, payload in enumerate(payloads):
-                payload["embedding_lowres_aug"] = extra[index]
+            for payload, crop_index in indexed:
+                payload["embedding_lowres_aug"] = extra[crop_index]
     timings["align_embed_ms"] = round((time.perf_counter() - started) * 1000, 3)
 
     started = time.perf_counter()
@@ -961,6 +968,7 @@ def analyze_frame(
 
     for payload in payloads:
         payload.pop("crop", None)
+        payload.pop("crop_index", None)
 
     return {
         "detector_id": detector_id,
@@ -979,7 +987,8 @@ def analyze_frame(
 
 
 def warm_up(detector_id: str | None = None, recognizer_id: str | None = None,
-            det_size: int | None = None, tiling_mode: str = "none") -> dict:
+            det_size: int | None = None, tiling_mode: str = "none",
+            det_thresh: float = 0.35, nms_thresh: float = 0.45) -> dict:
     """One throwaway inference pass so benchmark timings exclude lazy loading."""
     started = time.perf_counter()
     image = np.full((480, 640, 3), 127, dtype=np.uint8)
@@ -989,6 +998,8 @@ def warm_up(detector_id: str | None = None, recognizer_id: str | None = None,
             detector_id=detector_id,
             recognizer_id=recognizer_id,
             det_size=det_size,
+            det_thresh=det_thresh,
+            nms_thresh=nms_thresh,
             tiling_mode=tiling_mode,
             with_quality=False,
             with_pose=False,
@@ -1070,213 +1081,6 @@ def get_face_analyzer(model_name: str | None = None):
             raise FaceEngineUnavailable(f"Model '{name}' could not be loaded: {exc}") from exc
         _ANALYZERS[name] = analyzer
         return analyzer
-
-
-def detect_faces(image_bgr: np.ndarray, det_size: int | None = None, model_name: str | None = None):
-    """Legacy: detect with the selected model pack and return InsightFace faces."""
-    if image_bgr is None or image_bgr.size == 0:
-        return []
-    with _ENGINE_LOCK:
-        analyzer = get_face_analyzer(model_name)
-        size = det_size or settings.face_det_size
-        detector = getattr(analyzer, "det_model", None)
-        current = getattr(detector, "input_size", None)
-        if not current or tuple(current) != (size, size):
-            analyzer.prepare(ctx_id=0, det_size=(size, size))
-        return analyzer.get(image_bgr)
-
-
-def validate_registration_face(image_bgr: np.ndarray, model_name: str | None = None):
-    """Registration photos must contain exactly one clear face."""
-    if image_bgr is None or image_bgr.size == 0:
-        return False, None, "Invalid or empty image provided."
-
-    faces = detect_faces(image_bgr, model_name=model_name)
-    if len(faces) == 0:
-        return False, None, "No face detected. Ask the student to face the camera in good light."
-    if len(faces) > 1:
-        return (
-            False,
-            None,
-            f"Multiple faces ({len(faces)}) detected. Use exactly one student per photo.",
-        )
-
-    face = faces[0]
-    bbox = face.bbox.astype(int)
-    width, height = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    if width < 50 or height < 50:
-        return True, face, "Face is small in the frame; move closer for a stronger embedding."
-    return True, face, "Face detected."
-
-
-def extract_embedding(face_obj) -> np.ndarray:
-    if face_obj is None or getattr(face_obj, "embedding", None) is None:
-        raise ValueError("Face object does not contain an embedding")
-    emb = np.asarray(face_obj.embedding, dtype=np.float32)
-    norm = np.linalg.norm(emb)
-    return emb / norm if norm > 0 else emb
-
-
-def embedding_to_bytes(embedding: np.ndarray) -> bytes:
-    return np.asarray(embedding, dtype=np.float32).tobytes()
-
-
-def bytes_to_embedding(blob: bytes) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32).copy()
-
-
-def match_faces_to_students(
-    detected_faces: list,
-    registered_embeddings_rows: list[tuple[int, str, str | None, bytes]],
-    all_class_students: list[tuple[int, str, str | None]],
-    threshold: float | None = None,
-) -> tuple[list[dict], list[dict]]:
-    """Legacy greedy matcher, now backed by the shared matching engine."""
-    threshold = threshold if threshold is not None else settings.face_similarity_threshold
-
-    student_lookup = {
-        student_id: {
-            "student_id": student_id,
-            "name": name,
-            "roll_number": roll,
-            "status": "Absent",
-            "confidence": None,
-        }
-        for student_id, name, roll in all_class_students
-    }
-
-    if not detected_faces:
-        return [], sorted(student_lookup.values(), key=lambda row: row["name"])
-
-    if not registered_embeddings_rows:
-        matches = [
-            {
-                "face": face,
-                "matched": False,
-                "student_id": None,
-                "student_name": "Unknown",
-                "roll_number": None,
-                "confidence": 0.0,
-            }
-            for face in detected_faces
-        ]
-        return matches, sorted(student_lookup.values(), key=lambda row: row["name"])
-
-    gallery: dict[int, np.ndarray] = {}
-    meta: dict[int, tuple[str, str | None]] = {}
-    for student_id, name, roll, blob in registered_embeddings_rows:
-        emb = (
-            bytes_to_embedding(blob)
-            if isinstance(blob, (bytes, bytearray, memoryview))
-            else np.asarray(blob, dtype=np.float32)
-        )
-        gallery.setdefault(student_id, []).append(matching.l2_normalize(emb))
-        meta[student_id] = (name, roll)
-    gallery = {key: np.vstack(value) for key, value in gallery.items()}
-
-    face_embeddings = [extract_embedding(face) for face in detected_faces]
-    sim_matrix, student_ids = matching.build_similarity_matrix(face_embeddings, gallery, "max")
-    decisions = matching.assign_single_frame(
-        sim_matrix, student_ids, accept_threshold=threshold,
-        review_threshold=threshold, min_margin=0.0, assignment_mode="greedy",
-    )
-
-    matches = []
-    for face_index, face in enumerate(detected_faces):
-        decision = decisions[face_index]
-        student_id = decision["matched_student_id"]
-        if student_id is not None and decision["status"] == "present":
-            name, roll = meta[student_id]
-            matches.append(
-                {
-                    "face": face,
-                    "matched": True,
-                    "student_id": student_id,
-                    "student_name": name,
-                    "roll_number": roll,
-                    "confidence": round(decision["score"], 4),
-                }
-            )
-            if student_id in student_lookup:
-                student_lookup[student_id]["status"] = "Present"
-                student_lookup[student_id]["confidence"] = round(decision["score"], 4)
-        else:
-            best = float(np.max(sim_matrix[face_index])) if sim_matrix.shape[1] else 0.0
-            matches.append(
-                {
-                    "face": face,
-                    "matched": False,
-                    "student_id": None,
-                    "student_name": "Unknown",
-                    "roll_number": None,
-                    "confidence": round(best, 4),
-                }
-            )
-
-    roster = sorted(
-        student_lookup.values(), key=lambda row: (row["status"] != "Present", row["name"])
-    )
-    return matches, roster
-
-
-def match_frames_to_students(
-    detected_frames: list[list],
-    registered_embeddings_rows: list[tuple[int, str, str | None, bytes]],
-    all_class_students: list[tuple[int, str, str | None]],
-    threshold: float | None = None,
-) -> tuple[list[dict], list[dict], dict]:
-    """Legacy burst matcher retained for compatibility."""
-    threshold = threshold if threshold is not None else settings.face_similarity_threshold
-    frames = [frame for frame in detected_frames if frame is not None]
-    best_matches: list[dict] = []
-    best_roster: list[dict] = []
-    best_index = -1
-    best_recognised = -1
-    merged: dict[int, float] = {}
-    faces_detected = 0
-    unknown = 0
-
-    for index, faces in enumerate(frames):
-        matches, roster = match_faces_to_students(
-            faces, registered_embeddings_rows, all_class_students, threshold
-        )
-        faces_detected = max(faces_detected, len(faces))
-        unknown = max(unknown, sum(1 for match in matches if not match["matched"]))
-        recognised = 0
-        for match in matches:
-            if match["matched"]:
-                recognised += 1
-                student_id = match["student_id"]
-                merged[student_id] = max(merged.get(student_id, 0.0), match["confidence"])
-        if recognised > best_recognised:
-            best_recognised = recognised
-            best_matches = matches
-            best_roster = roster
-            best_index = index
-
-    if not frames:
-        best_matches, best_roster = match_faces_to_students(
-            [], registered_embeddings_rows, all_class_students, threshold
-        )
-
-    roster_by_id = {row["student_id"]: dict(row) for row in best_roster}
-    for student_id, confidence in merged.items():
-        row = roster_by_id.get(student_id)
-        if row is not None:
-            row["status"] = "Present"
-            row["confidence"] = confidence
-    roster = sorted(
-        roster_by_id.values(), key=lambda row: (row["status"] != "Present", row["name"])
-    )
-
-    summary = {
-        "matched": merged,
-        "unknown": unknown,
-        "facesDetected": faces_detected,
-        "frames": len(frames),
-        "bestIndex": best_index,
-    }
-    return best_matches, roster, summary
 
 
 # Annotation colours by decision status (present / needs_review / unmatched).

@@ -272,6 +272,34 @@ def test_k_of_n_voting_honours_min_margin():
     assert fused["students"]["b"]["status"] == "absent"
 
 
+def test_single_frame_voting_honours_min_quality():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([_det([1.0, 0.0, 0.0], quality=0.1)])]
+    fused = matching.fuse_multi_frame(
+        frames, gallery, accept_threshold=0.5, review_threshold=0.4, min_quality=0.5
+    )
+    assert fused["students"]["s"]["status"] == "absent"
+
+
+def test_k_is_clamped_to_frame_count():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([_det([1.0, 0.0, 0.0])]), _frame([_det([1.0, 0.0, 0.0])])]
+    fused = matching.fuse_multi_frame(
+        frames, gallery, accept_threshold=0.5, review_threshold=0.4, k=5
+    )
+    assert fused["students"]["s"]["status"] == "present"
+
+
+def test_max_gate_reports_needs_review():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([_det([0.45, 0.893, 0.0])])]
+    fused = matching.fuse_multi_frame(
+        frames, gallery, mode="max_with_margin_gate",
+        accept_threshold=0.6, review_threshold=0.4,
+    )
+    assert fused["students"]["s"]["status"] == "needs_review"
+
+
 def test_annotate_classroom_photo_draws_bbox_only_matches():
     from facelab import face as face_module
 

@@ -146,14 +146,6 @@ def _variant_for(flip_aug: bool, lowres_aug: bool) -> str:
     return "flip_avg" if flip_aug else "raw"
 
 
-def _variant_field(variant: str) -> str:
-    return {
-        "raw": "embedding",
-        "flip_avg": "embedding_flip_avg",
-        "lowres_aug": "embedding_lowres_aug",
-    }.get(variant, "embedding")
-
-
 # --------------------------------------------------------------------------- #
 # Persisted roster
 # --------------------------------------------------------------------------- #
@@ -999,7 +991,9 @@ def _run_scan_sync(
     variant = _variant_for(flip_aug, lowres_aug)
 
     try:
-        engine.warm_up(detector_id, recognizer_id, det_size, tiling_mode)
+        engine.warm_up(
+            detector_id, recognizer_id, det_size, tiling_mode, det_thresh, nms_thresh
+        )
     except engine.FaceEngineUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -1189,6 +1183,8 @@ def _run_scan_sync(
             "minMargin": round(min_margin, 4),
             "assignmentMode": assignment_mode,
             "templateStrategy": template_strategy,
+            "topK": top_k,
+            "minQuality": min_quality,
             "fusionMode": fusion_mode,
             "fusionK": fusion_k,
             "variant": variant,
@@ -1219,6 +1215,7 @@ def _run_scan_sync(
         "warnings": warnings,
     }
     _prune_scans()
+    cache_store.prune_cache()
     _save_result(result)
     return result
 
@@ -1340,7 +1337,10 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             warm_key = (detector_id, recognizer_id, det_size, tiling_mode)
             if warm_key not in warmups:
                 try:
-                    info = engine.warm_up(detector_id, recognizer_id, det_size, tiling_mode)
+                    info = engine.warm_up(
+                        detector_id, recognizer_id, det_size, tiling_mode,
+                        request.det_thresh, request.nms_thresh,
+                    )
                     warmups[warm_key] = float(info.get("warmup_ms") or 0.0)
                 except engine.FaceEngineUnavailable as exc:
                     rows.append(
@@ -1431,8 +1431,8 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 [(frames, present_ids) for frames, present_ids, _boxes in dataset_inputs],
                 gallery,
                 variant=variant,
-                review_ratio=(request.review_threshold / request.accept_threshold)
-                if request.accept_threshold else 0.8,
+                review_threshold=request.review_threshold,
+                min_quality=request.min_quality,
                 min_margin=request.min_margin,
                 assignment_mode=request.assignment_mode,
                 template_strategy=request.template_strategy,
@@ -1444,6 +1444,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             chosen_threshold = request.accept_threshold or (
                 points["best_f1"]["threshold"] if points["best_f1"] else request.review_threshold
             )
+            review_used = min(request.review_threshold, chosen_threshold)
             evaluations = [
                 bench.evaluate_frames(
                     frames,
@@ -1451,7 +1452,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     present_ids,
                     variant=variant,
                     accept_threshold=chosen_threshold,
-                    review_threshold=request.review_threshold,
+                    review_threshold=review_used,
                     min_margin=request.min_margin,
                     assignment_mode=request.assignment_mode,
                     template_strategy=request.template_strategy,
@@ -1481,7 +1482,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     "detectorSha256": _weight_sha256(KNOWN_DETECTORS.get(detector_id, {})),
                     "recognizerSha256": _weight_sha256(KNOWN_RECOGNIZERS.get(recognizer_id, {})),
                     "acceptThreshold": chosen_threshold,
-                    "reviewThreshold": request.review_threshold,
+                    "reviewThreshold": review_used,
                     "minMargin": request.min_margin,
                     "assignmentMode": request.assignment_mode,
                     "templateStrategy": request.template_strategy,
@@ -1521,6 +1522,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
         },
         "rows": rows,
     }
+    cache_store.prune_cache()
     _save_benchmark(run)
     return run
 
@@ -1814,7 +1816,8 @@ def rename_person(person_id: int, payload: RenameRequest, _: None = Depends(requ
             raise HTTPException(status_code=404, detail="Student not found")
         person["name"] = clean_name
         _save_state()
-    return {"person": _public_person(person), "state": _public_state()}
+        public = _public_person(person)
+    return {"person": public, "state": _public_state()}
 
 
 @app.delete("/api/people/{person_id}/photos/{photo_id}")
@@ -1832,7 +1835,8 @@ def delete_photo(person_id: int, photo_id: str, _: None = Depends(require_token)
         except (OSError, TypeError):
             pass
         _save_state()
-    return {"person": _public_person(person), "state": _public_state()}
+        public = _public_person(person)
+    return {"person": public, "state": _public_state()}
 
 
 @app.delete("/api/people/{person_id}")
@@ -1944,15 +1948,25 @@ def delete_result(scan_id: str, _: None = Depends(require_token)) -> dict:
 
 
 @app.post("/api/results/{scan_id}/sweep")
-def sweep_result(scan_id: str, payload: SweepRequest) -> dict:
+def sweep_result(
+    scan_id: str, payload: SweepRequest, _: None = Depends(require_token)
+) -> dict:
     """Re-score a saved scan from its cache when the threshold sliders move."""
     path = _result_path(scan_id)
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="Result not found")
+    for label, value in (
+        ("accept_threshold", payload.accept_threshold),
+        ("review_threshold", payload.review_threshold),
+        ("min_margin", payload.min_margin),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise HTTPException(status_code=422, detail=f"{label} must be between 0 and 1")
     result = json.loads(path.read_text(encoding="utf-8"))
     summary = result.get("summary", {})
     detector_id = payload.detector or result.get("detectorId") or settings.default_detector
     recognizer_id = payload.recognizer or result.get("recognizerId") or settings.default_recognizer
+    _require_recognizer(recognizer_id)
     det_params = summary.get("detParams") or cache_store.analysis_params(
         det_size=summary.get("detSize") or settings.face_scan_det_size,
         det_thresh=summary.get("detThresh", 0.35),
@@ -2094,7 +2108,7 @@ async def benchmark_run(payload: BenchmarkRunRequest, _: None = Depends(require_
 
 
 @app.post("/api/benchmark/sweep")
-async def benchmark_sweep(payload: SweepRequest) -> dict:
+async def benchmark_sweep(payload: SweepRequest, _: None = Depends(require_token)) -> dict:
     return await run_in_threadpool(_run_sweep_sync, payload)
 
 
