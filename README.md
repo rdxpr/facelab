@@ -82,6 +82,36 @@ Without `uniface` (or before its weights are downloaded), the registry marks
 those models unavailable and the quality score falls back to the pre-L2
 embedding norm.
 
+## Helper: batch face crops
+
+`scripts/crop_faces.py` is a standalone dev helper (it never touches the server,
+roster, or inference cache) that extracts **padded, natural-looking** face crops
+from a folder of reference photos — handy for enrolling students without
+hand-cropping.
+
+```bash
+mkdir -p scripts/incoming && cp /path/to/photos/*.jpg scripts/incoming/
+python scripts/crop_faces.py                       # -> scripts/face-crops/
+python scripts/crop_faces.py --padding 0.45 --aligned
+python scripts/crop_faces.py --recursive --manifest csv
+python scripts/crop_faces.py --tiling sahi_upper_band   # wide/group photos
+```
+
+It detects **every** face, writes one folder per source image
+(`<name>/<name>__f01.jpg`), and emits a `manifest.json` (or `--manifest csv`)
+plus a labelled `contact-sheet.jpg` so you can eyeball crops quickly.
+
+- `--padding` — margin as a fraction of the face's larger side (default `0.35`).
+- `--square` / `--no-square` — square crop around the face centre (default on).
+- `--min-face` / `--max-faces` / `--dominant` — drop or limit small faces.
+- `--aligned` — also save the 112×112 aligned crop.
+- `--tiling` — `none` (default), `sahi_upper_band`, or `sahi_full` for small
+  faces in wide shots.
+
+The padded crops are single-face portraits, so the good ones can be uploaded
+directly on the **Students** tab or posted to `POST /api/people`.
+`scripts/incoming/` and `scripts/face-crops/` are git-ignored.
+
 ## Using the UI
 
 The interface has three tabs.
@@ -305,6 +335,7 @@ server.py           FastAPI app: roster, scans, datasets, benchmarks
 static/             Zero-build UI (HTML/CSS/JS)
 scripts/
   fetch_models.py   Download model packs + UniFace weights, write a SHA-256 manifest
+  crop_faces.py     Standalone batch face-crop helper (padded crops + manifest)
 models/<pack>/      ONNX weights (git-ignored, fetched on demand)
 .data/              Roster, frames, datasets, cache, results (git-ignored, dev data)
 tests/              pytest suites for the matching and benchmark engines
@@ -319,7 +350,8 @@ Dockerfile          Container image (libGL for OpenCV, prod/ephemeral defaults)
 
 `tests/test_matching.py` covers similarity, assignment, margin gating, and burst
 fusion; `tests/test_benchmark.py` covers galleries, calibration, stratified
-recall, aggregation, and latency.
+recall, aggregation, and latency; `tests/test_crop_faces.py` covers the
+face-crop helper's padding/name helpers.
 
 ## Notes
 

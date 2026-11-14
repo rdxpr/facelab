@@ -17,6 +17,10 @@ venv/
 # GitHub's 100 MB limit). Fetch them with `python scripts/fetch_models.py`.
 models/
 
+# Input/output for the standalone face-crop helper (scripts/crop_faces.py).
+scripts/incoming/
+scripts/face-crops/
+
 # Secrets / local overrides.
 .env
 
