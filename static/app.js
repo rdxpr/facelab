@@ -90,6 +90,11 @@ const plural = (count, singular, pluralForm = `${singular}s`) =>
 
 const pct = (value) => `${Math.round((Number(value) || 0) * 100)}%`;
 const fixed = (value, digits = 3) => (Number.isFinite(Number(value)) ? Number(value).toFixed(digits) : "—");
+// Like fixed(), but null/undefined render as a dash instead of 0.000.
+const dash = (value, digits = 3) =>
+  value === null || value === undefined || !Number.isFinite(Number(value))
+    ? "—"
+    : Number(value).toFixed(digits);
 
 function formatBytes(bytes) {
   if (!bytes) return "0 B";
@@ -592,6 +597,7 @@ function scanForm() {
   form.append("lowresAug", String(selection.lowresAug));
   form.append("withQuality", String(selection.withQuality));
   form.append("withPose", String(selection.withPose));
+  form.append("labelUnknown", String($("#label-unknown").checked));
   for (const file of state.frameFiles) form.append("images", file, file.name);
   return form;
 }
@@ -694,7 +700,9 @@ async function liveSweep() {
     renderSummary();
     renderRoster();
     renderFrame();
-    if (state.inspector) openInspector(state.inspector.faceIndex);
+    if (state.inspector) {
+      openInspector(state.inspector.faceIndex, state.inspector.frame, state.inspector.scope);
+    }
     toast("Re-scored from cache — no re-inference", "");
   } catch (error) {
     if (seq !== sweepSeq) return;
@@ -832,14 +840,9 @@ function faceClass(status) {
   return "unknown";
 }
 
-function renderFrame() {
-  const scan = state.scan;
-  if (!scan || !scan.frames.length) return;
-  const index = clamp(state.selectedFrame, 0, scan.frames.length - 1);
-  const frame = scan.frames[index];
-  const view = $("#frame-view");
-  view.innerHTML = "";
-  delete view.dataset.highlight;
+function renderFrameInto(container, frame, index = 0) {
+  container.innerHTML = "";
+  delete container.dataset.highlight;
 
   const media = document.createElement("div");
   media.className = "frame-media";
@@ -851,7 +854,7 @@ function renderFrame() {
   const layer = document.createElement("div");
   layer.className = "box-layer";
   media.append(layer);
-  view.append(media);
+  container.append(media);
 
   frame.faces.forEach((face, faceIndex) => {
     const [x1, y1, x2, y2] = face.box;
@@ -874,14 +877,24 @@ function renderFrame() {
     if (width < 7 || height < 7) box.classList.add("compact");
     const label = document.createElement("span");
     label.className = "box-label";
-    const tag = face.status === "present" ? "" : face.status === "needs_review" ? "? " : "? ";
+    const tag = face.status === "present" ? "" : "? ";
     label.textContent = `${tag}${face.personId != null ? face.name : "Unknown"} · ${fixed(face.confidence, 2)}`;
     if (top < 7) label.classList.add("inside");
     if (left > 60) label.classList.add("right");
     box.append(label);
-    box.addEventListener("click", () => openInspector(faceIndex));
+    box.addEventListener("click", () => openInspector(faceIndex, frame, container));
     layer.append(box);
   });
+
+  return media;
+}
+
+function renderFrame() {
+  const scan = state.scan;
+  if (!scan || !scan.frames.length) return;
+  const index = clamp(state.selectedFrame, 0, scan.frames.length - 1);
+  const frame = scan.frames[index];
+  renderFrameInto($("#frame-view"), frame, index);
 
   $("#frame-meta").textContent =
     `${frame.sourceName || `frame ${index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}` +
@@ -943,11 +956,12 @@ function landmarksSvg(points) {
   return `<svg class="landmark-layer" viewBox="0 0 112 112" preserveAspectRatio="none" aria-hidden="true">${dots}</svg>`;
 }
 
-function openInspector(faceIndex) {
-  const frame = state.scan?.frames[state.selectedFrame];
+function openInspector(faceIndex, frame = null, scope = null) {
+  frame = frame || state.scan?.frames[state.selectedFrame];
   const face = frame?.faces[faceIndex];
   if (!face) return;
-  state.inspector = { faceIndex };
+  const container = scope || $("#frame-view");
+  state.inspector = { faceIndex, frame, scope: container };
   const wrap = $("#inspector");
   wrap.hidden = false;
 
@@ -981,7 +995,7 @@ function openInspector(faceIndex) {
       <span class="field-label">Box (x1, y1, x2, y2)</span>
       <div class="mono small">${face.box.map((value) => Math.round(value)).join(", ")}</div>
     </div>`;
-  for (const box of $$(".face-box", $("#frame-view"))) {
+  for (const box of $$(".face-box", container)) {
     box.classList.toggle("active", box.dataset.face === String(faceIndex));
   }
 }
@@ -990,6 +1004,145 @@ function closeInspector() {
   state.inspector = null;
   $("#inspector").hidden = true;
   for (const box of $$(".face-box")) box.classList.remove("active");
+}
+
+/* ----------------------------------------------------- view prefs + lightbox */
+
+const VIEW_KEY = "facelab.view";
+const LIGHTBOX_MIN_SCALE = 1;
+const LIGHTBOX_MAX_SCALE = 6;
+
+function viewPrefs() {
+  try { return JSON.parse(window.localStorage.getItem(VIEW_KEY) || "{}") || {}; } catch { return {}; }
+}
+
+function saveViewPrefs(patch) {
+  try {
+    window.localStorage.setItem(VIEW_KEY, JSON.stringify({ ...viewPrefs(), ...patch }));
+  } catch { /* localStorage may be blocked */ }
+}
+
+function setUnknownLabels(on) {
+  document.body.classList.toggle("show-unknown-labels", on);
+  const input = $("#label-unknown");
+  if (input) input.checked = on;
+}
+
+function setRosterCollapsed(on) {
+  $("#results-body")?.classList.toggle("roster-collapsed", on);
+  const button = $("#roster-toggle");
+  if (button) {
+    button.setAttribute("aria-pressed", String(on));
+    button.textContent = on ? "Show roster" : "Hide roster";
+  }
+}
+
+function applyViewPrefs() {
+  const prefs = viewPrefs();
+  setUnknownLabels(Boolean(prefs.labelUnknown));
+  setRosterCollapsed(Boolean(prefs.rosterCollapsed));
+}
+
+function lightboxFrame() {
+  return state.lightbox?.frames?.[state.lightbox.index] || null;
+}
+
+function fitLightboxStage() {
+  const lb = state.lightbox;
+  const frame = lightboxFrame();
+  const viewport = $("#lightbox-viewport");
+  if (!lb || !frame || !viewport) return;
+  const pad = 28;
+  const vw = Math.max(1, viewport.clientWidth - pad * 2);
+  const vh = Math.max(1, viewport.clientHeight - pad * 2);
+  const aspect = (frame.width || 1) / (frame.height || 1);
+  let w = vw;
+  let h = vw / aspect;
+  if (h > vh) { h = vh; w = vh * aspect; }
+  lb.fit = { w, h };
+  const stage = $("#lightbox-stage");
+  stage.style.width = `${w}px`;
+  stage.style.height = `${h}px`;
+}
+
+function applyLightboxTransform() {
+  const lb = state.lightbox;
+  const stage = $("#lightbox-stage");
+  if (!lb || !stage) return;
+  stage.style.transform = `translate(${lb.tx}px, ${lb.ty}px) scale(${lb.scale})`;
+  stage.style.setProperty("--inv", String(1 / lb.scale));
+  stage.classList.toggle("zoomed", lb.scale >= 1.9);
+}
+
+function centerLightbox() {
+  const lb = state.lightbox;
+  const viewport = $("#lightbox-viewport");
+  if (!lb || !lb.fit || !viewport) return;
+  lb.tx = (viewport.clientWidth - lb.fit.w * lb.scale) / 2;
+  lb.ty = (viewport.clientHeight - lb.fit.h * lb.scale) / 2;
+}
+
+function renderLightbox() {
+  const lb = state.lightbox;
+  const frame = lightboxFrame();
+  if (!lb || !frame) return;
+  const stage = $("#lightbox-stage");
+  fitLightboxStage();
+  renderFrameInto(stage, frame, lb.index);
+  centerLightbox();
+  applyLightboxTransform();
+  $("#lightbox-title").textContent =
+    `${frame.sourceName || frame.frameId || `Frame ${lb.index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}`;
+  $("#lightbox-prev").disabled = lb.index <= 0;
+  $("#lightbox-next").disabled = lb.index >= lb.frames.length - 1;
+}
+
+function openLightbox(frames, index = 0) {
+  if (!frames?.length) return;
+  state.lightbox = {
+    frames,
+    index: clamp(index, 0, frames.length - 1),
+    scale: 1,
+    tx: 0,
+    ty: 0,
+    fit: null,
+  };
+  document.body.classList.add("lightbox-open");
+  $("#frame-lightbox").hidden = false;
+  renderLightbox();
+}
+
+function closeLightbox() {
+  if (!state.lightbox) return;
+  const stage = $("#lightbox-stage");
+  if (state.inspector && state.inspector.scope === stage) closeInspector();
+  state.lightbox = null;
+  document.body.classList.remove("lightbox-open");
+  $("#frame-lightbox").hidden = true;
+  stage.innerHTML = "";
+}
+
+function lightboxStep(delta) {
+  const lb = state.lightbox;
+  if (!lb) return;
+  const next = clamp(lb.index + delta, 0, lb.frames.length - 1);
+  if (next === lb.index) return;
+  if (state.inspector) closeInspector();
+  lb.index = next;
+  lb.scale = 1;
+  renderLightbox();
+}
+
+function lightboxReset() {
+  const lb = state.lightbox;
+  if (!lb) return;
+  lb.scale = 1;
+  centerLightbox();
+  applyLightboxTransform();
+}
+
+function openScanLightbox() {
+  if (state.scan?.frames?.length) openLightbox(state.scan.frames, state.selectedFrame);
 }
 
 /* ------------------------------------------------------------- history */
@@ -1257,6 +1410,8 @@ async function runBenchmark() {
     fusion_mode: $("#bench-fusion").value,
     k: state.settings.fusionK ?? 2,
     min_quality: state.settings.minFaceQuality ?? 0,
+    force_fresh: $("#bench-force-fresh").checked,
+    label_unknown: $("#bench-label-unknown").checked,
   };
 
   if (!payload.det_sizes.length || !payload.tiling_modes.length) {
@@ -1307,18 +1462,50 @@ const BENCH_COLUMNS = [
   { key: "recognizer", label: "Recognizer", text: (row) => row.recognizer.split(":").pop(), value: (row) => row.recognizer },
   { key: "detSize", label: "Res", text: (row) => row.detSize, value: (row) => row.detSize },
   { key: "tiling", label: "Tiling", text: (row) => row.tilingMode, value: (row) => row.tilingMode },
-  { key: "f1", label: "F1", text: (row) => fixed(row.metrics?.f1), value: (row) => row.metrics?.f1 ?? -1, cls: (row) => metricClass(row.metrics?.f1 ?? 0) },
+  {
+    key: "f1",
+    label: "F1",
+    text: (row) => fixed(row.metrics?.f1),
+    // F1 dominates; similarity margin breaks ties.
+    value: (row) => (row.metrics?.f1 ?? -1) * 1000 + Math.max(0, row.simMargin ?? 0),
+    cls: (row) => metricClass(row.metrics?.f1 ?? 0),
+  },
   { key: "precision", label: "Prec", text: (row) => fixed(row.metrics?.precision), value: (row) => row.metrics?.precision ?? -1 },
   { key: "recall", label: "Rec", text: (row) => fixed(row.metrics?.recall), value: (row) => row.metrics?.recall ?? -1 },
   { key: "tauF1", label: "τ*", text: (row) => fixed(row.tauF1, 2), value: (row) => row.tauF1 ?? -1 },
+  { key: "meanSim", label: "Mean Sim", text: (row) => dash(row.meanPresentSim), value: (row) => row.meanPresentSim ?? -1 },
+  { key: "impostor", label: "Impostor", text: (row) => dash(row.maxImpostorSim), value: (row) => row.maxImpostorSim ?? -1 },
   {
     key: "buckets",
     label: "L/M/S recall",
+    // Only meaningful with ground-truth boxes; otherwise show a dash, not 0.000.
     text: (row) => {
+      if (!row.detection?.has_annotations) return "—";
       const b = row.detection?.buckets || {};
       return `${fixed(b.large?.identification_recall)} / ${fixed(b.medium?.identification_recall)} / ${fixed(b.small?.identification_recall)}`;
     },
-    value: (row) => row.detection?.buckets?.medium?.identification_recall ?? -1,
+    value: (row) =>
+      row.detection?.has_annotations
+        ? row.detection?.buckets?.medium?.identification_recall ?? -1
+        : -1,
+  },
+  {
+    key: "faces",
+    label: "Faces L/M/S",
+    text: (row) => {
+      const b = row.detectedBuckets || row.detection?.detected_buckets || {};
+      return `${b.large || 0} / ${b.medium || 0} / ${b.small || 0}`;
+    },
+    value: (row) => {
+      const b = row.detectedBuckets || row.detection?.detected_buckets || {};
+      return (b.large || 0) + (b.medium || 0) + (b.small || 0);
+    },
+  },
+  {
+    key: "fps",
+    label: "FPS",
+    text: (row) => `${fixed(row.fps, 1)}${row.cachedFrames ? "*" : ""}`,
+    value: (row) => row.fps ?? -1,
   },
   { key: "detP50", label: "det p50", text: (row) => fixed(row.latency?.detect_ms_p50, 0), value: (row) => row.latency?.detect_ms_p50 ?? -1 },
   { key: "totalP50", label: "total p50", text: (row) => fixed(row.latency?.total_inference_ms_p50, 0), value: (row) => row.latency?.total_inference_ms_p50 ?? -1 },
@@ -1354,7 +1541,7 @@ function renderBenchmark(run) {
   const body = rows
     .map((row) => {
       if (row.error) {
-        return `<tr class="error-row"><td>${esc(row.detector.split(":").pop())}</td><td>${esc(row.recognizer.split(":").pop())}</td><td>${row.detSize ?? "—"}</td><td>${esc(row.tilingMode || "—")}</td><td colspan="7">${esc(row.error)}</td></tr>`;
+        return `<tr class="error-row"><td>${esc(row.detector.split(":").pop())}</td><td>${esc(row.recognizer.split(":").pop())}</td><td>${row.detSize ?? "—"}</td><td>${esc(row.tilingMode || "—")}</td><td colspan="${BENCH_COLUMNS.length - 4}">${esc(row.error)}</td></tr>`;
       }
       const key = comboKey(row);
       const cells = BENCH_COLUMNS.map((item) => {
@@ -1434,15 +1621,37 @@ function showBenchmarkRow(row, tr, options = {}) {
     return;
   }
   const buckets = row.detection?.buckets || {};
+  const hasGt = Boolean(row.detection?.has_annotations);
+  const detected = row.detectedBuckets || row.detection?.detected_buckets || {};
   const reading = (key) =>
     ["large", "medium", "small"]
       .map((name) => `<div class="bucket"><span class="muted">${name}</span><b class="mono">${fixed(buckets[name]?.[key])}</b><span class="muted small">${buckets[name]?.gt || 0} gt</span></div>`)
       .join("");
+  const detectedReading = ["large", "medium", "small"]
+    .map((name) => `<div class="bucket"><span class="muted">${name}</span><b class="mono">${detected[name] || 0}</b></div>`)
+    .join("");
   const weightBits = [
     row.detectorSha256 ? `det ${row.detectorSha256.slice(0, 10)}` : "",
     row.recognizerSha256 ? `rec ${row.recognizerSha256.slice(0, 10)}` : "",
     (row.providers || []).length ? `EP: ${(row.providers || []).join(", ")}` : "",
   ].filter(Boolean).join(" · ");
+  const frames = row.frames || [];
+  const timingSource = row.cachedFrames
+    ? `${row.cachedFrames}/${row.frameCount ?? frames.length} cached`
+    : "fresh";
+  const fpsText = row.fps == null ? "—" : `${fixed(row.fps, 1)} fps${row.cachedFrames ? "*" : ""}`;
+  const framesHtml = frames.length
+    ? `<div class="inspect-section">
+        <span class="field-label">Annotated frames (${frames.length}) · click to open viewer</span>
+        <div class="bench-frames">${frames
+          .map((frame, index) => `
+            <button type="button" class="bench-frame-thumb" data-frame-index="${index}" title="${esc(frame.frameId || `Frame ${index + 1}`)}">
+              <img src="${esc(frame.annotatedUrl || frame.imageUrl)}" alt="" loading="lazy">
+              <span class="thumb-meta">${esc(frame.frameId || `Frame ${index + 1}`)} · ${plural(frame.faces?.length || 0, "face")}</span>
+            </button>`)
+          .join("")}</div>
+      </div>`
+    : `<div class="inspect-section"><span class="field-label">Annotated frames</span><div class="bench-frames-empty">No saved frames for this run.</div></div>`;
   detail.innerHTML = `
     <div class="bench-detail-head">
       <strong>${esc(row.detector)}</strong> + <strong>${esc(row.recognizer)}</strong>
@@ -1453,19 +1662,34 @@ function showBenchmarkRow(row, tr, options = {}) {
       <div><span class="muted">τ* (F1)</span><b>${fixed(row.tauF1, 2)}</b></div>
       <div><span class="muted">τ (FAR=0)</span><b>${row.far0 ? fixed(row.far0.threshold, 2) : "—"}</b></div>
       <div><span class="muted">τ (P≥0.98)</span><b>${row.prec98 ? fixed(row.prec98.threshold, 2) : "—"}</b></div>
-      <div><span class="muted">Detected / expected</span><b>${row.facesDetected} / ${row.expectedFaces}</b></div>
+      <div><span class="muted">Mean present sim</span><b>${dash(row.meanPresentSim)}</b></div>
+      <div><span class="muted">Max impostor sim</span><b>${dash(row.maxImpostorSim)}</b></div>
+      <div><span class="muted">Throughput</span><b>${fpsText}</b></div>
+      <div><span class="muted">Total (mean)</span><b>${fixed(row.latency?.total_inference_ms_mean, 0)} ms</b></div>
       <div><span class="muted">Latency p50 / p95</span><b>${fixed(row.latency?.total_inference_ms_p50, 0)} / ${fixed(row.latency?.total_inference_ms_p95, 0)} ms</b></div>
+      <div><span class="muted">Detected / expected</span><b>${row.facesDetected} / ${row.expectedFaces}</b></div>
+      <div><span class="muted">Timing source</span><b>${esc(timingSource)}</b></div>
       ${weightBits ? `<div class="wide"><span class="muted">Weights / provider</span><b class="mono small">${esc(weightBits)}</b></div>` : ""}
     </div>
     ${curveSvg(row.curve)}
     <div class="inspect-section">
-      <span class="field-label">Identification recall by face size</span>
-      <div class="bucket-row">${reading("identification_recall")}</div>
+      <span class="field-label">Faces detected by size (all frames)</span>
+      <div class="bucket-row">${detectedReading}</div>
     </div>
-    <div class="inspect-section">
-      <span class="field-label">Detection recall by face size</span>
-      <div class="bucket-row">${reading("detection_recall")}</div>
-    </div>`;
+    ${hasGt
+      ? `<div class="inspect-section">
+          <span class="field-label">Identification recall by face size</span>
+          <div class="bucket-row">${reading("identification_recall")}</div>
+        </div>
+        <div class="inspect-section">
+          <span class="field-label">Detection recall by face size</span>
+          <div class="bucket-row">${reading("detection_recall")}</div>
+        </div>`
+      : `<div class="inspect-section"><span class="field-label">Recall by face size</span><div class="muted small">No ground-truth boxes in this dataset — add annotated boxes to compute size-stratified recall.</div></div>`}
+    ${framesHtml}`;
+  for (const thumb of $$(".bench-frame-thumb", detail)) {
+    thumb.addEventListener("click", () => openLightbox(frames, Number(thumb.dataset.frameIndex)));
+  }
   if (options.scroll !== false) detail.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
@@ -1518,6 +1742,7 @@ const TABS = ["attendance", "benchmark", "datasets"];
 
 function switchTab(name, options = {}) {
   if (!TABS.includes(name)) name = "attendance";
+  if (state.lightbox) closeLightbox();
   for (const tab of $$("#tabs .tab")) tab.classList.toggle("active", tab.dataset.tab === name);
   for (const panel of $$(".workspace[data-panel]")) panel.hidden = panel.dataset.panel !== name;
   if (name === "datasets") { renderDatasets(); renderPresentPicker(); }
@@ -1540,6 +1765,7 @@ async function resetEverything() {
     state.people = data.state.people;
     state.scan = null;
     closeInspector();
+    closeLightbox();
     state.results = [];
     state.datasets = [];
     state.benchmarks = [];
@@ -1712,10 +1938,83 @@ function wireEvents() {
 
   $("#bench-run-btn").addEventListener("click", runBenchmark);
   $("#bench-history").addEventListener("click", handleBenchHistoryClick);
+
+  // Frame viewer: roster collapse, unknown-label toggle, fullscreen lightbox.
+  $("#roster-toggle").addEventListener("click", () => {
+    const collapsed = $("#results-body").classList.contains("roster-collapsed");
+    setRosterCollapsed(!collapsed);
+    saveViewPrefs({ rosterCollapsed: !collapsed });
+  });
+  $("#label-unknown").addEventListener("change", (event) => {
+    setUnknownLabels(event.target.checked);
+    saveViewPrefs({ labelUnknown: event.target.checked });
+  });
+  $("#frame-fullscreen").addEventListener("click", openScanLightbox);
+  $("#lightbox-close").addEventListener("click", closeLightbox);
+  $("#lightbox-reset").addEventListener("click", lightboxReset);
+  $("#lightbox-prev").addEventListener("click", () => lightboxStep(-1));
+  $("#lightbox-next").addEventListener("click", () => lightboxStep(1));
+
+  const lightboxViewport = $("#lightbox-viewport");
+  lightboxViewport.addEventListener("wheel", (event) => {
+    const lb = state.lightbox;
+    if (!lb) return;
+    event.preventDefault();
+    const rect = lightboxViewport.getBoundingClientRect();
+    const px = event.clientX - rect.left;
+    const py = event.clientY - rect.top;
+    const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const next = clamp(lb.scale * factor, LIGHTBOX_MIN_SCALE, LIGHTBOX_MAX_SCALE);
+    const ratio = next / lb.scale;
+    lb.tx = px - (px - lb.tx) * ratio;
+    lb.ty = py - (py - lb.ty) * ratio;
+    lb.scale = next;
+    applyLightboxTransform();
+  }, { passive: false });
+
+  let lightboxDrag = null;
+  lightboxViewport.addEventListener("pointerdown", (event) => {
+    if (!state.lightbox || event.button !== 0) return;
+    lightboxDrag = { x: event.clientX, y: event.clientY, tx: state.lightbox.tx, ty: state.lightbox.ty };
+    lightboxViewport.classList.add("dragging");
+  });
+  window.addEventListener("pointermove", (event) => {
+    if (!lightboxDrag || !state.lightbox) return;
+    state.lightbox.tx = lightboxDrag.tx + (event.clientX - lightboxDrag.x);
+    state.lightbox.ty = lightboxDrag.ty + (event.clientY - lightboxDrag.y);
+    applyLightboxTransform();
+  });
+  window.addEventListener("pointerup", () => {
+    lightboxDrag = null;
+    lightboxViewport.classList.remove("dragging");
+  });
+  lightboxViewport.addEventListener("dblclick", lightboxReset);
+  window.addEventListener("resize", () => {
+    if (!state.lightbox) return;
+    fitLightboxStage();
+    lightboxReset();
+  });
+  window.addEventListener("keydown", (event) => {
+    const target = event.target;
+    const typing = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+    if (event.key === "Escape") {
+      if (state.lightbox) { closeLightbox(); return; }
+      if (state.inspector) { closeInspector(); return; }
+    }
+    if (typing) return;
+    if (!state.lightbox) {
+      if ((event.key === "f" || event.key === "F") && state.scan?.frames?.length) openScanLightbox();
+      return;
+    }
+    if (event.key === "ArrowLeft") lightboxStep(-1);
+    if (event.key === "ArrowRight") lightboxStep(1);
+    if (event.key === "0") lightboxReset();
+  });
 }
 
 async function init() {
   wireEvents();
+  applyViewPrefs();
   slider("det-thresh", "det-thresh-value", 0.35);
   slider("nms-thresh", "nms-thresh-value", 0.45);
   slider("accept-threshold", "accept-threshold-value", 0.42);

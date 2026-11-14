@@ -335,6 +335,8 @@ class Settings(BaseSettings):
     benchmark_det_sizes: str = "640,1024,1280"
     benchmark_max_rows: int = 32
     benchmark_max_frames: int = 60
+    benchmarks_to_keep: int = 10
+    benchmark_preview_max_width: int = 1600
 
     max_photos_per_upload: int = 8
     max_photos_per_person: int = 12

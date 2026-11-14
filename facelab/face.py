@@ -1104,8 +1104,14 @@ STATUS_COLORS = {
 }
 
 
-def annotate_classroom_photo(image_bgr: np.ndarray, matches: list[dict]) -> np.ndarray:
-    """Draw a box per face: green present, amber review, red unmatched."""
+def annotate_classroom_photo(
+    image_bgr: np.ndarray, matches: list[dict], *, label_unknown: bool = False
+) -> np.ndarray:
+    """Draw a box per face: green present, amber review, red unmatched.
+
+    Unmatched faces get a red box only by default (``label_unknown=False``); turn
+    it on to also burn an "Unknown" tag. Matched faces always carry a name.
+    """
     annotated = image_bgr.copy()
     height, width = annotated.shape[:2]
     diagonal = np.sqrt(height**2 + width**2)
@@ -1130,9 +1136,11 @@ def annotate_classroom_photo(image_bgr: np.ndarray, matches: list[dict]) -> np.n
         elif status == "needs_review":
             label = f"? {match.get('student_name') or ''} ({float(match.get('confidence') or 0):.2f})"
         else:
-            label = f"Unknown ({float(match.get('confidence') or 0):.2f})"
+            label = "Unknown" if label_unknown else None
 
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+        if label is None:
+            continue
         (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
         tag_y1 = max(0, y1 - text_height - 8)
         cv2.rectangle(annotated, (x1, tag_y1), (x1 + text_width + 6, y1), color, -1)

@@ -18,6 +18,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -92,6 +93,8 @@ class BenchmarkRunRequest(BaseModel):
     fusion_mode: str = "k_of_n_voting"
     k: int = 2
     min_quality: float = 0.0
+    force_fresh: bool = False
+    label_unknown: bool = False
 
 
 class SweepRequest(BaseModel):
@@ -643,10 +646,11 @@ def _analyze_or_cache(
     recognizer_id: str,
     det_params: dict,
     flip_aug: bool,
+    force_fresh: bool = False,
 ) -> tuple[dict, bool]:
     image_sha = cache_store.sha256_bytes(data)
     key = cache_store.cache_key(image_sha, detector_id, det_params, recognizer_id, flip_aug)
-    cached = cache_store.load_analysis(key)
+    cached = None if force_fresh else cache_store.load_analysis(key)
     if cached is not None:
         cached["cache_key"] = key
         return cached, True
@@ -980,6 +984,7 @@ def _run_scan_sync(
     with_quality: bool,
     with_pose: bool,
     min_quality: float,
+    label_unknown: bool = False,
 ) -> dict:
     _require_detector(detector_id)
     _require_recognizer(recognizer_id)
@@ -1097,7 +1102,9 @@ def _run_scan_sync(
                 }
                 for face in faces_payload
             ]
-            annotated = engine.annotate_classroom_photo(item["bgr"], matches_for_annotation)
+            annotated = engine.annotate_classroom_photo(
+                item["bgr"], matches_for_annotation, label_unknown=label_unknown
+            )
             annotated_rel = _write_jpeg_rgb(
                 annotated, f"scans/{scan_id}/frame-{order}-annotated.jpg"
             )
@@ -1190,6 +1197,7 @@ def _run_scan_sync(
             "variant": variant,
             "flipAug": flip_aug,
             "lowresAug": lowres_aug,
+            "labelUnknown": label_unknown,
             "detParams": det_params,
             "frames": len(decoded),
             "uploadedFrames": len(raw),
@@ -1313,6 +1321,71 @@ def _resolve_benchmark_config(request: BenchmarkRunRequest) -> dict:
     }
 
 
+def _combo_slug(index: int, detector_id: str, recognizer_id: str, det_size: int, tiling: str) -> str:
+    raw = f"{detector_id}-{recognizer_id}-{det_size}-{tiling}".lower()
+    return f"{index:02d}-" + re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+
+
+def _benchmark_frames(
+    dataset_inputs: list, evaluations: list, snapshot: dict[int, dict]
+) -> list[dict]:
+    output = []
+    for (frames, _present, _boxes), evaluation in zip(dataset_inputs, evaluations):
+        for frame, decisions in zip(frames, evaluation["per_frame"]):
+            faces = [
+                _serialize_face(decision, det, snapshot)
+                for det, decision in zip(frame["detections"], decisions)
+            ]
+            for face in faces:
+                # Source-space landmarks are unused by the benchmark viewer;
+                # dropping them keeps the run JSON compact.
+                face.pop("landmarks5pt", None)
+            output.append(
+                {
+                    "datasetId": frame["dataset_id"],
+                    "frameId": frame["frame_id"],
+                    "width": frame["img_w"],
+                    "height": frame["img_h"],
+                    "imageUrl": f"/media/datasets/{frame['dataset_id']}/{frame['filename']}",
+                    "annotatedUrl": None,
+                    "cached": frame["cached"],
+                    "faces": faces,
+                }
+            )
+    return output
+
+
+def _render_benchmark_preview(
+    image_bgr: np.ndarray, faces: list[dict], relative: str, label_unknown: bool
+) -> str | None:
+    """Burn one annotated preview JPEG for a combo, downscaled to stay legible."""
+    try:
+        height, width = image_bgr.shape[:2]
+        scale = min(1.0, settings.benchmark_preview_max_width / max(1, width))
+        if scale < 1.0:
+            image_bgr = cv2.resize(
+                image_bgr,
+                (max(1, int(width * scale)), max(1, int(height * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        matches = [
+            {
+                "bbox": [value * scale for value in face["box"]],
+                "status": face["status"],
+                "student_name": face["name"],
+                "confidence": face["confidence"],
+                "matched": face["matched"],
+            }
+            for face in faces
+        ]
+        annotated = engine.annotate_classroom_photo(image_bgr, matches, label_unknown=label_unknown)
+        _write_jpeg_rgb(annotated, relative, quality=85)
+        return f"/media/{relative}"
+    except Exception as exc:  # a preview must never fail the run
+        print(f"[facelab] benchmark preview failed: {exc}")
+        return None
+
+
 def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
     if not request.dataset_ids:
         raise HTTPException(status_code=422, detail="Pick at least one dataset")
@@ -1329,11 +1402,14 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
 
     variant = request.variant or _variant_for(request.flip_aug, request.lowres_aug)
     snapshot = _student_snapshot()
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     rows = []
     warmups: dict[tuple, float] = {}
 
     with _model_lock:
-        for detector_id, recognizer_id, det_size, tiling_mode in config["combos"]:
+        for combo_index, (detector_id, recognizer_id, det_size, tiling_mode) in enumerate(
+            config["combos"]
+        ):
             warm_key = (detector_id, recognizer_id, det_size, tiling_mode)
             if warm_key not in warmups:
                 try:
@@ -1354,6 +1430,9 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     )
                     continue
             warmup_ms = warmups.get(warm_key, 0.0)
+            combo_started = time.perf_counter()
+            cached_frames = 0
+            first_bgr = None
 
             gallery = bench.build_gallery(snapshot, recognizer_id, variant)
             det_params = cache_store.analysis_params(
@@ -1386,11 +1465,15 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         image_bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
                         if image_bgr is None:
                             continue
-                        payload, _cached = _analyze_or_cache(
+                        payload, cached = _analyze_or_cache(
                             image_bgr, data,
                             detector_id=detector_id, recognizer_id=recognizer_id,
                             det_params=det_params, flip_aug=request.flip_aug,
+                            force_fresh=request.force_fresh,
                         )
+                        cached_frames += int(cached)
+                        if first_bgr is None:
+                            first_bgr = image_bgr
                         dataset_frames.append(
                             {
                                 "frame_id": frame["frame_id"],
@@ -1398,6 +1481,11 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                                 "height": frame["height"],
                                 "detections": payload["detections"],
                                 "timings": payload["timings_ms"],
+                                "dataset_id": dataset_id,
+                                "filename": frame["filename"],
+                                "img_w": int(image_bgr.shape[1]),
+                                "img_h": int(image_bgr.shape[0]),
+                                "cached": cached,
                             }
                         )
                         timings.append(payload["timings_ms"])
@@ -1445,6 +1533,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 points["best_f1"]["threshold"] if points["best_f1"] else request.review_threshold
             )
             review_used = min(request.review_threshold, chosen_threshold)
+            match_started = time.perf_counter()
             evaluations = [
                 bench.evaluate_frames(
                     frames,
@@ -1464,6 +1553,10 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 )
                 for frames, present_ids, dataset_boxes in dataset_inputs
             ]
+            match_ms = (time.perf_counter() - match_started) * 1000
+            per_frame_match = round(match_ms / max(1, len(timings)), 3)
+            # Copy rather than mutate: cached timing dicts are shared with the cache.
+            timings = [{**item, "match_ms": per_frame_match} for item in timings]
             attendance = bench.aggregate_attendance(evaluations)
             detection = bench.aggregate_detection(
                 [evaluation["detection"] for evaluation in evaluations]
@@ -1471,6 +1564,18 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             faces_detected = sum(
                 evaluation["faces_detected"] for evaluation in evaluations
             )
+
+            frames_meta = _benchmark_frames(dataset_inputs, evaluations, snapshot)
+            if frames_meta and first_bgr is not None:
+                slug = _combo_slug(combo_index, detector_id, recognizer_id, det_size, tiling_mode)
+                frames_meta[0]["annotatedUrl"] = _render_benchmark_preview(
+                    first_bgr, frames_meta[0]["faces"],
+                    f"benchmarks/{run_id}/{slug}.jpg", request.label_unknown,
+                )
+            first_bgr = None
+            latency = bench.latency_percentiles(timings)
+            wall_ms = (time.perf_counter() - combo_started) * 1000
+
             rows.append(
                 {
                     "detector": detector_id,
@@ -1488,20 +1593,32 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     "templateStrategy": request.template_strategy,
                     "fusionMode": request.fusion_mode,
                     "metrics": attendance,
+                    "meanPresentSim": attendance["mean_present_sim"],
+                    "maxImpostorSim": attendance["max_impostor_sim"],
+                    "simMargin": round(
+                        attendance["mean_present_sim"] - attendance["max_impostor_sim"], 4
+                    ),
                     "tauF1": points["best_f1"]["threshold"] if points["best_f1"] else None,
                     "bestF1": points["best_f1"]["f1"] if points["best_f1"] else 0.0,
                     "far0": points["far0"],
                     "prec98": points["prec98"],
                     "detection": detection,
+                    "detectedBuckets": detection["detected_buckets"],
                     "facesDetected": faces_detected,
                     "expectedFaces": expected_faces,
-                    "latency": bench.latency_percentiles(timings),
+                    "latency": latency,
+                    "fps": latency.get("frames_per_sec", 0.0),
+                    "matchMs": round(match_ms, 3),
+                    "wallMs": round(wall_ms, 3),
+                    "cachedFrames": cached_frames,
+                    "frameCount": len(timings),
+                    "annotatedUrl": frames_meta[0]["annotatedUrl"] if frames_meta else None,
+                    "frames": frames_meta,
                     "warmupMs": round(warmup_ms, 3),
                     "curve": curve,
                 }
             )
 
-    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
     run = {
         "runId": run_id,
         "createdAt": _now(),
@@ -1518,6 +1635,8 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
             "lowresAug": request.lowres_aug,
             "withQuality": request.with_quality,
             "withPose": request.with_pose,
+            "forceFresh": request.force_fresh,
+            "labelUnknown": request.label_unknown,
             "providers": settings.provider_list,
         },
         "rows": rows,
@@ -1533,8 +1652,9 @@ def _save_benchmark(run: dict) -> None:
     temp.write_text(json.dumps(run, indent=2), encoding="utf-8")
     temp.replace(path)
     files = sorted(settings.benchmarks_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in files[10:]:
+    for stale in files[settings.benchmarks_to_keep:]:
         stale.unlink(missing_ok=True)
+        shutil.rmtree(settings.benchmarks_dir / stale.stem, ignore_errors=True)
 
 
 def _list_benchmarks() -> list[dict]:
@@ -1709,6 +1829,7 @@ app.mount("/media/faces", StaticFiles(directory=str(settings.faces_dir)), name="
 app.mount("/media/scans", StaticFiles(directory=str(settings.scans_dir)), name="scans")
 app.mount("/media/crops", StaticFiles(directory=str(settings.crops_dir)), name="crops")
 app.mount("/media/datasets", StaticFiles(directory=str(settings.datasets_dir)), name="datasets")
+app.mount("/media/benchmarks", StaticFiles(directory=str(settings.benchmarks_dir)), name="benchmarks")
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
@@ -1877,6 +1998,7 @@ async def scan(
     with_quality: bool = Form(True, alias="withQuality"),
     with_pose: bool = Form(True, alias="withPose"),
     min_quality: float | None = Form(None, alias="minQuality"),
+    label_unknown: bool = Form(False, alias="labelUnknown"),
     _: None = Depends(require_token),
 ) -> dict:
     if not images:
@@ -1921,6 +2043,7 @@ async def scan(
         with_quality=with_quality,
         with_pose=with_pose,
         min_quality=min_quality if min_quality is not None else settings.min_face_quality,
+        label_unknown=label_unknown,
     )
 
 

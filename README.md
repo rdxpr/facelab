@@ -35,6 +35,9 @@ stored per recognizer id           → match → present/review/unknown    → c
   scan live as you drag the sliders, with no re-inference.
 - **Ground-truth datasets.** Build reusable labelled datasets; sweeps never
   re-upload images.
+- **Inspectable benchmark artifacts.** Every combo stores per-frame detection
+  metadata plus one downscaled annotated preview, with similarity margins, size
+  buckets, FPS, and honest stage timings so you can rank accuracy against speed.
 - **Storage modes.** Local development persists everything under `./.data`. Any
   non-`dev` `FACELAB_ENV` switches to ephemeral storage that is wiped on start.
 
@@ -98,7 +101,11 @@ The interface has three tabs.
    show green (present), amber (review), and red (unknown) boxes. Click any box
    for the **Face Inspector**: the aligned crop, size bucket, face height,
    detector score, quality, head pose, and top-3 candidates with scores and
-   margins.
+   margins. **Fullscreen** (or `f`) opens a zoom/pan lightbox — scroll to zoom,
+   drag to pan, `←`/`→` to step frames, `Esc` to close — shared with benchmark
+   frames. **Label unknown faces** toggles name tags on unmatched (red) boxes;
+   they are box-only by default. **Hide roster** widens the frame column. Both
+   view preferences persist in `localStorage`.
 
 Moving any matching slider (accept, review, margin, assignment, fusion, …)
 re-scores the loaded scan from cache instantly — no re-inference.
@@ -109,6 +116,12 @@ Build a labelled dataset from classroom frames: mark the students who are
 actually present, add notes, and save. Datasets are the ground truth benchmarks
 calibrate against and are reused across sweeps.
 
+Attendance F1 / precision / recall use the present roster you tick — no boxes
+needed. Size-stratified detection/identification recall additionally needs
+per-face annotated boxes (with a row bucket); without them those columns show
+`—` and the detail falls back to detected-face counts by size. The threshold
+sweep starts at 0.25 so `τ*` is not pinned to an uncalibrated low-score plateau.
+
 ### Benchmark
 
 Select datasets, a grid of detectors × recognizers × resolutions × tiling modes,
@@ -118,12 +131,26 @@ combination:
 | Column | Meaning |
 | ------ | ------- |
 | `F1` / `Prec` / `Rec` | Attendance precision/recall/F1 at the chosen threshold |
-| `τ*` | Threshold that maximises F1 |
-| `L/M/S recall` | Identification recall for large / medium / small faces |
+| `τ*` | Threshold that maximises F1 (highest point on the F1 plateau) |
+| `Mean Sim` | Mean fused similarity of students predicted present |
+| `Impostor` | Highest similarity on any detection *not* called present |
+| `Faces L/M/S` | Detections by face-size bucket (works without annotations) |
+| `L/M/S recall` | Identification recall by size — needs annotated boxes, else `—` |
+| `FPS` | Throughput from mean per-frame inference time (`*` if cached) |
 | `det p50` / `total p50` | Detection and total inference latency (ms) |
 
 Click a row for the threshold curve (precision/recall/F1 vs τ), the zero-false-
-positive and precision≥0.98 operating points, and per-bucket recall.
+positive and precision≥0.98 operating points, similarity stats, detected faces
+by size, and per-bucket recall. The detail also shows `match`/`wall` timings and
+a strip of every dataset frame; **each combo saves one downscaled annotated JPEG**
+(first frame, ≤ `benchmark_preview_max_width` px) as a thumbnail, and any frame
+opens in the shared lightbox. Per-frame face metadata is stored in the run JSON,
+so the viewer works for every frame without storing every annotated image.
+
+Enable **Force fresh inference** to bypass the analysis cache (honest timings,
+slower); otherwise rows report the timings recorded when the frame was first
+analyzed, and `cachedFrames` badges them. Benchmarks keep the newest
+`benchmarks_to_keep` runs (JSON + preview folder) and prune the rest.
 
 ## How it works
 

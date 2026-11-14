@@ -200,6 +200,89 @@ def test_dataset_id_traversal_rejected():
     assert datasets.load_manifest("../x") is None
 
 
+def _row(threshold, tp, fp, fn):
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {
+        "threshold": threshold, "tp": tp, "fp": fp, "fn": fn,
+        "precision": precision, "recall": recall, "f1": f1,
+    }
+
+
+def test_operating_points_prefer_top_of_plateau():
+    curve = [
+        _row(0.25, 8, 0, 0), _row(0.30, 8, 0, 0), _row(0.45, 8, 0, 0),
+        _row(0.50, 6, 0, 2), _row(0.75, 1, 0, 7),
+    ]
+    points = benchmark.pick_operating_points(curve)
+    assert points["best_f1"]["threshold"] == 0.45
+    assert points["far0"]["threshold"] == 0.45  # not 0.75, where tp collapsed to 1
+    assert points["prec98"]["threshold"] == 0.45
+
+
+def test_operating_points_empty_curve():
+    assert benchmark.pick_operating_points([]) == {
+        "best_f1": None, "far0": None, "prec98": None
+    }
+
+
+def test_curve_default_low_is_025():
+    rows = benchmark.threshold_curve_datasets([], {}, high=0.27)
+    assert rows[0]["threshold"] == 0.25
+
+
+def test_aggregate_attendance_similarity_stats():
+    att = {"tp": 1, "fp": 0, "fn": 0}
+    out = benchmark.aggregate_attendance([
+        {"attendance": att, "present_sim_sum": 1.2, "present_sim_n": 2, "max_impostor_sim": 0.3},
+        {"attendance": att, "present_sim_sum": 0.6, "present_sim_n": 1, "max_impostor_sim": 0.5},
+    ])
+    assert out["tp"] == 2
+    assert out["mean_present_sim"] == 0.6
+    assert out["max_impostor_sim"] == 0.5
+
+
+def test_evaluate_frames_reports_similarity_stats_and_detected_buckets():
+    students = {1: make_student(1, [1.0, 0.0, 0.0])}
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    frames = [frame("frame_01", [det(unit(1.0, 0.0, 0.0))])]
+    result = benchmark.evaluate_frames(
+        frames, gallery, [1], variant="raw", accept_threshold=0.5, review_threshold=0.4, k=1
+    )
+    assert result["mean_present_sim"] > 0.9
+    assert result["max_impostor_sim"] == 0.0
+    # Detection buckets are counted even without annotated ground-truth boxes.
+    assert result["detection"]["detected_buckets"]["large"] == 1
+
+
+def test_annotate_unknown_label_toggle():
+    from facelab import face as engine
+
+    image = np.zeros((200, 200, 3), dtype=np.uint8)
+    matches = [
+        {
+            "bbox": [40, 40, 160, 170],
+            "status": "unmatched",
+            "student_name": "Unknown",
+            "confidence": 0.0,
+            "matched": False,
+        }
+    ]
+    without = engine.annotate_classroom_photo(image, matches)
+    with_labels = engine.annotate_classroom_photo(image, matches, label_unknown=True)
+    assert int(np.count_nonzero(without)) > 0  # the red box is still drawn
+    assert int(np.count_nonzero(with_labels)) > int(np.count_nonzero(without))
+
+
+def test_aggregate_detection_sums_detected_buckets():
+    merged = benchmark.aggregate_detection([
+        {"buckets": {}, "detected_buckets": {"large": 2, "small": 1}},
+        {"buckets": {}, "detected_buckets": {"large": 1, "medium": 4}},
+    ])
+    assert merged["detected_buckets"] == {"large": 3, "medium": 4, "small": 1}
+
+
 def test_aggregate_detection_sums_buckets():
     results = [
         {"has_annotations": True, "buckets": {"large": {"gt": 2, "detected": 2, "identified": 1}}},

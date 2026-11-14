@@ -256,7 +256,7 @@
             <section id="results" class="results" hidden>
               <div id="summary-grid" class="summary-grid"></div>
 
-              <div class="results-body">
+              <div class="results-body" id="results-body">
                 <div class="matches-col">
                   <div class="list-head">
                     <span>Roster</span>
@@ -267,6 +267,11 @@
                 </div>
 
                 <div class="frames-col">
+                  <div class="frame-toolbar">
+                    <button id="roster-toggle" class="btn ghost small" type="button" aria-pressed="false">Hide roster</button>
+                    <label class="toggle"><input id="label-unknown" type="checkbox" /><span>Label unknown faces</span></label>
+                    <button id="frame-fullscreen" class="btn ghost small" type="button" title="Fullscreen zoom/pan viewer (f)">Fullscreen</button>
+                  </div>
                   <div id="frame-tabs" class="frame-tabs"></div>
                   <div id="frame-view" class="frame-view"></div>
                   <div id="frame-meta" class="frame-meta muted"></div>
@@ -289,13 +294,6 @@
           </div>
         </section>
 
-        <aside id="inspector" class="inspector" hidden aria-label="Face inspector">
-          <div class="inspector-head">
-            <h3>Face inspector</h3>
-            <button id="inspector-close" class="icon-btn" type="button" title="Close">×</button>
-          </div>
-          <div id="inspector-body" class="inspector-body"></div>
-        </aside>
       </main>
 
       <!-- ============================= BENCHMARK ============================= -->
@@ -362,6 +360,8 @@
                 <label class="toggle"><input id="bench-lowres" type="checkbox" /><span>Low-res aug</span></label>
                 <label class="toggle"><input id="bench-quality" type="checkbox" checked /><span>Quality</span></label>
                 <label class="toggle"><input id="bench-pose" type="checkbox" /><span>Pose</span></label>
+                <label class="toggle" title="Bypass the analysis cache so latency/FPS are measured, not replayed"><input id="bench-force-fresh" type="checkbox" /><span>Force fresh inference</span></label>
+                <label class="toggle" title="Write “Unknown” on unmatched faces in the saved annotated JPEG"><input id="bench-label-unknown" type="checkbox" /><span>Label unknown</span></label>
               </div>
             </details>
 
@@ -378,7 +378,7 @@
           <div class="pane-head">
             <div class="pane-title">
               <h2 id="bench-matrix-title">Model matrix</h2>
-              <p>Calibrated F1, precision, recall, size-stratified recall, and latency.</p>
+              <p>Calibrated F1, similarity margin, faces by size, and honest latency. Click a row for frames.</p>
             </div>
             <span id="bench-row-count" class="count">0</span>
           </div>
@@ -446,6 +446,28 @@
           </div>
         </section>
       </main>
+    </div>
+
+    <aside id="inspector" class="inspector" hidden aria-label="Face inspector">
+      <div class="inspector-head">
+        <h3>Face inspector</h3>
+        <button id="inspector-close" class="icon-btn" type="button" title="Close">×</button>
+      </div>
+      <div id="inspector-body" class="inspector-body"></div>
+    </aside>
+
+    <div id="frame-lightbox" class="lightbox" hidden role="dialog" aria-modal="true" aria-label="Frame viewer">
+      <div class="lightbox-bar">
+        <span id="lightbox-title" class="lightbox-title mono"></span>
+        <span class="lightbox-hint">scroll zoom · drag pan · double-click reset · ← → frames · Esc close</span>
+        <button id="lightbox-prev" class="btn ghost small" type="button" title="Previous frame">‹</button>
+        <button id="lightbox-next" class="btn ghost small" type="button" title="Next frame">›</button>
+        <button id="lightbox-reset" class="btn ghost small" type="button">Reset view</button>
+        <button id="lightbox-close" class="btn ghost small" type="button" title="Close (Esc)">Close</button>
+      </div>
+      <div id="lightbox-viewport" class="lightbox-viewport">
+        <div id="lightbox-stage" class="lightbox-stage"></div>
+      </div>
     </div>
 
     <div id="toast" class="toast" hidden></div>
