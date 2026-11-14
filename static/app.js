@@ -252,12 +252,29 @@ function fillSelect(select, entries, value, labelFor) {
   select.value = value;
 }
 
+function constrainDetSize() {
+  const select = $("#det-size");
+  if (!select) return;
+  const entry = state.registry.detectors.find((item) => item.id === state.detector);
+  const allowed = entry?.input_sizes;
+  let firstAllowed = null;
+  for (const option of [...select.options]) {
+    const ok = !allowed || allowed.includes(Number(option.value));
+    option.disabled = !ok;
+    if (ok && firstAllowed === null) firstAllowed = option.value;
+  }
+  if (allowed && !allowed.includes(Number(select.value)) && firstAllowed) {
+    select.value = firstAllowed;
+  }
+}
+
 function renderModelPickers() {
   const { detectors, recognizers } = state.registry;
   fillSelect($("#detector-select"), detectors, state.detector, (entry) => entry.label || entry.id);
   fillSelect($("#recognizer-select"), recognizers, state.recognizer, (entry) => entry.label || entry.id);
   const recognizerEntry = recognizers.find((entry) => entry.id === state.recognizer);
   $("#scan-recognizer").textContent = recognizerEntry?.label || state.recognizer;
+  constrainDetSize();
 }
 
 let modelStatusSeq = 0;
@@ -1340,7 +1357,10 @@ function renderBenchOptions() {
   const detectors = state.registry.detectors.filter((entry) => entry.available);
   const recognizers = state.registry.recognizers.filter((entry) => entry.available);
   $("#bench-detectors").innerHTML = detectors.length
-    ? detectors.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.det, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")
+    ? detectors.map((entry) => {
+        const note = entry.input_sizes ? ` · ${entry.input_sizes.join("/")}px only` : "";
+        return `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.det, entry.id, true)}><span>${esc(entry.label)}<span class="muted">${esc(note)}</span></span></label>`;
+      }).join("")
     : `<div class="muted small">No detectors installed.</div>`;
   $("#bench-recognizers").innerHTML = recognizers.length
     ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.rec, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")

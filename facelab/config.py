@@ -102,6 +102,8 @@ KNOWN_DETECTORS: dict[str, dict] = {
         "wider_hard": 79.6,
         "license": "AGPL-3.0",
         "role": "Steep pitch / desk-occlusion robustness",
+        # The exported ONNX has a fixed 640×640 input.
+        "input_sizes": [640],
     },
     "opencv:yunet_2023mar": {
         "id": "opencv:yunet_2023mar",

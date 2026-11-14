@@ -147,6 +147,10 @@ a strip of every dataset frame; **each combo saves one downscaled annotated JPEG
 opens in the shared lightbox. Per-frame face metadata is stored in the run JSON,
 so the viewer works for every frame without storing every annotated image.
 
+Detectors with a fixed ONNX input (YOLOv8-Face is 640 only) declare `input_sizes`
+in the registry; impossible grid cells are skipped, and a per-combo failure
+becomes an error row instead of aborting the whole run.
+
 Enable **Force fresh inference** to bypass the analysis cache (honest timings,
 slower); otherwise rows report the timings recorded when the frame was first
 analyzed, and `cachedFrames` badges them. Benchmarks keep the newest

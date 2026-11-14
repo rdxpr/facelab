@@ -1305,13 +1305,18 @@ def _resolve_benchmark_config(request: BenchmarkRunRequest) -> dict:
         raise HTTPException(status_code=422, detail="No available detectors to benchmark")
     if not recognizers:
         raise HTTPException(status_code=422, detail="No available recognizers to benchmark")
-    combos = [
-        (detector, recognizer, size, tiling)
-        for detector in detectors
-        for recognizer in recognizers
-        for size in det_sizes
-        for tiling in tiling_modes
-    ][: settings.benchmark_max_rows]
+    combos: list[tuple] = []
+    for detector in detectors:
+        # Some detectors have a fixed input size (e.g. YOLOv8-Face is 640 only);
+        # skip impossible grid cells instead of letting them crash the run.
+        allowed_sizes = KNOWN_DETECTORS.get(detector, {}).get("input_sizes")
+        for recognizer in recognizers:
+            for size in det_sizes:
+                if allowed_sizes and int(size) not in allowed_sizes:
+                    continue
+                for tiling in tiling_modes:
+                    combos.append((detector, recognizer, size, tiling))
+    combos = combos[: settings.benchmark_max_rows]
     return {
         "detectors": detectors,
         "recognizers": recognizers,
@@ -1418,14 +1423,14 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         request.det_thresh, request.nms_thresh,
                     )
                     warmups[warm_key] = float(info.get("warmup_ms") or 0.0)
-                except engine.FaceEngineUnavailable as exc:
+                except Exception as exc:
                     rows.append(
                         {
                             "detector": detector_id,
                             "recognizer": recognizer_id,
                             "detSize": det_size,
                             "tilingMode": tiling_mode,
-                            "error": str(exc),
+                            "error": str(exc) or exc.__class__.__name__,
                         }
                     )
                     continue
@@ -1491,14 +1496,15 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         timings.append(payload["timings_ms"])
                     if dataset_frames:
                         dataset_inputs.append((dataset_frames, present_ids, dataset_boxes))
-            except engine.FaceEngineUnavailable as exc:
+            except Exception as exc:
+                # One bad combo must not abort the whole grid.
                 rows.append(
                     {
                         "detector": detector_id,
                         "recognizer": recognizer_id,
                         "detSize": det_size,
                         "tilingMode": tiling_mode,
-                        "error": str(exc),
+                        "error": str(exc) or exc.__class__.__name__,
                     }
                 )
                 continue
@@ -2033,6 +2039,12 @@ async def scan(
     det_size = det_size or settings.face_scan_det_size
     if not 320 <= det_size <= 2048:
         raise HTTPException(status_code=422, detail="Detector size must be 320-2048")
+    allowed_sizes = KNOWN_DETECTORS.get(detector_id, {}).get("input_sizes")
+    if allowed_sizes and det_size not in allowed_sizes:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Detector '{detector_id}' supports detection size(s) {allowed_sizes}",
+        )
     accept = accept_threshold if accept_threshold is not None else (
         threshold if threshold is not None else settings.accept_threshold
     )
