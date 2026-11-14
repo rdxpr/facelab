@@ -70,6 +70,17 @@ KNOWN_DETECTORS: dict[str, dict] = {
         "license": "Non-Commercial",
         "role": "High-recall ablation; drop scrfd_34g.onnx in models/ (needs a landmark predictor)",
     },
+    "insightface:scrfd_10g_wo": {
+        "id": "insightface:scrfd_10g_wo",
+        "label": "SCRFD-10G-WO (Raccoon-L)",
+        "library": "insightface",
+        "kind": "detector",
+        "pack": "raccoon_l",
+        "file_candidates": ["det_10g_wo.onnx"],
+        "landmarks_5pt": True,
+        "license": "Non-Commercial",
+        "role": "Raccoon-L detector from the InsightFace 2.x pack",
+    },
     "uniface:retinaface_r50": {
         "id": "uniface:retinaface_r50",
         "label": "RetinaFace R50",
@@ -143,17 +154,6 @@ KNOWN_RECOGNIZERS: dict[str, dict] = {
         "embedding_dim": 512,
         "role": "Speed-floor benchmark",
     },
-    "insightface:raccoon_l": {
-        "id": "insightface:raccoon_l",
-        "label": "Raccoon-L",
-        "library": "insightface",
-        "kind": "recognizer",
-        "pack": "raccoon_l",
-        "file_candidates": ["raccoon_l.onnx"],
-        "license": "Non-Commercial",
-        "embedding_dim": 512,
-        "role": "Latest InsightFace 2.x benchmark pack",
-    },
     "uniface:adaface_ir101": {
         "id": "uniface:adaface_ir101",
         "label": "AdaFace IR-101 / WebFace12M",
@@ -224,7 +224,7 @@ KNOWN_PACKS: dict[str, dict] = {
         "license": "Non-Commercial",
     },
     "raccoon_l": {
-        "required": ["raccoon_l.onnx"],
+        "required": ["det_10g_wo.onnx", "w600k_r50.onnx"],
         "license": "Non-Commercial",
     },
 }

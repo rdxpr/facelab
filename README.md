@@ -19,9 +19,8 @@ stored per recognizer id           → match → present/review/unknown    → c
 ## Highlights
 
 - **Detectors and recognizers are independent.** Pick any detector (SCRFD,
-  RetinaFace, YOLOv8-Face, YuNet) with any recognizer (ArcFace R50/R100,
-  MobileFaceNet, AdaFace, EdgeFace, SphereFace, Raccoon-L). No more "one pack per
-  run".
+  Raccoon-L, RetinaFace, YOLOv8-Face, YuNet) with any recognizer (ArcFace R50/R100,
+  MobileFaceNet, AdaFace, EdgeFace, SphereFace). No more "one pack per run".
 - **SAHI for back rows.** Optional slicing-aided hyper-inference tiles the upper
   band or the whole frame so small back-row faces survive detection.
 - **Calibrated thresholds.** Similarity scores are not comparable across
