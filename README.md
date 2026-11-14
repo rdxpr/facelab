@@ -68,19 +68,19 @@ uv sync                       # or: python -m venv .venv && .venv/bin/pip instal
 > populate the whole benchmark matrix — it is a large download (hundreds of MB).
 > `--list` shows what is available.
 
-### Optional: UniFace models
+### UniFace models
 
-`uniface` unlocks the AdaFace / EdgeFace / SphereFace recognizers plus the
-eDifFIQA quality and 6D head-pose predictors. Everything else works without it.
+`uniface` is installed as a core runtime dependency and provides the AdaFace /
+EdgeFace / SphereFace recognizers plus the eDifFIQA quality and 6D head-pose
+predictors. The package alone is not enough: each model is only selectable once
+its weights are downloaded.
 
 ```bash
-uv pip install --python .venv/bin/python "uniface[cpu]"   # or [gpu] on CUDA
 .venv/bin/python scripts/fetch_models.py --uniface all
 ```
 
-Without `uniface` (or before its weights are downloaded), the registry marks
-those models unavailable and the quality score falls back to the pre-L2
-embedding norm.
+Before its weights are downloaded, the registry marks those models unavailable
+and the quality score falls back to the pre-L2 embedding norm.
 
 ## Helper: batch face crops
 

@@ -12,17 +12,22 @@ dependencies = [
     "numpy==1.26.4",
     "scipy==1.17.1",
     "pillow==13.0.0",
-    "onnxruntime==1.31.1",
+    "onnxruntime-gpu==1.31.1",
     "insightface==2.1",
+    # UniFace provides the AdaFace / EdgeFace / SphereFace recognizers and the
+    # eDifFIQA quality / 6D head-pose predictors. It is part of the runtime here.
+    "uniface[gpu]>=4.3.0",
 ]
 
 [project.optional-dependencies]
-# UniFace unlocks AdaFace / EdgeFace / SphereFace recognizers plus the eDifFIQA
-# quality and 6D head-pose predictors. Everything else works without it.
-uniface = ["uniface[cpu]>=4.3.0"]
 dev = ["pytest==8.3.4"]
 
 [tool.uv]
 # FaceLab is an application, not a library: sync dependencies only, don't try to
 # build and install the project itself.
 package = false
+
+# InsightFace declares a hard dependency on the CPU `onnxruntime` distribution.
+# The GPU distribution provides the same `onnxruntime` module, so keep the CPU
+# wheel out of the environment when using `onnxruntime-gpu`.
+override-dependencies = ["onnxruntime; python_version < '0'"]

@@ -10,12 +10,13 @@ pydantic-settings==2.16.2
 numpy==1.26.4
 scipy==1.17.1
 pillow==13.0.0
-onnxruntime==1.31.1
+onnxruntime-gpu==1.31.1
 insightface==2.1
 
-# Optional: UniFace recognizers (AdaFace, EdgeFace, SphereFace) and the eDifFIQA
-# quality / 6D head-pose predictors. Swap `cpu` for `gpu` on a CUDA host.
-uniface[cpu]>=4.3.0
+# UniFace recognizers (AdaFace, EdgeFace, SphereFace) and the eDifFIQA quality /
+# 6D head-pose predictors. GPU runtime: falls back to CPU automatically when
+# CUDA is unavailable.
+uniface[gpu]>=4.3.0
 
 # Tests.
 pytest==8.3.4
