@@ -1844,6 +1844,13 @@ table.matrix tr.error-row td {
   letter-spacing: -0.01em;
 }
 
+.bench-detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+  align-items: center;
+}
+
 .inspect-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));

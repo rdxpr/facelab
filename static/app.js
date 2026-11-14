@@ -1609,6 +1609,113 @@ function curveSvg(curve) {
     <div class="curve-legend"><span class="curve-key precision"></span>precision <span class="curve-key recall"></span>recall <span class="curve-key f1"></span>F1</div>`;
 }
 
+function benchmarkRecipe(row) {
+  const cfg = state.benchmarkRun?.config || {};
+  // Runs saved before the recipe field existed only have row-level fields; fill
+  // the shared request params from the run config.
+  const base = row.recipe || {
+    detector: row.detector,
+    recognizer: row.recognizer,
+    detSize: row.detSize,
+    tilingMode: row.tilingMode,
+    detThresh: cfg.detThresh,
+    nmsThresh: cfg.nmsThresh,
+    acceptThreshold: row.acceptThreshold,
+    reviewThreshold: row.reviewThreshold,
+    minMargin: row.minMargin,
+    assignmentMode: row.assignmentMode,
+    templateStrategy: row.templateStrategy,
+    fusionMode: row.fusionMode,
+    flipAug: cfg.flipAug,
+    lowresAug: cfg.lowresAug,
+    withQuality: cfg.withQuality,
+    withPose: cfg.withPose,
+    variant: row.variant,
+  };
+  return {
+    ...base,
+    benchmark: {
+      runId: state.benchmarkRun?.runId || null,
+      datasetIds: state.benchmarkRun?.config?.datasetIds || [],
+      metrics: row.metrics || null,
+      tauF1: row.tauF1 ?? null,
+      far0: row.far0 ? { threshold: row.far0.threshold, precision: row.far0.precision, recall: row.far0.recall } : null,
+      prec98: row.prec98 ? { threshold: row.prec98.threshold, precision: row.prec98.precision, recall: row.prec98.recall } : null,
+      meanPresentSim: row.meanPresentSim ?? null,
+      maxImpostorSim: row.maxImpostorSim ?? null,
+      fps: row.fps ?? null,
+    },
+    exportedAt: new Date().toISOString(),
+  };
+}
+
+function applyRecipeToScan(row) {
+  const recipe = row.recipe || benchmarkRecipe(row);
+  state.detector = recipe.detector;
+  state.recognizer = recipe.recognizer;
+  remember();
+  renderModelPickers();
+  setSelectValue("det-size", recipe.detSize, `${recipe.detSize} px`);
+  setSelectValue("tiling-mode", recipe.tilingMode);
+  const setRange = (id, value) => {
+    const element = $(`#${id}`);
+    if (!element || value === undefined || value === null) return;
+    element.value = String(value);
+    element.dispatchEvent(new Event("input"));
+  };
+  setRange("det-thresh", recipe.detThresh);
+  setRange("nms-thresh", recipe.nmsThresh);
+  setRange("accept-threshold", recipe.acceptThreshold);
+  setRange("review-threshold", recipe.reviewThreshold);
+  setRange("min-margin", recipe.minMargin);
+  setRange("min-quality", recipe.minQuality);
+  setSelectValue("assignment-mode", recipe.assignmentMode);
+  setSelectValue("template-strategy", recipe.templateStrategy);
+  setSelectValue("fusion-mode", recipe.fusionMode);
+  const fusionK = $("#fusion-k");
+  if (fusionK && recipe.fusionK != null) fusionK.value = String(recipe.fusionK);
+  const setToggle = (id, on) => {
+    const element = $(`#${id}`);
+    if (element && on !== undefined && on !== null) element.checked = Boolean(on);
+  };
+  setToggle("flip-aug", recipe.flipAug);
+  setToggle("lowres-aug", recipe.lowresAug);
+  setToggle("with-quality", recipe.withQuality);
+  setToggle("with-pose", recipe.withPose);
+  refreshModelStatus();
+  switchTab("attendance");
+  toast(
+    `Applied ${recipe.detector.split(":").pop()} + ${recipe.recognizer.split(":").pop()} to the scan panel`,
+    "ok",
+  );
+}
+
+async function copyRecipe(row) {
+  const text = JSON.stringify(benchmarkRecipe(row), null, 2);
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Benchmark settings copied to clipboard", "ok");
+  } catch {
+    window.prompt("Copy the benchmark settings:", text);
+  }
+}
+
+function downloadRecipe(row) {
+  const recipe = benchmarkRecipe(row);
+  const name = `${recipe.detector.split(":").pop()}-${recipe.recognizer.split(":").pop()}-${recipe.detSize}`
+    .replace(/[^a-z0-9._-]+/gi, "-");
+  const blob = new Blob([JSON.stringify(recipe, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${name}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+  toast(`Downloaded ${name}.json`, "ok");
+}
+
 function showBenchmarkRow(row, tr, options = {}) {
   if (!row) return;
   state.benchSelected = comboKey(row);
@@ -1656,6 +1763,11 @@ function showBenchmarkRow(row, tr, options = {}) {
     <div class="bench-detail-head">
       <strong>${esc(row.detector)}</strong> + <strong>${esc(row.recognizer)}</strong>
       <span class="muted">${row.detSize}px · ${esc(row.tilingMode)} · ${esc(row.variant)} · ${esc(row.assignmentMode)}</span>
+      <div class="bench-detail-actions">
+        <button class="btn ghost small" type="button" data-action="apply-scan">Apply to scan</button>
+        <button class="btn ghost small" type="button" data-action="copy-recipe">Copy settings</button>
+        <button class="btn ghost small" type="button" data-action="download-recipe">Download JSON</button>
+      </div>
     </div>
     <div class="inspect-grid">
       <div><span class="muted">Best F1</span><b>${fixed(row.bestF1)}</b></div>
@@ -1687,6 +1799,13 @@ function showBenchmarkRow(row, tr, options = {}) {
         </div>`
       : `<div class="inspect-section"><span class="field-label">Recall by face size</span><div class="muted small">No ground-truth boxes in this dataset — add annotated boxes to compute size-stratified recall.</div></div>`}
     ${framesHtml}`;
+  for (const button of $$("[data-action]", detail)) {
+    button.addEventListener("click", () => {
+      if (button.dataset.action === "apply-scan") applyRecipeToScan(row);
+      else if (button.dataset.action === "copy-recipe") copyRecipe(row);
+      else if (button.dataset.action === "download-recipe") downloadRecipe(row);
+    });
+  }
   for (const thumb of $$(".bench-frame-thumb", detail)) {
     thumb.addEventListener("click", () => openLightbox(frames, Number(thumb.dataset.frameIndex)));
   }

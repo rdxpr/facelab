@@ -152,6 +152,13 @@ slower); otherwise rows report the timings recorded when the frame was first
 analyzed, and `cachedFrames` badges them. Benchmarks keep the newest
 `benchmarks_to_keep` runs (JSON + preview folder) and prune the rest.
 
+Every row carries a self-contained `recipe` (detector, recognizer, resolution,
+thresholds, fusion/assignment/template settings, augmentations). In the detail
+panel use **Apply to scan** to copy that recipe into the Attendance controls,
+**Copy settings** to put the JSON on the clipboard, or **Download JSON** to save
+it for another app. The same data is in `.data/benchmarks/<runId>.json` under
+`rows[].recipe`.
+
 ## How it works
 
 1. **Detect** — the chosen detector runs on the frame (optionally across SAHI
