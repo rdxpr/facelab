@@ -235,6 +235,21 @@ class Detection:
         return float(self.bbox[3] - self.bbox[1])
 
 
+def select_dominant_face(detections: list[Detection]) -> Detection:
+    """Return the most prominent detection: largest bbox, ties on score.
+
+    Used by enrolment so a portrait with a stray background face still resolves
+    to the subject instead of failing the upload.
+    """
+    return max(
+        detections,
+        key=lambda det: (
+            float((det.bbox[2] - det.bbox[0]) * (det.bbox[3] - det.bbox[1])),
+            float(det.score),
+        ),
+    )
+
+
 class BaseDetector:
     id: str = ""
     label: str = ""
@@ -766,7 +781,8 @@ def embed_reference(
     not another full detection pass).
 
     Returns a cache-shaped record with an ``embeddings`` mapping keyed by
-    recognizer id. Raises :class:`ValueError` unless exactly one face is found.
+    recognizer id. Raises :class:`ValueError` when no face is found; when the
+    photo also contains background faces, the dominant (largest) one is used.
     """
     detector_id = detector_id or settings.default_detector
     det_size = det_size or settings.face_det_size
@@ -778,19 +794,15 @@ def embed_reference(
     detections = detect_with_sahi(
         image_bgr, lambda img: detector.detect(img), tiling_mode="none"
     )
-    aligned = [
-        (det, align_face(image_bgr, det.kps.astype(np.float32), 112))
-        for det in detections
-        if det.kps is not None
-    ]
-    if not aligned:
+    candidates = [det for det in detections if det.kps is not None]
+    if not candidates:
         raise ValueError("No face detected. Ask the student to face the camera in good light.")
-    if len(aligned) > 1:
-        raise ValueError(
-            f"Multiple faces ({len(aligned)}) detected. Use exactly one student per photo."
-        )
 
-    det, crop = aligned[0]
+    # Reference photos are usually portraits, but casual shots often include
+    # background faces. Enrol the dominant (largest) face rather than rejecting
+    # the upload; break ties on detector score.
+    det = select_dominant_face(candidates)
+    crop = align_face(image_bgr, det.kps.astype(np.float32), 112)
     bbox = det.bbox.astype(np.float32)
     height_px = float(bbox[3] - bbox[1])
 

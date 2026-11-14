@@ -88,7 +88,9 @@ The interface has three tabs.
 1. **Students** — add a name and one or more single-face photos. Every photo is
    detected once and embedded with *every* available recognizer, so switching
    backbones never requires re-enrolling; **Re-embed all** backfills students
-   enrolled before a new model was added.
+   enrolled before a new model was added. Photos are portraits, so if a shot
+   also contains background faces the largest (dominant) one is enrolled
+   automatically; crop to the subject when a different face is intended.
 2. **Classroom scan** — choose a detector, a recognizer, a detection resolution,
    and optional SAHI tiling. Tune the detection threshold, NMS IoU, accept and
    review thresholds, the top1–top2 margin gate, and the assignment strategy.
@@ -129,7 +131,9 @@ positive and precision≥0.98 operating points, and per-bucket recall.
    tiles), merged with NMS.
 2. **Align + embed** — 5-point landmarks drive a 112×112 aligned crop; the
    recognizer returns a raw vector, plus optional flip-averaged and low-res-
-   augmented variants.
+   augmented variants. Enrolment picks the dominant face per photo (largest
+   bounding box, ties broken on detector score) so a stray background face does
+   not block the upload.
 3. **Match** — `facelab/matching.py` builds a face×student similarity matrix from
    per-student templates and turns it into `present` / `needs_review` /
    `unmatched` decisions with an optional margin gate and Hungarian/greedy

@@ -300,6 +300,20 @@ def test_max_gate_reports_needs_review():
     assert fused["students"]["s"]["status"] == "needs_review"
 
 
+def test_select_dominant_face_prefers_largest_then_score():
+    from facelab import face as face_module
+
+    make = face_module.Detection
+    subject = make(bbox=np.array([0, 0, 100, 100], dtype=np.float32), score=0.5)
+    background = make(bbox=np.array([0, 0, 30, 30], dtype=np.float32), score=0.99)
+    # A small, high-confidence background face must not beat the subject.
+    assert face_module.select_dominant_face([background, subject]) is subject
+
+    # Equal areas fall back to the higher detector score.
+    twin = make(bbox=np.array([10, 10, 110, 110], dtype=np.float32), score=0.9)
+    assert face_module.select_dominant_face([subject, twin]) is twin
+
+
 def test_annotate_classroom_photo_draws_bbox_only_matches():
     from facelab import face as face_module
 
