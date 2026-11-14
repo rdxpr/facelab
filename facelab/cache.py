@@ -122,7 +122,12 @@ def load_analysis(key: str) -> dict | None:
     if not path.is_file():
         return None
     try:
-        return _decode(json.loads(path.read_text(encoding="utf-8")))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        try:
+            path.touch(exist_ok=True)
+        except OSError:
+            pass
+        return _decode(data)
     except Exception:
         return None
 

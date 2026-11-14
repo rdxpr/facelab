@@ -683,6 +683,8 @@ async function liveSweep() {
         : { ...row, status: "absent", confidence: 0, framesHit: 0 };
     });
     scan.summary.matchedCount = data.matchedCount;
+    if (typeof data.needsReview === "number") scan.summary.needsReview = data.needsReview;
+    if (typeof data.unknown === "number") scan.summary.unknown = data.unknown;
     scan.summary.templateStrategy = payload.template_strategy;
     scan.summary.acceptThreshold = payload.accept_threshold;
     scan.summary.reviewThreshold = payload.review_threshold;

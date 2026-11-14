@@ -1964,16 +1964,8 @@ def sweep_result(
             raise HTTPException(status_code=422, detail=f"{label} must be between 0 and 1")
     result = json.loads(path.read_text(encoding="utf-8"))
     summary = result.get("summary", {})
-    detector_id = payload.detector or result.get("detectorId") or settings.default_detector
     recognizer_id = payload.recognizer or result.get("recognizerId") or settings.default_recognizer
     _require_recognizer(recognizer_id)
-    det_params = summary.get("detParams") or cache_store.analysis_params(
-        det_size=summary.get("detSize") or settings.face_scan_det_size,
-        det_thresh=summary.get("detThresh", 0.35),
-        nms_thresh=summary.get("nmsThresh", 0.45),
-        tiling_mode=summary.get("tilingMode", "none"),
-        lowres_aug=summary.get("lowresAug", False),
-    )
     variant = payload.variant or summary.get("variant") or _variant_for(
         summary.get("flipAug", True), summary.get("lowresAug", False)
     )
@@ -2029,8 +2021,10 @@ def sweep_result(
         "students": {str(k): v for k, v in fused["students"].items()},
         "faces": faces,
         "matchedCount": sum(1 for record in fused["students"].values() if record["status"] == "present"),
-        "unknown": sum(
-            1 for frame in faces for face in frame if face["status"] == "unmatched"
+        "needsReview": sum(1 for record in fused["students"].values() if record["status"] == "needs_review"),
+        "unknown": max(
+            (sum(1 for face in frame if face["status"] == "unmatched") for frame in faces),
+            default=0,
         ),
         "params": payload.model_dump(),
     }
