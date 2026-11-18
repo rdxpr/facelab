@@ -143,20 +143,41 @@ def assign_single_frame(
         matrix = matrix[None, :]
     num_faces, num_students = matrix.shape
     results: list[dict] = []
-    if num_faces == 0 or num_students == 0:
+    if num_faces == 0:
         return results
+    if num_students == 0:
+        # A scan without an enrolled gallery still has to surface every face;
+        # returning no decisions made the caller drop real detections entirely.
+        return [
+            {
+                "det_index": index,
+                "matched_student_id": None,
+                "status": "unmatched",
+                "score": 0.0,
+                "margin": 0.0,
+                "top_candidates": [],
+            }
+            for index in range(num_faces)
+        ]
 
     top_k_indices = np.argsort(-matrix, axis=1)[:, : min(3, num_students)]
 
+    # Rank *accepted* pairs above review-band pairs before similarity. Plain
+    # sum-of-similarity can trade one present match for two review matches
+    # (e.g. 0.75/0.70 vs 0.75/0.40), which silently loses attendance.
+    accepted = matrix >= accept_threshold
+    weights = np.where(matrix >= review_threshold, matrix, -1.0) + np.where(
+        accepted, 2.0, 0.0
+    )
+
     assigned_map: dict[int, int] = {}
     if assignment_mode == "hungarian":
-        masked = np.where(matrix >= review_threshold, matrix, -1.0)
-        row_ind, col_ind = linear_sum_assignment(-masked)
+        row_ind, col_ind = linear_sum_assignment(-weights)
         for row, col in zip(row_ind, col_ind):
-            if masked[row, col] >= review_threshold:
+            if matrix[row, col] >= review_threshold:
                 assigned_map[int(row)] = int(col)
     elif assignment_mode == "greedy":
-        order = np.dstack(np.unravel_index(np.argsort(-matrix.ravel()), matrix.shape))[0]
+        order = np.dstack(np.unravel_index(np.argsort(-weights.ravel()), matrix.shape))[0]
         used: set[int] = set()
         for row, col in order:
             row_i, col_i = int(row), int(col)
@@ -301,7 +322,11 @@ def fuse_multi_frame(
                 sid = decision["matched_student_id"]
                 if sid is None or sid not in student_status:
                     continue
-                if float(detections[det_index].get("quality") or 0.0) < min_quality:
+                # ``None`` means quality was not measured (no quality model).
+                # Treat it as unknown rather than as 0.0, which used to reject
+                # every valid face as soon as min_quality was non-zero.
+                quality = detections[det_index].get("quality")
+                if quality is not None and float(quality) < min_quality:
                     continue
                 score = float(decision["score"])
                 if score >= review_threshold:
@@ -326,8 +351,8 @@ def fuse_multi_frame(
                 sid = decision["matched_student_id"]
                 if sid is None or sid not in student_status:
                     continue
-                quality = float(detections[det_index].get("quality") or 0.0)
-                if quality < min_quality:
+                quality = detections[det_index].get("quality")
+                if quality is not None and float(quality) < min_quality:
                     continue
                 if decision["status"] != "present" or decision["margin"] < min_margin:
                     review_sids.add(sid)
@@ -336,7 +361,7 @@ def fuse_multi_frame(
                 record = student_status[sid]
                 if score > record["score"]:
                     record["score"] = round(score, 4)
-                    record["quality"] = round(quality, 4)
+                    record["quality"] = round(float(quality or 0.0), 4)
                 record["frames_hit"] += 1
         for sid, record in student_status.items():
             if record["score"] >= accept_threshold:

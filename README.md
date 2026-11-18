@@ -196,12 +196,15 @@ it for another app. The same data is in `.data/benchmarks/<runId>.json` under
 ## How it works
 
 1. **Detect** — the chosen detector runs on the frame (optionally across SAHI
-   tiles), merged with NMS.
-2. **Align + embed** — 5-point landmarks drive a 112×112 aligned crop; the
-   recognizer returns a raw vector, plus optional flip-averaged and low-res-
-   augmented variants. Enrolment picks the dominant face per photo (largest
-   bounding box, ties broken on detector score) so a stray background face does
-   not block the upload.
+   tiles), merged with NMS. SCRFD adds a cheap 128 px recovery pass for
+   close-ups, and tile-clipped fragments never outrank a complete detection.
+2. **Align + embed** — 5-point landmarks drive a 112×112 aligned crop
+   (anti-aliased when a large face is reduced several times); the recognizer
+   returns a raw vector, plus an optional flip-averaged variant. The low-res-
+   augmented variant is an enrolment/gallery template only: classroom probes
+   are always embedded from the clean crop. Enrolment picks the dominant face
+   per photo (largest bounding box, ties broken on detector score) so a stray
+   background face does not block the upload.
 3. **Match** — `facelab/matching.py` builds a face×student similarity matrix from
    per-student templates and turns it into `present` / `needs_review` /
    `unmatched` decisions with an optional margin gate and Hungarian/greedy

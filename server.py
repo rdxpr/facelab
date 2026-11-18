@@ -149,6 +149,11 @@ def _variant_for(flip_aug: bool, lowres_aug: bool) -> str:
     return "flip_avg" if flip_aug else "raw"
 
 
+#: Bumped whenever a stored *derived* embedding changes definition. v2 stores a
+#: flip-averaged degraded template instead of a clean/degraded blend.
+LOWRES_TEMPLATE_VERSION = 2
+
+
 # --------------------------------------------------------------------------- #
 # Persisted roster
 # --------------------------------------------------------------------------- #
@@ -158,6 +163,8 @@ def _encode_embedding(entry: dict) -> dict:
         vector = entry.get(name)
         if vector is not None:
             encoded[name] = np.asarray(vector, dtype=np.float32).tolist()
+    if encoded.get("lowres_aug") is not None:
+        encoded["lowres_aug_version"] = LOWRES_TEMPLATE_VERSION
     encoded["norm_magnitude"] = float(entry.get("norm_magnitude") or 0.0)
     return encoded
 
@@ -168,6 +175,13 @@ def _decode_embedding(entry: dict) -> dict:
         vector = entry.get(name)
         if vector is not None:
             decoded[name] = np.asarray(vector, dtype=np.float32)
+    # Old templates mixed the clean and degraded embeddings, which is a
+    # different quantity from the current degraded template. Drop them so the
+    # variant falls back to ``raw`` until re-embedding regenerates it.
+    if decoded.get("lowres_aug") is not None and int(
+        entry.get("lowres_aug_version") or 1
+    ) < LOWRES_TEMPLATE_VERSION:
+        decoded["lowres_aug"] = None
     decoded["norm_magnitude"] = float(entry.get("norm_magnitude") or 0.0)
     return decoded
 
@@ -665,6 +679,9 @@ def _analyze_or_cache(
         tiling_mode=det_params.get("tiling_mode", "none"),
         tile_size=int(det_params.get("tile_size", 640)),
         tile_overlap=float(det_params.get("tile_overlap", 0.25)),
+        # Tile-merge NMS used to stay at 0.45 regardless of the requested
+        # nms_thresh, so tuning it had no effect with tiling enabled.
+        nms_iou=float(det_params.get("nms_thresh", 0.45)),
         flip_aug=flip_aug,
         lowres_aug=bool(det_params.get("lowres_aug", False)),
         with_quality=bool(det_params.get("with_quality", True)),
@@ -727,7 +744,10 @@ def _embed_reference(
     return {
         "id": uuid.uuid4().hex[:10],
         "sha256": cache_store.sha256_bytes(data),
-        "quality_score": float(result.get("quality_score") or 0.0),
+        "quality_score": (
+            None if result.get("quality_score") is None else float(result["quality_score"])
+        ),
+        "quality_source": result.get("quality_source", "unavailable"),
         "quality_note": (
             "Face is small in the frame; move closer for a stronger embedding."
             if float(result.get("face_height_px") or 0.0) < 50
@@ -849,30 +869,46 @@ def _reembed_sync(recognizer_ids: list[str]) -> dict:
                 missing = [
                     rid for rid in targets if existing.get(rid, {}).get("raw") is None
                 ]
+                # v2 low-res templates (see LOWRES_TEMPLATE_VERSION) are a
+                # different quantity from the old clean/degraded blends. Refresh
+                # only the derived template; keep the enrolled raw/flip vectors
+                # that calibrated thresholds were measured against.
+                stale_templates = [
+                    rid
+                    for rid in targets
+                    if rid not in missing
+                    and existing.get(rid, {}).get("lowres_aug") is None
+                ]
                 for recognizer_id in targets:
-                    if recognizer_id not in missing:
+                    if recognizer_id not in missing and recognizer_id not in stale_templates:
                         results[recognizer_id]["skipped"] += 1
-                if not missing:
+                requested = missing + stale_templates
+                if not requested:
                     continue
                 path = settings.data_dir / (photo.get("filename") or "")
                 image_bgr = cv2.imread(str(path)) if path.is_file() else None
                 if image_bgr is None:
-                    for recognizer_id in missing:
+                    for recognizer_id in requested:
                         results[recognizer_id]["skipped"] += 1
                     errors.append(f"missing reference image for photo {photo['id']}")
                     continue
                 try:
                     record = _embed_reference(
-                        image_bgr, path.read_bytes(), missing, detector_id
+                        image_bgr, path.read_bytes(), requested, detector_id
                     )
                 except HTTPException as exc:
-                    for recognizer_id in missing:
+                    for recognizer_id in requested:
                         results[recognizer_id]["skipped"] += 1
                     errors.append(f"{photo['id']}: {exc.detail}")
                     continue
                 entry = photo.setdefault("embeddings", {})
                 for recognizer_id in missing:
                     entry[recognizer_id] = record["embeddings"][recognizer_id]
+                    results[recognizer_id]["updated"] += 1
+                for recognizer_id in stale_templates:
+                    entry.setdefault(recognizer_id, {})["lowres_aug"] = (
+                        record["embeddings"][recognizer_id]["lowres_aug"]
+                    )
                     results[recognizer_id]["updated"] += 1
                 if not photo.get("quality_score"):
                     photo["quality_score"] = record["quality_score"]
@@ -920,6 +956,28 @@ def _scan_det_params(
         with_quality=with_quality,
         with_pose=with_pose,
     )
+
+
+def _pad_decisions(detections: list[dict], decisions: list[dict]) -> list[dict]:
+    """Return exactly one decision per detection.
+
+    Matching has no decision for a face it could not evaluate (for example an
+    empty gallery). Zipping the shorter list used to drop those faces from the
+    scan/benchmark payload even though the detector found them.
+    """
+    padded = list(decisions[: len(detections)])
+    for index in range(len(padded), len(detections)):
+        padded.append(
+            {
+                "det_index": index,
+                "matched_student_id": None,
+                "status": "unmatched",
+                "score": 0.0,
+                "margin": 0.0,
+                "top_candidates": [],
+            }
+        )
+    return padded
 
 
 def _serialize_candidates(candidates: list[dict], snapshot: dict[int, dict]) -> list[dict]:
@@ -1086,7 +1144,10 @@ def _run_scan_sync(
         annotate_started = time.perf_counter()
         frames_payload = []
         for order, item in enumerate(decoded):
-            decisions = fused["per_frame"][order]
+            decisions = _pad_decisions(
+                item["detections"],
+                fused["per_frame"][order] if order < len(fused["per_frame"]) else [],
+            )
             faces_payload = [
                 _serialize_face(decision, item["detections"][det_index], snapshot)
                 for det_index, decision in enumerate(decisions)
@@ -1337,6 +1398,7 @@ def _benchmark_frames(
     output = []
     for (frames, _present, _boxes), evaluation in zip(dataset_inputs, evaluations):
         for frame, decisions in zip(frames, evaluation["per_frame"]):
+            decisions = _pad_decisions(frame["detections"], decisions)
             faces = [
                 _serialize_face(decision, det, snapshot)
                 for det, decision in zip(frame["detections"], decisions)
@@ -1777,7 +1839,10 @@ def _sweep_dataset(
                 "faces": [
                     [
                         _serialize_face(decision, det, snapshot)
-                        for det, decision in zip(frame["detections"], decisions)
+                        for det, decision in zip(
+                            frame["detections"],
+                            _pad_decisions(frame["detections"], decisions),
+                        )
                     ]
                     for frame, decisions in zip(frames, evaluation["per_frame"])
                 ],
@@ -2170,7 +2235,10 @@ def sweep_result(
     faces = [
         [
             _serialize_face(decision, det, snapshot)
-            for det, decision in zip(frame["detections"], decisions)
+            for det, decision in zip(
+                frame["detections"],
+                _pad_decisions(frame["detections"], decisions),
+            )
         ]
         for frame, decisions in zip(frames, fused["per_frame"])
     ]

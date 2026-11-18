@@ -235,6 +235,54 @@ class Detection:
         return float(self.bbox[3] - self.bbox[1])
 
 
+def _box_area(box: np.ndarray) -> float:
+    return max(0.0, float(box[2]) - float(box[0])) * max(
+        0.0, float(box[3]) - float(box[1])
+    )
+
+
+def _box_intersection(a: np.ndarray, b: np.ndarray) -> float:
+    width = min(float(a[2]), float(b[2])) - max(float(a[0]), float(b[0]))
+    height = min(float(a[3]), float(b[3])) - max(float(a[1]), float(b[1]))
+    return max(0.0, width) * max(0.0, height)
+
+
+def merge_detections(
+    primary: list[Detection], extra: list[Detection], iou_threshold: float = 0.45
+) -> list[Detection]:
+    """Add detections from a second pass without replacing better geometry.
+
+    A lower-resolution pass can recover a face the primary scale missed, but it
+    also returns coarser boxes for faces already found. Keep the primary box
+    unless the extra box is substantially larger and mostly contains it (the
+    primary pass clipped the face).
+    """
+    merged = list(primary)
+    for det in extra:
+        area = _box_area(det.bbox)
+        best_iou, best_iou_index = 0.0, None
+        best_contain, best_contain_index = 0.0, None
+        for index, kept in enumerate(merged):
+            intersection = _box_intersection(det.bbox, kept.bbox)
+            kept_area = _box_area(kept.bbox)
+            union = area + kept_area - intersection
+            if union > 0 and intersection / union > best_iou:
+                best_iou, best_iou_index = intersection / union, index
+            if kept_area > 0 and intersection / kept_area > best_contain:
+                best_contain, best_contain_index = intersection / kept_area, index
+        if (
+            best_contain_index is not None
+            and best_contain > 0.8
+            and area > _box_area(merged[best_contain_index].bbox) * 1.3
+        ):
+            merged[best_contain_index] = det
+            continue
+        if best_iou_index is not None and best_iou >= iou_threshold:
+            continue
+        merged.append(det)
+    return merged
+
+
 def select_dominant_face(detections: list[Detection]) -> Detection:
     """Return the most prominent detection: largest bbox, ties on score.
 
@@ -265,6 +313,12 @@ class BaseDetector:
 
 class InsightFaceDetector(BaseDetector):
     """SCRFD detector from the InsightFace model zoo (5-point keypoints)."""
+
+    #: A face taller than this fraction of the frame overflows the detector's
+    #: anchor scales at the requested input size: SCRFD then returns nothing or a
+    #: clipped fragment. A cheap low-resolution recovery pass fixes close-ups.
+    CLOSEUP_FRACTION = 0.5
+    RECOVERY_DET_SIZE = 128
 
     def __init__(self, detector_id: str, entry: dict, det_size: tuple[int, int],
                  det_thresh: float, nms_thresh: float, providers: list[str]):
@@ -298,8 +352,8 @@ class InsightFaceDetector(BaseDetector):
         self.det_thresh = det_thresh
         self.nms_thresh = nms_thresh
 
-    def detect(self, image_bgr: np.ndarray) -> list[Detection]:
-        boxes, kps = self.model.detect(image_bgr, input_size=self.det_size)
+    def _detect_at(self, image_bgr: np.ndarray, size: int) -> list[Detection]:
+        boxes, kps = self.model.detect(image_bgr, input_size=(size, size))
         detections: list[Detection] = []
         for index in range(len(boxes)):
             detections.append(
@@ -308,6 +362,22 @@ class InsightFaceDetector(BaseDetector):
                     score=float(boxes[index, 4]),
                     kps=np.asarray(kps[index], dtype=np.float32) if kps is not None else None,
                 )
+            )
+        return detections
+
+    def detect(self, image_bgr: np.ndarray) -> list[Detection]:
+        detections = self._detect_at(image_bgr, int(self.det_size[0]))
+        frame_height = float(image_bgr.shape[0] or 1)
+        largest = max((det.height for det in detections), default=0.0)
+        recovery = min(self.RECOVERY_DET_SIZE, int(self.det_size[0]) - 1)
+        if recovery >= 64 and (
+            not detections or largest > self.CLOSEUP_FRACTION * frame_height
+        ):
+            # The primary pass found nothing or a face that no longer fits the
+            # input grid, so re-run cheaply at a small input size where a
+            # close-up is back inside the detector's supported scale range.
+            detections = merge_detections(
+                detections, self._detect_at(image_bgr, recovery)
             )
         return detections
 
@@ -390,14 +460,27 @@ class OpenCVYuNetDetector(BaseDetector):
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         height, width = image_bgr.shape[:2]
-        self.model.setInputSize((width, height))
-        _, faces = self.model.detect(image_bgr)
+        # Scale the *input* to the requested detector size and map results back.
+        # The previous code reset the input to the full frame on every call, so
+        # ``detSize`` had no effect and benchmark columns for YuNet were identical.
+        scale = min(1.0, float(self.det_size[0]) / max(1, width, height))
+        if scale < 1.0:
+            resized = cv2.resize(
+                image_bgr,
+                (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+                interpolation=cv2.INTER_AREA,
+            )
+        else:
+            resized = image_bgr
+        resized_height, resized_width = resized.shape[:2]
+        self.model.setInputSize((resized_width, resized_height))
+        _, faces = self.model.detect(resized)
         detections: list[Detection] = []
         if faces is None:
             return detections
         for row in faces:
-            x, y, w, h = (float(value) for value in row[:4])
-            landmarks = row[4:14].reshape(5, 2).astype(np.float32)
+            x, y, w, h = (float(value) / scale for value in row[:4])
+            landmarks = (row[4:14].astype(np.float32).reshape(5, 2)) / scale
             detections.append(
                 Detection(
                     bbox=np.array([x, y, x + w, y + h], dtype=np.float32),
@@ -594,15 +677,18 @@ def get_head_pose_predictor():
         return model
 
 
-def _quality_score(model, crop: np.ndarray, norm_magnitude: float) -> tuple[float, str]:
+def _quality_score(model, crop: np.ndarray) -> tuple[float | None, str]:
     if model is not None:
         try:
             result = model.score_aligned(crop)
             return float(result.score), "ediffiqa"
         except Exception:
             pass
-    # Fallback: a well-centred alignment tends to have a larger pre-L2 norm.
-    return float(min(1.0, max(0.0, (norm_magnitude - 8.0) / 24.0))), "norm"
+    # No model-independent fallback. The pre-L2 embedding norm depends on the
+    # recognizer (AdaFace/SphereFace return ~1.0 for a perfectly good crop where
+    # ArcFace returns ~20), so the old norm-based score reported 0.0 for valid
+    # faces and silently rejected them whenever ``min_quality`` was set.
+    return None, "unavailable"
 
 
 def _head_pose(model, crop: np.ndarray) -> dict | None:
@@ -671,23 +757,90 @@ def nms_boxes_and_landmarks(boxes: np.ndarray, scores: np.ndarray, landmarks: np
     return boxes[keep], scores[keep], landmarks[keep]
 
 
+def _touches_internal_tile_edge(
+    box: np.ndarray,
+    tile: tuple[int, int, int, int],
+    shape: tuple[int, int],
+    margin: float,
+) -> bool:
+    """True when a detection is clipped by a tile border that is not an image border."""
+    x0, y0, x1, y1 = tile
+    image_height, image_width = shape
+    bx0, by0, bx2, by2 = (float(value) for value in box[:4])
+    if x0 > 0 and bx0 <= x0 + margin:
+        return True
+    if y0 > 0 and by0 <= y0 + margin:
+        return True
+    if x1 < image_width and bx2 >= x1 - margin:
+        return True
+    if y1 < image_height and by2 >= y1 - margin:
+        return True
+    return False
+
+
+def _merge_tiled_detections(
+    boxes: np.ndarray,
+    scores: np.ndarray,
+    landmarks: np.ndarray,
+    truncated: np.ndarray,
+    iou_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """NMS that never lets a tile-clipped fragment beat a complete detection.
+
+    Tile detections that touch an internal tile border are ranked after every
+    complete detection, and a clipped box mostly contained by a complete one is
+    dropped even when their IoU is below the NMS threshold (heavy clipping
+    shrinks IoU, so score-only NMS used to keep the fragment and discard the
+    full-frame box, feeding clipped landmarks into alignment).
+    """
+    order = sorted(
+        range(len(scores)), key=lambda index: (bool(truncated[index]), -float(scores[index]))
+    )
+    areas = np.maximum(0.0, boxes[:, 2] - boxes[:, 0]) * np.maximum(
+        0.0, boxes[:, 3] - boxes[:, 1]
+    )
+    keep: list[int] = []
+    for index in order:
+        drop = False
+        for kept in keep:
+            intersection = _box_intersection(boxes[index], boxes[kept])
+            union = areas[index] + areas[kept] - intersection
+            if union > 0 and intersection / union > iou_threshold:
+                drop = True
+                break
+            if (
+                truncated[index]
+                and not truncated[kept]
+                and areas[index] > 0
+                and intersection / areas[index] > 0.9
+            ):
+                drop = True
+                break
+        if not drop:
+            keep.append(index)
+    return boxes[keep], scores[keep], landmarks[keep]
+
+
 def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap: float = 0.25,
                      iou_threshold: float = 0.45, tiling_mode: str = "sahi_upper_band"
                      ) -> list[Detection]:
     """Detect on the full frame plus overlapping tiles, then merge with NMS.
 
     ``tiling_mode`` is ``none`` (full frame only), ``sahi_upper_band`` (tiles the
-    back two-thirds of the room), or ``sahi_full``.
+    back two-thirds of the room), or ``sahi_full``. Tile detections clipped by an
+    internal tile border are ranked below complete detections during the merge.
     """
     if tiling_mode in ("none", None, ""):
         return detect_fn(image)
 
     height, width = image.shape[:2]
     upper_band_only = tiling_mode == "sahi_upper_band"
+    margin = max(2.0, tile_size * 0.02)
 
     all_boxes: list[np.ndarray] = []
     all_scores: list[np.ndarray] = []
     all_landmarks: list[np.ndarray] = []
+    truncated: list[bool] = []
 
     base = detect_fn(image)
     for det in base:
@@ -696,6 +849,7 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
         all_landmarks.append(
             (det.kps if det.kps is not None else np.zeros((5, 2), dtype=np.float32))[None, :, :]
         )
+        truncated.append(False)
 
     for x0, y0, x1, y1 in generate_tiles(
         height, width, tile_size=tile_size, overlap=overlap, upper_band_only=upper_band_only
@@ -713,12 +867,18 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
             all_boxes.append(box[None, :])
             all_scores.append(np.array([det.score], dtype=np.float32))
             all_landmarks.append(kps[None, :, :])
+            truncated.append(
+                _touches_internal_tile_edge(box, (x0, y0, x1, y1), (height, width), margin)
+            )
 
     if not all_boxes:
         return []
 
-    merged_boxes, merged_scores, merged_kps = nms_boxes_and_landmarks(
-        np.vstack(all_boxes), np.concatenate(all_scores), np.vstack(all_landmarks),
+    merged_boxes, merged_scores, merged_kps = _merge_tiled_detections(
+        np.vstack(all_boxes),
+        np.concatenate(all_scores),
+        np.vstack(all_landmarks),
+        np.asarray(truncated, dtype=bool),
         iou_threshold=iou_threshold,
     )
     return [
@@ -730,10 +890,46 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
 # --------------------------------------------------------------------------- #
 # Full-frame analysis
 # --------------------------------------------------------------------------- #
-def align_face(image_bgr: np.ndarray, kps: np.ndarray, size: int = 112) -> np.ndarray:
+def align_face(
+    image_bgr: np.ndarray, kps: np.ndarray, size: int = 112, antialias: bool = True
+) -> np.ndarray:
+    """Warp a face to ``size``×``size`` with anti-aliasing for large faces.
+
+    InsightFace's ``norm_crop`` point-samples the source with a plain bilinear
+    warp. That is fine for back-row faces (little downscaling) but aliases
+    high-frequency detail when a front-row face is reduced several times to
+    112 px. Blur the source ROI with a Gaussian sized to the reduction factor
+    before warping; the transform itself is unchanged.
+    """
     from insightface.utils import face_align
 
-    return face_align.norm_crop(image_bgr, kps, image_size=size)
+    kps = np.asarray(kps, dtype=np.float32)
+    matrix = face_align.estimate_norm(kps, image_size=size)
+    scale = float(np.hypot(matrix[0, 0], matrix[0, 1]))
+    if not antialias or scale >= 0.5:
+        return cv2.warpAffine(image_bgr, matrix, (size, size), borderValue=0.0)
+
+    sigma = max(0.5, 0.5 * (1.0 / max(scale, 1e-6) - 1.0))
+    inverse = cv2.invertAffineTransform(matrix)
+    corners = np.array(
+        [[[0.0, 0.0], [size, 0.0], [0.0, size], [size, size]]], dtype=np.float32
+    )
+    source = cv2.transform(corners, inverse).reshape(-1, 2)
+    pad = int(np.ceil(3 * sigma)) + 1
+    height, width = image_bgr.shape[:2]
+    x0 = max(0, int(np.floor(source[:, 0].min())) - pad)
+    y0 = max(0, int(np.floor(source[:, 1].min())) - pad)
+    x1 = min(width, int(np.ceil(source[:, 0].max())) + pad)
+    y1 = min(height, int(np.ceil(source[:, 1].max())) + pad)
+    if x1 - x0 < 2 or y1 - y0 < 2:
+        return cv2.warpAffine(image_bgr, matrix, (size, size), borderValue=0.0)
+
+    roi = cv2.GaussianBlur(image_bgr[y0:y1, x0:x1], (0, 0), sigma)
+    local = matrix.copy()
+    # M maps global coordinates; the ROI is offset by (x0, y0).
+    local[0, 2] += local[0, 0] * x0 + local[0, 1] * y0
+    local[1, 2] += local[1, 0] * x0 + local[1, 1] * y0
+    return cv2.warpAffine(roi, local, (size, size), borderValue=0.0)
 
 
 def _project_landmarks_to_crop(kps: np.ndarray, size: int = 112) -> np.ndarray | None:
@@ -758,6 +954,42 @@ def lowres_augment(crop: np.ndarray, tiny: int = 24, size: int = 112) -> np.ndar
     """Simulate a back-row face: downsample to ``tiny`` then bicubic upscale."""
     down = cv2.resize(crop, (tiny, tiny), interpolation=cv2.INTER_AREA)
     return cv2.resize(down, (size, size), interpolation=cv2.INTER_CUBIC)
+
+
+def _embed_crop(recognizer: "BaseRecognizer", crop: np.ndarray) -> np.ndarray:
+    return np.asarray(recognizer.embed([crop]), dtype=np.float32)[0]
+
+
+def embed_variants(
+    recognizer: "BaseRecognizer",
+    crop: np.ndarray,
+    *,
+    flip_aug: bool = True,
+    lowres_aug: bool = True,
+) -> dict[str, np.ndarray | None]:
+    """Embed one aligned crop into every stored variant with one definition.
+
+    ``raw`` is the clean embedding, ``flip_avg`` averages it with its mirror, and
+    ``lowres_aug`` is the flip-averaged *degraded* embedding used as a low-res
+    gallery template. Classroom probes are never degraded
+    (:func:`facelab.benchmark.select_embedding` keeps using the clean vector), so
+    this helper exists to make the gallery-side variant unambiguous: enrolment
+    and any future caller now produce the same thing under the same name instead
+    of a clean/degraded blend versus a pure degraded vector.
+    """
+    raw = _embed_crop(recognizer, crop)
+    flip_avg = None
+    if flip_aug:
+        flip_avg = matching.flip_averaged(raw, _embed_crop(recognizer, cv2.flip(crop, 1)))
+    lowres = None
+    if lowres_aug:
+        degraded = lowres_augment(crop)
+        lowres = _embed_crop(recognizer, degraded)
+        if flip_aug:
+            lowres = matching.flip_averaged(
+                lowres, _embed_crop(recognizer, lowres_augment(cv2.flip(crop, 1)))
+            )
+    return {"raw": raw, "flip_avg": flip_avg, "lowres_aug": lowres}
 
 
 def embed_reference(
@@ -808,31 +1040,22 @@ def embed_reference(
 
     embeddings: dict[str, dict] = {}
     for recognizer in recognizers:
-        raw = np.asarray(recognizer.embed([crop]), dtype=np.float32)[0]
-        entry: dict[str, Any] = {
-            "raw": raw,
-            "flip_avg": None,
-            "lowres_aug": None,
-            "norm_magnitude": round(float(np.linalg.norm(raw)), 4),
+        variants = embed_variants(
+            recognizer, crop, flip_aug=flip_aug, lowres_aug=lowres_aug
+        )
+        embeddings[recognizer.id] = {
+            **variants,
+            "norm_magnitude": round(float(np.linalg.norm(variants["raw"])), 4),
         }
-        if flip_aug:
-            mirror = np.asarray(recognizer.embed([cv2.flip(crop, 1)]), dtype=np.float32)[0]
-            entry["flip_avg"] = matching.flip_averaged(raw, mirror)
-        if lowres_aug:
-            augmented = np.asarray(recognizer.embed([lowres_augment(crop)]), dtype=np.float32)[0]
-            base_vec = entry["flip_avg"] if entry.get("flip_avg") is not None else raw
-            entry["lowres_aug"] = matching.flip_averaged(base_vec, augmented)
-        embeddings[recognizer.id] = entry
 
     primary = recognizers[0]
-    quality_score = 0.0
-    quality_source = "none"
+    quality_score: float | None = None
+    quality_source = "unavailable"
     head_pose = None
     if with_quality:
-        score, source = _quality_score(
-            get_quality_predictor(), crop, embeddings[primary.id]["norm_magnitude"]
-        )
-        quality_score, quality_source = round(score, 4), source
+        score, source = _quality_score(get_quality_predictor(), crop)
+        quality_score = None if score is None else round(score, 4)
+        quality_source = source
     if with_pose:
         head_pose = _head_pose(get_head_pose_predictor(), crop)
 
@@ -866,8 +1089,9 @@ def analyze_frame(
 ) -> dict:
     """Detect, align, embed, and score every face in one frame.
 
-    Returns a cache-shaped payload. Embeddings are raw (un-normalized) vectors so
-    the pre-L2 norm can be reported as an auxiliary quality signal.
+    Returns a cache-shaped payload. Embeddings are raw (un-normalized) vectors.
+    ``lowres_aug`` only affects enrolment templates: classroom probes are always
+    embedded from the clean aligned crop (see :func:`embed_variants`).
     """
     detector_id = detector_id or settings.default_detector
     recognizer_id = recognizer_id or settings.default_recognizer
@@ -927,8 +1151,8 @@ def analyze_frame(
                 "embedding_flip_avg": None,
                 "embedding_lowres_aug": None,
                 "embedding_norm_mag": 0.0,
-                "quality_score": 0.0,
-                "quality_source": "none",
+                "quality_score": None,
+                "quality_source": "unavailable",
                 "head_pose": None,
                 "crop": crop,
             }
@@ -953,11 +1177,11 @@ def analyze_frame(
                 payload["embedding_flip_avg"] = matching.flip_averaged(
                     raw[crop_index], mirror[crop_index]
                 )
-        if lowres_aug:
-            augmented = [lowres_augment(crop) for crop in crops]
-            extra = np.asarray(recognizer.embed(augmented), dtype=np.float32)
-            for payload, crop_index in indexed:
-                payload["embedding_lowres_aug"] = extra[crop_index]
+        # lowres_aug is a *gallery-side* augmentation: classroom probes are
+        # already low-resolution and select_embedding() scores them with the
+        # clean vector, so embedding a degraded probe here cost a full extra
+        # recognition pass per frame and stored a vector that was never read.
+        # The field stays in the schema (as None) for cache/UI compatibility.
     timings["align_embed_ms"] = round((time.perf_counter() - started) * 1000, 3)
 
     started = time.perf_counter()
@@ -969,10 +1193,8 @@ def analyze_frame(
             if crop is None:
                 continue
             if with_quality:
-                score, source = _quality_score(
-                    quality_model, crop, payload["embedding_norm_mag"]
-                )
-                payload["quality_score"] = round(score, 4)
+                score, source = _quality_score(quality_model, crop)
+                payload["quality_score"] = None if score is None else round(score, 4)
                 payload["quality_source"] = source
             if with_pose:
                 payload["head_pose"] = _head_pose(pose_model, crop)

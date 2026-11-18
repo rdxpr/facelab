@@ -117,7 +117,12 @@ def test_hungarian_resolves_conflict_greedily_differently():
 
 def test_assign_single_frame_empty_inputs():
     assert matching.assign_single_frame(np.zeros((0, 2)), ["a", "b"]) == []
-    assert matching.assign_single_frame(np.zeros((3, 0)), []) == []
+    # An empty gallery must still return one decision per detected face so the
+    # scan UI can show the detection instead of silently dropping it.
+    decisions = matching.assign_single_frame(np.zeros((3, 0)), [])
+    assert len(decisions) == 3
+    assert all(row["status"] == "unmatched" for row in decisions)
+    assert all(row["matched_student_id"] is None for row in decisions)
 
 
 def _frame(detections, width=1000, height=1000):

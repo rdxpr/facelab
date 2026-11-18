@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 import cv2
 import numpy as np
 
+from facelab import matching
 from facelab.cache import sha256_bytes
 from facelab.config import settings
 
@@ -101,7 +102,8 @@ def create_dataset(
             height_px = bbox[3] - bbox[1]
             row = box.get("row_bucket")
             if not row:
-                row = "large" if height_px >= 55 else ("medium" if height_px >= 30 else "small")
+                # Share thresholds with the detector-side bucketing.
+                row = matching.size_bucket(height_px)
             boxes.append(
                 {
                     "frame_id": box.get("frame_id") or frame_records[0]["frame_id"],

@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from facelab import cache, datasets, matching
 
@@ -75,7 +76,12 @@ _EMBEDDING_FIELDS = {
 
 
 def select_embedding(detection: dict, variant: str = "flip_avg") -> np.ndarray:
-    """Pick the detection embedding to score with, falling back to raw."""
+    """Pick the detection embedding to score with, falling back to raw.
+
+    ``lowres_aug`` is a *gallery-side* augmentation: enrolment stores a
+    flip-averaged degraded template, while classroom probes are already
+    low-resolution and are scored with the clean/flip vector.
+    """
     if variant == "lowres_aug":
         # Classroom probes are already low-resolution; don't degrade them a
         # second time with the low-res augmentation. Use the clean/flip vector.
@@ -101,7 +107,8 @@ def _fusion_frames(frames: Sequence[dict], variant: str) -> list[dict]:
                 {
                     "embedding": select_embedding(det, variant),
                     "bbox": det.get("bbox"),
-                    "quality": det.get("quality_score") or 0.0,
+                    # Keep None: "not measured" must not be gated like quality 0.
+                    "quality": det.get("quality_score"),
                 }
             )
         output.append(
@@ -130,6 +137,29 @@ def _iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
     union = area_a + area_b - inter
     return float(inter / union) if union > 0 else 0.0
+
+
+def _match_gt_to_detections(
+    gt_boxes: Sequence[dict], detections: Sequence[dict], iou_threshold: float
+) -> list[tuple[int, int]]:
+    """One-to-one GT↔detection match that does not depend on annotation order.
+
+    Maximise the number of pairs first (a bonus larger than any IoU difference),
+    then total IoU. The old greedy pass let the first ground-truth box claim the
+    best unused detection, so reordering two overlapping annotations changed
+    reported recall with identical detections.
+    """
+    if not gt_boxes or not detections:
+        return []
+    overlaps = np.zeros((len(gt_boxes), len(detections)), dtype=np.float32)
+    for row, gt in enumerate(gt_boxes):
+        gt_box = gt.get("bbox") or [0, 0, 0, 0]
+        for col, det in enumerate(detections):
+            overlaps[row, col] = _iou(gt_box, det.get("bbox") or [0, 0, 0, 0])
+    valid = overlaps >= iou_threshold
+    weights = np.where(valid, overlaps + 2.0, -1.0)
+    rows, cols = linear_sum_assignment(-weights)
+    return [(int(row), int(col)) for row, col in zip(rows, cols) if valid[row, col]]
 
 
 def stratified_metrics(
@@ -166,22 +196,20 @@ def stratified_metrics(
             continue
         detections = frame.get("detections", [])
         frame_decisions = decisions[frame_index] if frame_index < len(decisions) else []
-        used = set()
-        for gt in gt_boxes:
+        matched_by_gt = {
+            gt_index: det_index
+            for gt_index, det_index in _match_gt_to_detections(
+                gt_boxes, detections, iou_threshold
+            )
+        }
+        for gt_index, gt in enumerate(gt_boxes):
             bucket = gt.get("row_bucket") or "medium"
             if bucket not in buckets:
                 bucket = "medium"
             buckets[bucket]["gt"] += 1
-            best_index, best_iou = None, 0.0
-            for index, det in enumerate(detections):
-                if index in used:
-                    continue
-                score = _iou(gt["bbox"], det.get("bbox"))
-                if score > best_iou:
-                    best_iou, best_index = score, index
-            if best_index is None or best_iou < iou_threshold:
+            best_index = matched_by_gt.get(gt_index)
+            if best_index is None:
                 continue
-            used.add(best_index)
             buckets[bucket]["detected"] += 1
             decision = frame_decisions[best_index] if best_index < len(frame_decisions) else None
             matched = decision.get("matched_student_id") if decision else None

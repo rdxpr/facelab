@@ -21,7 +21,7 @@ import numpy as np
 
 from facelab.config import settings
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2  # v2: antialiased alignment, close-up detection recovery, clean probes
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -42,6 +42,8 @@ def analysis_params(
     """Build the analysis parameter dict shared by the scan/benchmark paths.
 
     Two callers must build this identically or their cache keys will not match.
+    ``lowres_aug`` is carried for the UI/benchmark recipe but deliberately not
+    part of the key: classroom probes are always embedded from the clean crop.
     """
     return {
         "det_size": [int(det_size), int(det_size)],
@@ -73,7 +75,8 @@ def _param_fingerprint(
         "tiling_mode": det_params.get("tiling_mode", "none"),
         "tile_size": int(det_params.get("tile_size", 640)),
         "tile_overlap": round(float(det_params.get("tile_overlap", 0.25)), 3),
-        "lowres_aug": bool(det_params.get("lowres_aug", False)),
+        # lowres_aug is a gallery-side template augmentation: it no longer
+        # changes the per-frame artifact, so it must not fork the cache key.
         "with_quality": bool(det_params.get("with_quality", True)),
         "with_pose": bool(det_params.get("with_pose", True)),
         "recognizer_id": recognizer_id,
