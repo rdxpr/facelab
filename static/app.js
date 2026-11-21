@@ -288,10 +288,11 @@ async function refreshModelStatus() {
     );
     if (seq !== modelStatusSeq) return;
     if (info.ready) {
+      const ep = (info.providers || []).length ? ` · EP: ${info.providers.join(", ")}` : "";
       setModelPill(
         "ready",
         `${info.detector?.label || state.detector} · ready`,
-        `${info.detectorId} + ${info.recognizerId}`,
+        `${info.detectorId} + ${info.recognizerId}${ep}`,
       );
       $("#model-banner").hidden = true;
     } else {
@@ -397,7 +398,9 @@ async function addPerson(event) {
     return;
   }
   const button = $("#add-person-btn");
+  if (state.busy || button.disabled) return;
   const original = button.textContent;
+  button.disabled = true;
   button.textContent = "Adding…";
   state.busy = true;
   const form = new FormData();
@@ -416,6 +419,7 @@ async function addPerson(event) {
   } finally {
     state.busy = false;
     button.textContent = original;
+    button.disabled = false;
   }
 }
 
@@ -502,7 +506,10 @@ function applyState(payload) {
 
 async function reembedAll() {
   const button = $("#reembed-btn");
+  if (state.busy || button.disabled) return;
   const original = button.textContent;
+  button.disabled = true;
+  state.busy = true;
   button.textContent = "Embedding…";
   try {
     const data = await api("/api/students/re-embed", jsonRequest({ recognizer_ids: [] }));
@@ -515,7 +522,9 @@ async function reembedAll() {
   } catch (error) {
     toast(error.message, "error");
   } finally {
+    state.busy = false;
     button.textContent = original;
+    button.disabled = false;
   }
 }
 
@@ -699,12 +708,32 @@ async function liveSweep() {
     const frames = scan.frames;
     data.faces.forEach((faces, index) => { if (frames[index]) frames[index].faces = faces; });
     delete scan.roster;
-    scan.people = (scan.people || []).map((row) => {
-      const record = data.students[String(row.personId)];
-      return record
-        ? { ...row, status: record.status, confidence: record.score ?? 0, framesHit: record.frames_hit ?? 0 }
-        : { ...row, status: "absent", confidence: 0, framesHit: 0 };
-    });
+    // Rebuild the roster from the current people list, not just the rows the
+    // original scan saved: a student enrolled after the scan must still appear.
+    const byId = new Map((scan.people || []).map((row) => [Number(row.personId), row]));
+    for (const person of state.people) {
+      if (!byId.has(person.id)) {
+        byId.set(person.id, {
+          personId: person.id,
+          number: person.number,
+          name: person.name,
+          status: "absent",
+          confidence: 0,
+          framesHit: 0,
+          enrolled: Boolean(person.recognizers?.[scan.recognizerId]),
+          photoUrl: person.photos?.[0]?.url || null,
+          templates: person.recognizers?.[scan.recognizerId] || 0,
+        });
+      }
+    }
+    scan.people = [...byId.values()]
+      .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
+      .map((row) => {
+        const record = data.students[String(row.personId)];
+        return record
+          ? { ...row, status: record.status, confidence: record.score ?? 0, framesHit: record.frames_hit ?? 0 }
+          : { ...row, status: "absent", confidence: 0, framesHit: 0 };
+      });
     scan.summary.matchedCount = data.matchedCount;
     if (typeof data.needsReview === "number") scan.summary.needsReview = data.needsReview;
     if (typeof data.unknown === "number") scan.summary.unknown = data.unknown;
@@ -714,9 +743,12 @@ async function liveSweep() {
     scan.summary.minMargin = payload.min_margin;
     scan.summary.assignmentMode = payload.assignment_mode;
     scan.summary.fusionMode = payload.fusion_mode;
+    scan.summary.fusionK = payload.k;
+    scan.summary.minQuality = payload.min_quality;
     renderSummary();
     renderRoster();
     renderFrame();
+    if (state.lightbox && state.lightbox.frames === scan.frames) renderLightbox();
     if (state.inspector) {
       openInspector(state.inspector.faceIndex, state.inspector.frame, state.inspector.scope);
     }
@@ -1416,7 +1448,7 @@ async function runBenchmark() {
     det_sizes: checkedValues("bench-det-sizes").map(Number),
     tiling_modes: checkedValues("bench-tilings"),
     det_thresh: readNumber("bench-det-thresh", 0.35),
-    nms_thresh: 0.45,
+    nms_thresh: state.settings.nmsThresh ?? 0.45,
     flip_aug: $("#bench-flip").checked,
     lowres_aug: $("#bench-lowres").checked,
     with_quality: $("#bench-quality").checked,
@@ -1440,10 +1472,11 @@ async function runBenchmark() {
   }
 
   const button = $("#bench-run-btn");
-  if (button.disabled) return;
+  if (state.busy || button.disabled) return;
   const original = button.textContent;
   button.textContent = "Running…";
   button.disabled = true;
+  state.busy = true;
   $("#bench-status").hidden = false;
   const startedAt = performance.now();
   const timer = window.setInterval(() => {
@@ -1468,6 +1501,7 @@ async function runBenchmark() {
     $("#bench-status").hidden = true;
     button.textContent = original;
     button.disabled = false;
+    state.busy = false;
   }
 }
 
@@ -1605,11 +1639,19 @@ function curveSvg(curve) {
   const width = 520;
   const height = 130;
   const pad = 10;
-  const x = (index) => pad + (index / (curve.length - 1)) * (width - pad * 2);
+  const denom = Math.max(1, curve.length - 1);
+  const x = (index) => pad + (index / denom) * (width - pad * 2);
   const y = (value) => height - pad - clamp(value, 0, 1) * (height - pad * 2);
   const path = (key) =>
     curve.map((point, index) => `${index === 0 ? "M" : "L"} ${x(index).toFixed(1)} ${y(point[key]).toFixed(1)}`).join(" ");
-  const bestIndex = curve.reduce((best, point, index) => (point.f1 > curve[best].f1 ? index : best), 0);
+  // Match backend pick_operating_points(): highest (f1, precision, threshold).
+  const isBetter = (a, b) =>
+    a.f1 !== b.f1
+      ? a.f1 > b.f1
+      : a.precision !== b.precision
+        ? a.precision > b.precision
+        : a.threshold > b.threshold;
+  const bestIndex = curve.reduce((best, point, index) => (isBetter(point, curve[best]) ? index : best), 0);
   const best = curve[bestIndex];
   const grid = [0.25, 0.5, 0.75]
     .map((tick) => `<line x1="${pad}" y1="${y(tick).toFixed(1)}" x2="${width - pad}" y2="${y(tick).toFixed(1)}" class="curve-grid" />`)
@@ -1962,6 +2004,11 @@ function applySettings(settings) {
   setSelectValue("template-strategy", state.settings.templateStrategy);
   setSelectValue("fusion-mode", state.settings.fusionMode);
   $("#fusion-k").value = String(state.settings.fusionK);
+  if ($("#bench-review")) $("#bench-review").value = String(state.settings.reviewThreshold);
+  if ($("#bench-margin")) $("#bench-margin").value = String(state.settings.minMargin);
+  if ($("#bench-det-thresh")) $("#bench-det-thresh").value = String(state.settings.detThresh);
+  if ($("#bench-assignment")) setSelectValue("bench-assignment", state.settings.assignmentMode);
+  if ($("#bench-fusion")) setSelectValue("bench-fusion", state.settings.fusionMode);
   for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality"]) {
     $(`#${id}`).dispatchEvent(new Event("input"));
   }
@@ -2112,21 +2159,39 @@ function wireEvents() {
   }, { passive: false });
 
   let lightboxDrag = null;
+  let suppressLightboxClick = false;
   lightboxViewport.addEventListener("pointerdown", (event) => {
     if (!state.lightbox || event.button !== 0) return;
-    lightboxDrag = { x: event.clientX, y: event.clientY, tx: state.lightbox.tx, ty: state.lightbox.ty };
+    lightboxDrag = {
+      x: event.clientX,
+      y: event.clientY,
+      tx: state.lightbox.tx,
+      ty: state.lightbox.ty,
+      moved: false,
+    };
     lightboxViewport.classList.add("dragging");
   });
   window.addEventListener("pointermove", (event) => {
     if (!lightboxDrag || !state.lightbox) return;
-    state.lightbox.tx = lightboxDrag.tx + (event.clientX - lightboxDrag.x);
-    state.lightbox.ty = lightboxDrag.ty + (event.clientY - lightboxDrag.y);
+    const dx = event.clientX - lightboxDrag.x;
+    const dy = event.clientY - lightboxDrag.y;
+    if (!lightboxDrag.moved && Math.hypot(dx, dy) > 4) lightboxDrag.moved = true;
+    state.lightbox.tx = lightboxDrag.tx + dx;
+    state.lightbox.ty = lightboxDrag.ty + dy;
     applyLightboxTransform();
   });
   window.addEventListener("pointerup", () => {
+    if (lightboxDrag?.moved) suppressLightboxClick = true;
     lightboxDrag = null;
     lightboxViewport.classList.remove("dragging");
   });
+  // A pan that ends over a face box must not be treated as a click -> inspector.
+  lightboxViewport.addEventListener("click", (event) => {
+    if (!suppressLightboxClick) return;
+    suppressLightboxClick = false;
+    event.preventDefault();
+    event.stopPropagation();
+  }, true);
   lightboxViewport.addEventListener("dblclick", lightboxReset);
   window.addEventListener("resize", () => {
     if (!state.lightbox) return;
@@ -2135,14 +2200,24 @@ function wireEvents() {
   });
   window.addEventListener("keydown", (event) => {
     const target = event.target;
-    const typing = target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+    const typing =
+      target &&
+      (target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.tagName === "SELECT" ||
+        target.isContentEditable);
     if (event.key === "Escape") {
       if (state.lightbox) { closeLightbox(); return; }
       if (state.inspector) { closeInspector(); return; }
     }
-    if (typing) return;
+    // Never hijack browser shortcuts (Ctrl/Cmd/Alt+F), and only act on the tab
+    // that owns the shortcut.
+    if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
     if (!state.lightbox) {
-      if ((event.key === "f" || event.key === "F") && state.scan?.frames?.length) openScanLightbox();
+      const onAttendance = !$("#panel-attendance")?.hidden;
+      if (onAttendance && (event.key === "f" || event.key === "F") && state.scan?.frames?.length) {
+        openScanLightbox();
+      }
       return;
     }
     if (event.key === "ArrowLeft") lightboxStep(-1);

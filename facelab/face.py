@@ -1504,16 +1504,20 @@ def get_face_analyzer(model_name: str | None = None):
                 "InsightFace is not installed. Run `uv sync` in this project and try again."
             ) from exc
 
-        try:
-            analyzer = FaceAnalysis(
+        def _create(active: list[str]):
+            instance = FaceAnalysis(
                 name=str(path),
                 root=str(settings.models_dir),
-                providers=settings.provider_list,
+                providers=active,
                 allowed_modules=settings.allowed_module_list or None,
             )
-            analyzer.prepare(
+            instance.prepare(
                 ctx_id=0, det_size=(settings.face_det_size, settings.face_det_size)
             )
+            return instance
+
+        try:
+            analyzer = _with_cpu_fallback(_create, settings.provider_list, name)
         except Exception as exc:
             raise FaceEngineUnavailable(f"Model '{name}' could not be loaded: {exc}") from exc
         _ANALYZERS[name] = analyzer
@@ -1549,7 +1553,10 @@ def annotate_classroom_photo(
         bbox = getattr(face, "bbox", None) if face is not None else match.get("bbox")
         if bbox is None:
             continue
-        x1, y1, x2, y2 = np.asarray(bbox).astype(int)
+        x1 = max(0, min(width - 1, int(round(float(bbox[0])))))
+        y1 = max(0, min(height - 1, int(round(float(bbox[1])))))
+        x2 = max(0, min(width - 1, int(round(float(bbox[2])))))
+        y2 = max(0, min(height - 1, int(round(float(bbox[3])))))
 
         status = match.get("status")
         if status is None:
@@ -1567,12 +1574,20 @@ def annotate_classroom_photo(
         if label is None:
             continue
         (text_width, text_height), _ = cv2.getTextSize(label, font, font_scale, thickness)
-        tag_y1 = max(0, y1 - text_height - 8)
-        cv2.rectangle(annotated, (x1, tag_y1), (x1 + text_width + 6, y1), color, -1)
+        # Keep the tag inside the frame: flip it below the top edge when there is
+        # no room above the box, matching the UI's inside label style.
+        tag_h = text_height + 8
+        if y1 >= tag_h:
+            tag_y1, tag_y2 = y1 - tag_h, y1
+        else:
+            tag_y1 = y1
+            tag_y2 = min(height, y1 + tag_h)
+        tag_x2 = min(width, x1 + text_width + 6)
+        cv2.rectangle(annotated, (x1, tag_y1), (tag_x2, tag_y2), color, -1)
         cv2.putText(
             annotated,
             label,
-            (x1 + 3, y1 - 4),
+            (x1 + 3, tag_y2 - 4),
             font,
             font_scale,
             (255, 255, 255),

@@ -79,8 +79,8 @@ its weights are downloaded.
 .venv/bin/python scripts/fetch_models.py --uniface all
 ```
 
-Before its weights are downloaded, the registry marks those models unavailable
-and the quality score falls back to the pre-L2 embedding norm.
+Before its weights are downloaded, the registry marks those models unavailable;
+unmeasured quality is recorded as `null` (`unavailable`) rather than zero.
 
 ## Helper: batch face crops
 
@@ -163,7 +163,7 @@ combination:
 | `F1` / `Prec` / `Rec` | Attendance precision/recall/F1 at the chosen threshold |
 | `τ*` | Threshold that maximises F1 (highest point on the F1 plateau) |
 | `Mean Sim` | Mean fused similarity of students predicted present |
-| `Impostor` | Highest similarity on any detection *not* called present |
+| `Impostor` | Highest similarity on non-present detections, excluding missed genuine students |
 | `Faces L/M/S` | Detections by face-size bucket (works without annotations) |
 | `L/M/S recall` | Identification recall by size — needs annotated boxes, else `—` |
 | `FPS` | Throughput from mean per-frame inference time (`*` if cached) |
@@ -271,7 +271,7 @@ it for another app. The same data is in `.data/benchmarks/<runId>.json` under
 | `POST` | `/api/reset` | Clear roster, scans, datasets, and results |
 
 Interactive API docs are at `/docs` (FastAPI). Set `FACELAB_API_TOKEN` to
-require `Authorization: Bearer <token>` (or `X-API-Token`) on mutating routes.
+require `Authorization: Bearer <token>` (or `X-API-Token`) on mutating routes and `/api/model`.
 
 ## Configuration
 

@@ -16,15 +16,19 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hmac
 import json
 import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -33,7 +37,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from facelab import benchmark as bench
 from facelab import cache as cache_store
@@ -53,6 +57,9 @@ from facelab.config import (
 
 MAX_IMAGE_BYTES = 12 * 1024 * 1024
 
+# Lock ordering: snapshot state under `_state_lock`, run inference under
+# `_model_lock`, merge under `_state_lock`. Never hold one while acquiring the
+# other (see `reset`, which nests model→state only, once nothing else nests).
 _state_lock = threading.RLock()
 _model_lock = threading.Lock()
 _people: dict[int, dict] = {}
@@ -62,6 +69,16 @@ _next_number = 1
 # --------------------------------------------------------------------------- #
 # Request models
 # --------------------------------------------------------------------------- #
+TilingMode = Literal["none", "sahi_upper_band", "sahi_full"]
+AssignmentMode = Literal["hungarian", "greedy", "margin"]
+TemplateStrategy = Literal["top_k_mean", "max", "mean", "prototype"]
+FusionMode = Literal[
+    "k_of_n_voting",
+    "max_with_margin_gate",
+    "quality_weighted_embedding_cluster",
+]
+
+
 class RenameRequest(BaseModel):
     name: str
 
@@ -75,23 +92,23 @@ class BenchmarkRunRequest(BaseModel):
     detectors: list[str] = []
     recognizers: list[str] = []
     det_sizes: list[int] = []
-    tiling_modes: list[str] = []
-    det_thresh: float = 0.35
-    nms_thresh: float = 0.45
+    tiling_modes: list[TilingMode] = []
+    det_thresh: float = Field(0.35, ge=0.0, le=1.0)
+    nms_thresh: float = Field(0.45, ge=0.0, le=1.0)
     flip_aug: bool = True
     lowres_aug: bool = False
     with_quality: bool = True
     with_pose: bool = False
     variant: str | None = None
-    accept_threshold: float | None = None
-    review_threshold: float = 0.34
-    min_margin: float = 0.04
-    assignment_mode: str = "hungarian"
-    template_strategy: str = "top_k_mean"
-    top_k: int = 2
-    fusion_mode: str = "k_of_n_voting"
-    k: int = 2
-    min_quality: float = 0.0
+    accept_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    review_threshold: float = Field(0.34, ge=0.0, le=1.0)
+    min_margin: float = Field(0.04, ge=0.0, le=1.0)
+    assignment_mode: AssignmentMode = "hungarian"
+    template_strategy: TemplateStrategy = "top_k_mean"
+    top_k: int = Field(2, ge=1, le=50)
+    fusion_mode: FusionMode = "k_of_n_voting"
+    k: int = Field(2, ge=1, le=60)
+    min_quality: float = Field(0.0, ge=0.0, le=1.0)
     force_fresh: bool = False
     label_unknown: bool = False
 
@@ -100,24 +117,24 @@ class SweepRequest(BaseModel):
     dataset_ids: list[str] = []
     detector: str = ""
     recognizer: str = ""
-    det_size: int = 0
-    tiling_mode: str = "none"
-    det_thresh: float = 0.35
-    nms_thresh: float = 0.45
+    det_size: int = Field(0, ge=0, le=2048)
+    tiling_mode: TilingMode = "none"
+    det_thresh: float = Field(0.35, ge=0.0, le=1.0)
+    nms_thresh: float = Field(0.45, ge=0.0, le=1.0)
     flip_aug: bool = True
     lowres_aug: bool = False
     with_quality: bool = True
     with_pose: bool = False
     variant: str | None = None
-    accept_threshold: float = 0.42
-    review_threshold: float = 0.34
-    min_margin: float = 0.04
-    assignment_mode: str = "hungarian"
-    template_strategy: str = "top_k_mean"
-    top_k: int = 2
-    fusion_mode: str = "k_of_n_voting"
-    k: int = 2
-    min_quality: float = 0.0
+    accept_threshold: float = Field(0.42, ge=0.0, le=1.0)
+    review_threshold: float = Field(0.34, ge=0.0, le=1.0)
+    min_margin: float = Field(0.04, ge=0.0, le=1.0)
+    assignment_mode: AssignmentMode = "hungarian"
+    template_strategy: TemplateStrategy = "top_k_mean"
+    top_k: int = Field(2, ge=1, le=50)
+    fusion_mode: FusionMode = "k_of_n_voting"
+    k: int = Field(2, ge=1, le=60)
+    min_quality: float = Field(0.0, ge=0.0, le=1.0)
 
 
 # --------------------------------------------------------------------------- #
@@ -138,8 +155,39 @@ def require_token(
     provided = x_api_token
     if not provided and authorization and authorization.lower().startswith("bearer "):
         provided = authorization[7:].strip()
-    if provided != expected:
+    if not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API token")
+
+
+def _write_json_atomic(path: Path, payload: object, *, indent: int | None = 2) -> None:
+    """Write JSON via a unique temp file + ``os.replace`` (no partial readers)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(payload, handle, indent=indent)
+        os.replace(tmp_name, path)
+    except Exception:
+        if tmp_name:
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
+async def _read_upload(image: UploadFile) -> tuple[bytes, str | None]:
+    """Read an upload with a hard byte cap so a huge body cannot exhaust RAM."""
+    data = await image.read(MAX_IMAGE_BYTES + 1)
+    if len(data) > MAX_IMAGE_BYTES:
+        label = image.filename or "upload"
+        raise HTTPException(status_code=413, detail=f"{label}: larger than 12 MB")
+    return data, image.filename
 
 
 def _variant_for(flip_aug: bool, lowres_aug: bool) -> str:
@@ -200,7 +248,7 @@ def _save_state() -> None:
                         "id": photo["id"],
                         "filename": photo["filename"],
                         "sha256": photo.get("sha256") or "",
-                        "qualityScore": photo.get("quality_score") or 0.0,
+                        "qualityScore": photo.get("quality_score"),
                         "qualityNote": photo.get("quality_note") or "",
                         "headPose": photo.get("head_pose"),
                         "createdAt": photo["createdAt"],
@@ -216,9 +264,7 @@ def _save_state() -> None:
         ],
     }
     settings.data_dir.mkdir(parents=True, exist_ok=True)
-    temp = settings.students_file.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    temp.replace(settings.students_file)
+    _write_json_atomic(settings.students_file, payload)
 
 
 def _load_legacy_people(payload: dict) -> dict[int, dict]:
@@ -239,7 +285,7 @@ def _load_legacy_people(payload: dict) -> dict[int, dict]:
                     "id": photo.get("id") or uuid.uuid4().hex[:10],
                     "filename": photo.get("filename"),
                     "sha256": "",
-                    "quality_score": 0.0,
+                    "quality_score": None,
                     "quality_note": photo.get("quality") or "",
                     "head_pose": None,
                     "createdAt": photo.get("createdAt") or _now(),
@@ -276,7 +322,11 @@ def _load_state() -> None:
                             "id": photo["id"],
                             "filename": photo.get("filename"),
                             "sha256": photo.get("sha256") or "",
-                            "quality_score": float(photo.get("qualityScore") or 0.0),
+                            "quality_score": (
+                                None
+                                if photo.get("qualityScore") is None
+                                else float(photo["qualityScore"])
+                            ),
                             "quality_note": photo.get("qualityNote") or "",
                             "head_pose": photo.get("headPose"),
                             "createdAt": photo.get("createdAt") or _now(),
@@ -334,7 +384,7 @@ def _public_person(person: dict) -> dict:
                 "id": photo["id"],
                 "url": f"/media/{photo['filename']}",
                 "quality": photo.get("quality_note") or "",
-                "qualityScore": photo.get("quality_score") or 0.0,
+                "qualityScore": photo.get("quality_score"),
                 "headPose": photo.get("head_pose"),
                 "createdAt": photo["createdAt"],
                 "recognizers": sorted((photo.get("embeddings") or {}).keys()),
@@ -483,30 +533,40 @@ def _result_path(scan_id: str) -> "os.PathLike[str] | None":
 
 
 def _save_result(result: dict) -> None:
-    _prune_results(keep=settings.results_to_keep - 1)
+    _prune_results(keep=max(0, settings.results_to_keep - 1))
     path = settings.results_dir / f"{result['scanId']}.json"
-    temp = path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(result, indent=2), encoding="utf-8")
-    temp.replace(path)
+    _write_json_atomic(path, result)
 
 
 def _prune_results(keep: int | None = None) -> None:
-    keep = settings.results_to_keep if keep is None else keep
+    keep = max(0, int(settings.results_to_keep if keep is None else keep))
     if not settings.results_dir.exists():
         return
-    files = [path for path in settings.results_dir.glob("*.json")]
-    files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale in files[keep:]:
+    entries: list[tuple[float, Path]] = []
+    for path in settings.results_dir.glob("*.json"):
+        try:
+            entries.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in entries[keep:]:
         stale.unlink(missing_ok=True)
 
 
 def _prune_scans(keep: int | None = None) -> None:
-    keep = settings.scans_to_keep if keep is None else keep
+    keep = max(0, int(settings.scans_to_keep if keep is None else keep))
     if not settings.scans_dir.exists():
         return
-    folders = [path for path in settings.scans_dir.iterdir() if path.is_dir()]
-    folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale in folders[keep:]:
+    folders: list[tuple[float, Path]] = []
+    for path in settings.scans_dir.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            folders.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    folders.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in folders[keep:]:
         shutil.rmtree(stale, ignore_errors=True)
 
 
@@ -600,26 +660,38 @@ def _require_recognizer(recognizer_id: str) -> None:
         raise HTTPException(status_code=422, detail=f"Recognizer '{recognizer_id}' is unavailable: {reason}")
 
 
-_MANIFEST_CACHE: dict[str, str] | None = None
+_MANIFEST_CACHE: tuple[tuple[int, int] | None, dict[str, str]] = (None, {})
 
 
 def _manifest_hashes() -> dict[str, str]:
-    """Map weight filename -> SHA-256 from the last fetch_models.py manifest."""
+    """Map weight filename -> SHA-256 from the last fetch_models.py manifest.
+
+    The manifest is re-read whenever its mtime/size changes, so running
+    ``fetch_models.py`` while the server is up is picked up without a restart.
+    """
     global _MANIFEST_CACHE
-    if _MANIFEST_CACHE is not None:
-        return _MANIFEST_CACHE
-    out: dict[str, str] = {}
     path = settings.models_manifest_file
-    if path.is_file():
+    try:
+        stat = path.stat()
+        stamp: tuple[int, int] | None = (stat.st_mtime_ns, stat.st_size)
+    except OSError:
+        stamp = None
+    cached_stamp, cached_map = _MANIFEST_CACHE
+    if stamp is not None and stamp == cached_stamp:
+        return cached_map
+    out: dict[str, str] = {}
+    if stamp is not None:
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            for entry in data.get("models", []):
+            for entry in [*data.get("models", []), *data.get("uniface_models", [])]:
                 name = os.path.basename(entry.get("file", ""))
                 if name:
-                    out[name] = entry.get("sha256", "")
+                    digest = entry.get("sha256", "")
+                    out[name] = digest
+                    out.setdefault(Path(name).stem, digest)
         except Exception:
             out = {}
-    _MANIFEST_CACHE = out
+    _MANIFEST_CACHE = (stamp, out)
     return out
 
 
@@ -630,7 +702,29 @@ def _weight_sha256(entry: dict) -> str | None:
         name = os.path.basename(candidate)
         if name in hashes:
             return hashes[name]
+    uniface_weight = entry.get("uniface_weights")
+    if uniface_weight:
+        for key in (f"{uniface_weight}.onnx", uniface_weight):
+            if key in hashes:
+                return hashes[key]
     return None
+
+
+def _pair_providers(detector: object, recognizer: object) -> list[str]:
+    """Report the ONNX providers actually in use after any CPU fallback."""
+    det_ep = list(getattr(detector, "active_providers", None) or [])
+    rec_ep = list(getattr(recognizer, "active_providers", None) or [])
+    if det_ep and rec_ep and det_ep[0] != rec_ep[0]:
+        return [f"det:{det_ep[0]}", f"rec:{rec_ep[0]}"]
+    return det_ep or rec_ep or settings.provider_list
+
+
+def _warmup_size_for(detector_id: str, requested: int) -> int:
+    """Clamp a warm-up size to a fixed-input detector's allowed sizes."""
+    allowed = KNOWN_DETECTORS.get(detector_id, {}).get("input_sizes")
+    if allowed and requested not in allowed:
+        return int(allowed[0])
+    return requested
 
 
 def _legacy_ids(model: str | None, detector_id: str | None, recognizer_id: str | None) -> tuple[str, str]:
@@ -861,8 +955,14 @@ def _reembed_sync(recognizer_ids: list[str]) -> dict:
 
     results = {rid: {"updated": 0, "skipped": 0} for rid in targets}
     errors: list[str] = []
-    with _state_lock, _model_lock:
-        for person in _people.values():
+    work: list[tuple[int, str, str, list[str], list[str]]] = []
+
+    # Snapshot the work under `_state_lock` only; inference then runs under
+    # `_model_lock` alone and results are merged back under `_state_lock`. This
+    # avoids the AB-BA deadlock with scans (model→state) and keeps /api/state
+    # responsive during a multi-model re-embed.
+    with _state_lock:
+        for person_id, person in _people.items():
             for photo in person["photos"]:
                 existing = photo.get("embeddings") or {}
                 missing = [
@@ -881,39 +981,77 @@ def _reembed_sync(recognizer_ids: list[str]) -> dict:
                 for recognizer_id in targets:
                     if recognizer_id not in missing and recognizer_id not in stale_templates:
                         results[recognizer_id]["skipped"] += 1
-                requested = missing + stale_templates
-                if not requested:
-                    continue
-                path = settings.data_dir / (photo.get("filename") or "")
-                image_bgr = cv2.imread(str(path)) if path.is_file() else None
-                if image_bgr is None:
-                    for recognizer_id in requested:
-                        results[recognizer_id]["skipped"] += 1
-                    errors.append(f"missing reference image for photo {photo['id']}")
-                    continue
-                try:
-                    record = _embed_reference(
-                        image_bgr, path.read_bytes(), requested, detector_id
+                if missing or stale_templates:
+                    work.append(
+                        (
+                            person_id,
+                            photo["id"],
+                            photo.get("filename") or "",
+                            missing,
+                            stale_templates,
+                        )
                     )
-                except HTTPException as exc:
-                    for recognizer_id in requested:
+
+    completed: list[tuple[int, str, list[str], list[str], dict]] = []
+    with _model_lock:
+        for person_id, photo_id, filename, missing, stale_templates in work:
+            requested = missing + stale_templates
+            path = settings.data_dir / filename if filename else None
+            if path is None or not path.is_file():
+                for recognizer_id in requested:
+                    results[recognizer_id]["skipped"] += 1
+                errors.append(f"missing reference image for photo {photo_id}")
+                continue
+            try:
+                data = path.read_bytes()
+                image_bgr = engine.image_to_bgr(data)
+                record = _embed_reference(image_bgr, data, requested, detector_id)
+            except HTTPException as exc:
+                for recognizer_id in requested:
+                    results[recognizer_id]["skipped"] += 1
+                errors.append(f"{photo_id}: {exc.detail}")
+                continue
+            except Exception as exc:
+                for recognizer_id in requested:
+                    results[recognizer_id]["skipped"] += 1
+                errors.append(f"{photo_id}: {exc}")
+                continue
+            completed.append((person_id, photo_id, missing, stale_templates, record))
+
+    if completed:
+        with _state_lock:
+            changed = False
+            for person_id, photo_id, missing, stale_templates, record in completed:
+                person = _people.get(person_id)
+                photo = (
+                    next((p for p in person["photos"] if p["id"] == photo_id), None)
+                    if person is not None
+                    else None
+                )
+                if photo is None:
+                    # Deleted while inference ran; drop the result.
+                    for recognizer_id in missing + stale_templates:
                         results[recognizer_id]["skipped"] += 1
-                    errors.append(f"{photo['id']}: {exc.detail}")
                     continue
                 entry = photo.setdefault("embeddings", {})
                 for recognizer_id in missing:
                     entry[recognizer_id] = record["embeddings"][recognizer_id]
                     results[recognizer_id]["updated"] += 1
+                    changed = True
                 for recognizer_id in stale_templates:
                     entry.setdefault(recognizer_id, {})["lowres_aug"] = (
                         record["embeddings"][recognizer_id]["lowres_aug"]
                     )
                     results[recognizer_id]["updated"] += 1
-                if not photo.get("quality_score"):
+                    changed = True
+                if photo.get("quality_score") is None and record["quality_score"] is not None:
                     photo["quality_score"] = record["quality_score"]
-                if not photo.get("head_pose"):
+                    changed = True
+                if photo.get("head_pose") is None and record["head_pose"] is not None:
                     photo["head_pose"] = record["head_pose"]
-        _save_state()
+                    changed = True
+            if changed:
+                _save_state()
     return {"results": results, "errors": errors[:20], "state": _public_state()}
 
 
@@ -1052,16 +1190,16 @@ def _run_scan_sync(
     )
     variant = _variant_for(flip_aug, lowres_aug)
 
-    try:
-        engine.warm_up(
-            detector_id, recognizer_id, det_size, tiling_mode, det_thresh, nms_thresh
-        )
-    except engine.FaceEngineUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
     decoded: list[dict] = []
     total_decode_ms = 0.0
     with _model_lock:
+        try:
+            engine.warm_up(
+                detector_id, recognizer_id, det_size, tiling_mode, det_thresh, nms_thresh
+            )
+        except engine.FaceEngineUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
         for index, (data, filename) in enumerate(raw):
             label = filename or f"frame {index + 1}"
             decode_started = time.perf_counter()
@@ -1099,116 +1237,115 @@ def _run_scan_sync(
                 }
             )
 
-        if not decoded:
-            raise HTTPException(status_code=422, detail="No readable frames. " + " ".join(warnings))
+    if not decoded:
+        raise HTTPException(status_code=422, detail="No readable frames. " + " ".join(warnings))
 
-        snapshot = _student_snapshot()
-        gallery = bench.build_gallery(snapshot, recognizer_id, variant)
-        enrolled_ids = set(gallery.keys())
+    # The lock above covered only decode + inference; everything below is CPU/
+    # disk work, so a concurrent /api/model is not blocked for the whole scan.
+    snapshot = _student_snapshot()
+    gallery = bench.build_gallery(snapshot, recognizer_id, variant)
+    enrolled_ids = set(gallery.keys())
 
-        fusion_frames = [
+    fusion_frames = bench._fusion_frames(
+        [
             {
                 "frame_id": f"frame_{order + 1}",
                 "width": item["width"],
                 "height": item["height"],
-                "detections": [
-                    {
-                        "embedding": bench.select_embedding(det, variant),
-                        "bbox": det["bbox"],
-                        "quality": det.get("quality_score") or 0.0,
-                    }
-                    for det in item["detections"]
-                ],
+                "detections": item["detections"],
             }
             for order, item in enumerate(decoded)
-        ]
+        ],
+        variant,
+        embedding_dim=bench._gallery_dim(gallery),
+    )
 
-        match_started = time.perf_counter()
-        fused = matching.fuse_multi_frame(
-            fusion_frames,
-            gallery,
-            mode=fusion_mode,
-            accept_threshold=accept_threshold,
-            review_threshold=review_threshold,
-            min_margin=min_margin,
-            assignment_mode=assignment_mode,
-            template_strategy=template_strategy,
-            top_k=top_k,
-            k=fusion_k,
-            min_quality=min_quality,
+    match_started = time.perf_counter()
+    fused = matching.fuse_multi_frame(
+        fusion_frames,
+        gallery,
+        mode=fusion_mode,
+        accept_threshold=accept_threshold,
+        review_threshold=review_threshold,
+        min_margin=min_margin,
+        assignment_mode=assignment_mode,
+        template_strategy=template_strategy,
+        top_k=top_k,
+        k=fusion_k,
+        min_quality=min_quality,
+    )
+    match_ms = (time.perf_counter() - match_started) * 1000
+
+    scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    annotate_started = time.perf_counter()
+    frames_payload = []
+    for order, item in enumerate(decoded):
+        decisions = _pad_decisions(
+            item["detections"],
+            fused["per_frame"][order] if order < len(fused["per_frame"]) else [],
         )
-        match_ms = (time.perf_counter() - match_started) * 1000
+        faces_payload = [
+            _serialize_face(decision, item["detections"][det_index], snapshot)
+            for det_index, decision in enumerate(decisions)
+        ]
+        frame_rel = _write_jpeg_bgr(item["bgr"], f"scans/{scan_id}/frame-{order}.jpg")
+        matches_for_annotation = [
+            {
+                "bbox": face["box"],
+                "status": face["status"],
+                "student_name": face["name"],
+                "confidence": face["confidence"],
+                "matched": face["matched"],
+            }
+            for face in faces_payload
+        ]
+        annotated = engine.annotate_classroom_photo(
+            item["bgr"], matches_for_annotation, label_unknown=label_unknown
+        )
+        annotated_rel = _write_jpeg_rgb(
+            annotated, f"scans/{scan_id}/frame-{order}-annotated.jpg"
+        )
+        frames_payload.append(
+            {
+                "order": order,
+                "sourceIndex": item["index"],
+                "sourceName": item["sourceName"],
+                "width": item["width"],
+                "height": item["height"],
+                "imageUrl": f"/media/{frame_rel}",
+                "annotatedUrl": f"/media/{annotated_rel}",
+                "cacheKey": item["cache_key"],
+                "cached": item["cached"],
+                "timings": {**item["timings"], "decode_ms": item["decode_ms"]},
+                "faces": faces_payload,
+            }
+        )
+    annotate_ms = (time.perf_counter() - annotate_started) * 1000
 
-        scan_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        annotate_started = time.perf_counter()
-        frames_payload = []
-        for order, item in enumerate(decoded):
-            decisions = _pad_decisions(
-                item["detections"],
-                fused["per_frame"][order] if order < len(fused["per_frame"]) else [],
-            )
-            faces_payload = [
-                _serialize_face(decision, item["detections"][det_index], snapshot)
-                for det_index, decision in enumerate(decisions)
-            ]
-            frame_rel = _write_jpeg_bgr(item["bgr"], f"scans/{scan_id}/frame-{order}.jpg")
-            matches_for_annotation = [
-                {
-                    "bbox": face["box"],
-                    "status": face["status"],
-                    "student_name": face["name"],
-                    "confidence": face["confidence"],
-                    "matched": face["matched"],
-                }
-                for face in faces_payload
-            ]
-            annotated = engine.annotate_classroom_photo(
-                item["bgr"], matches_for_annotation, label_unknown=label_unknown
-            )
-            annotated_rel = _write_jpeg_rgb(
-                annotated, f"scans/{scan_id}/frame-{order}-annotated.jpg"
-            )
-            frames_payload.append(
-                {
-                    "order": order,
-                    "sourceIndex": item["index"],
-                    "sourceName": item["sourceName"],
-                    "width": item["width"],
-                    "height": item["height"],
-                    "imageUrl": f"/media/{frame_rel}",
-                    "annotatedUrl": f"/media/{annotated_rel}",
-                    "cacheKey": item["cache_key"],
-                    "cached": item["cached"],
-                    "timings": {**item["timings"], "decode_ms": item["decode_ms"]},
-                    "faces": faces_payload,
-                }
-            )
-        annotate_ms = (time.perf_counter() - annotate_started) * 1000
-
-        roster_payload = []
-        student_status = fused["students"]
-        for student_id, person in sorted(snapshot.items(), key=lambda kv: kv[1]["number"]):
-            record = student_status.get(student_id, {"status": "absent", "score": 0.0, "frames_hit": 0})
-            templates = sum(
-                1 for photo in person["photos"] if (photo.get("embeddings") or {}).get(recognizer_id)
-            )
-            roster_payload.append(
-                {
-                    "personId": student_id,
-                    "number": person["number"],
-                    "name": person["name"],
-                    "status": record["status"],
-                    "confidence": record["score"],
-                    "framesHit": record["frames_hit"],
-                    "enrolled": student_id in enrolled_ids,
-                    "photoUrl": (
-                        f"/media/{person['photos'][0]['filename']}"
-                        if person["photos"]
-                        else None
-                    ),
-                    "templates": templates,
-                }
-            )
+    roster_payload = []
+    student_status = fused["students"]
+    for student_id, person in sorted(snapshot.items(), key=lambda kv: kv[1]["number"]):
+        record = student_status.get(student_id, {"status": "absent", "score": 0.0, "frames_hit": 0})
+        templates = sum(
+            1 for photo in person["photos"] if (photo.get("embeddings") or {}).get(recognizer_id)
+        )
+        roster_payload.append(
+            {
+                "personId": student_id,
+                "number": person["number"],
+                "name": person["name"],
+                "status": record["status"],
+                "confidence": record["score"],
+                "framesHit": record["frames_hit"],
+                "enrolled": student_id in enrolled_ids,
+                "photoUrl": (
+                    f"/media/{person['photos'][0]['filename']}"
+                    if person["photos"]
+                    else None
+                ),
+                "templates": templates,
+            }
+        )
 
     present_count = sum(1 for row in roster_payload if row["status"] == "present")
     unknown = max(
@@ -1297,13 +1434,19 @@ def _model_info_sync(name: str | None = None, detector_id: str | None = None,
         _require_detector(detector_id)
         _require_recognizer(recognizer_id)
         unloaded = None
+        warm_size = _warmup_size_for(detector_id, settings.face_scan_det_size)
+        active_providers = settings.provider_list
         try:
             with _model_lock:
                 # Selection is the natural eviction point: keep only the active
                 # pair on the GPU so the newly chosen model initializes quickly
                 # instead of competing with idle cached sessions for VRAM.
                 unloaded = engine.unload_other_models(detector_id, recognizer_id)
-                engine.warm_up(detector_id, recognizer_id, settings.face_scan_det_size, "none")
+                engine.warm_up(detector_id, recognizer_id, warm_size, "none")
+                active_providers = _pair_providers(
+                    engine.get_detector(detector_id, warm_size),
+                    engine.get_recognizer(recognizer_id),
+                )
         except engine.FaceEngineUnavailable as exc:
             return {"ready": False, "error": str(exc), "detectorId": detector_id,
                     "recognizerId": recognizer_id}
@@ -1313,7 +1456,7 @@ def _model_info_sync(name: str | None = None, detector_id: str | None = None,
             "recognizerId": recognizer_id,
             "detector": KNOWN_DETECTORS[detector_id],
             "recognizer": KNOWN_RECOGNIZERS[recognizer_id],
-            "providers": settings.provider_list,
+            "providers": active_providers,
             "unloaded": unloaded,
             "loadMs": round((time.perf_counter() - started) * 1000),
             "python": sys.version.split()[0],
@@ -1483,6 +1626,9 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
         for combo_index, (detector_id, recognizer_id, det_size, tiling_mode) in enumerate(
             config["combos"]
         ):
+            # Evict idle sessions before this combo's warm-up so a memory-tight
+            # GPU does not OOM on the first grid step.
+            engine.unload_other_models(detector_id, recognizer_id)
             warm_key = (detector_id, recognizer_id, det_size, tiling_mode)
             if warm_key not in warmups:
                 try:
@@ -1502,6 +1648,12 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         }
                     )
                     continue
+            active_providers = _pair_providers(
+                engine.get_detector(
+                    detector_id, det_size, request.det_thresh, request.nms_thresh
+                ),
+                engine.get_recognizer(recognizer_id),
+            )
             warmup_ms = warmups.get(warm_key, 0.0)
             combo_started = time.perf_counter()
             cached_frames = 0
@@ -1534,30 +1686,51 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         path = dataset_store.dataset_dir(dataset_id) / frame["filename"]
                         if not path.is_file():
                             continue
-                        data = path.read_bytes()
-                        image_bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-                        if image_bgr is None:
-                            continue
-                        payload, cached = _analyze_or_cache(
-                            image_bgr, data,
-                            detector_id=detector_id, recognizer_id=recognizer_id,
-                            det_params=det_params, flip_aug=request.flip_aug,
-                            force_fresh=request.force_fresh,
-                        )
+                        # Prefer the cache: skip reading and JPEG-decoding the
+                        # frame entirely when the artifact already exists.
+                        payload = None
+                        cached = False
+                        img_w = int(frame["width"])
+                        img_h = int(frame["height"])
+                        if not request.force_fresh and frame.get("sha256"):
+                            key = cache_store.cache_key(
+                                frame["sha256"],
+                                detector_id,
+                                det_params,
+                                recognizer_id,
+                                request.flip_aug,
+                            )
+                            hit = cache_store.load_analysis(key)
+                            if hit is not None:
+                                hit["cache_key"] = key
+                                payload, cached = hit, True
+                        if payload is None:
+                            data = path.read_bytes()
+                            image_bgr = engine.image_to_bgr(data)
+                            img_h, img_w = int(image_bgr.shape[0]), int(image_bgr.shape[1])
+                            payload, cached = _analyze_or_cache(
+                                image_bgr, data,
+                                detector_id=detector_id, recognizer_id=recognizer_id,
+                                det_params=det_params, flip_aug=request.flip_aug,
+                                force_fresh=request.force_fresh,
+                            )
+                            if first_bgr is None:
+                                first_bgr = image_bgr
+                        elif first_bgr is None:
+                            # A cached frame still needs decoding for the preview.
+                            first_bgr = engine.image_to_bgr(path.read_bytes())
                         cached_frames += int(cached)
-                        if first_bgr is None:
-                            first_bgr = image_bgr
                         dataset_frames.append(
                             {
                                 "frame_id": frame["frame_id"],
-                                "width": frame["width"],
-                                "height": frame["height"],
+                                "width": img_w,
+                                "height": img_h,
                                 "detections": payload["detections"],
                                 "timings": payload["timings_ms"],
                                 "dataset_id": dataset_id,
                                 "filename": frame["filename"],
-                                "img_w": int(image_bgr.shape[1]),
-                                "img_h": int(image_bgr.shape[0]),
+                                "img_w": img_w,
+                                "img_h": img_h,
                                 "cached": cached,
                             }
                         )
@@ -1603,8 +1776,14 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 k=request.k,
             )
             points = bench.pick_operating_points(curve)
-            chosen_threshold = request.accept_threshold or (
-                points["best_f1"]["threshold"] if points["best_f1"] else request.review_threshold
+            chosen_threshold = (
+                request.accept_threshold
+                if request.accept_threshold is not None
+                else (
+                    points["best_f1"]["threshold"]
+                    if points["best_f1"]
+                    else request.review_threshold
+                )
             )
             review_used = min(request.review_threshold, chosen_threshold)
             match_started = time.perf_counter()
@@ -1657,7 +1836,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     "detSize": det_size,
                     "tilingMode": tiling_mode,
                     "variant": variant,
-                    "providers": settings.provider_list,
+                    "providers": active_providers,
                     "detectorSha256": _weight_sha256(KNOWN_DETECTORS.get(detector_id, {})),
                     "recognizerSha256": _weight_sha256(KNOWN_RECOGNIZERS.get(recognizer_id, {})),
                     "acceptThreshold": chosen_threshold,
@@ -1742,14 +1921,33 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
     return run
 
 
+def _benchmark_summary(run: dict) -> dict:
+    return {
+        "runId": run.get("runId"),
+        "createdAt": run.get("createdAt"),
+        "rows": len(run.get("rows", [])),
+        "config": run.get("config"),
+    }
+
+
 def _save_benchmark(run: dict) -> None:
     path = settings.benchmarks_dir / f"{run['runId']}.json"
-    temp = path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(run, indent=2), encoding="utf-8")
-    temp.replace(path)
-    files = sorted(settings.benchmarks_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    for stale in files[settings.benchmarks_to_keep:]:
+    summary_path = settings.benchmarks_dir / f"{run['runId']}.summary.json"
+    _write_json_atomic(path, run)
+    _write_json_atomic(summary_path, _benchmark_summary(run))
+    keep = max(0, int(settings.benchmarks_to_keep))
+    entries: list[tuple[float, Path]] = []
+    for candidate in settings.benchmarks_dir.glob("*.json"):
+        if candidate.name.endswith(".summary.json"):
+            continue
+        try:
+            entries.append((candidate.stat().st_mtime, candidate))
+        except OSError:
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in entries[keep:]:
         stale.unlink(missing_ok=True)
+        (settings.benchmarks_dir / f"{stale.stem}.summary.json").unlink(missing_ok=True)
         shutil.rmtree(settings.benchmarks_dir / stale.stem, ignore_errors=True)
 
 
@@ -1758,18 +1956,22 @@ def _list_benchmarks() -> list[dict]:
         return []
     items = []
     for path in settings.benchmarks_dir.glob("*.json"):
+        if path.name.endswith(".summary.json"):
+            continue
+        summary_path = settings.benchmarks_dir / f"{path.stem}.summary.json"
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            if summary_path.is_file():
+                items.append(json.loads(summary_path.read_text(encoding="utf-8")))
+            else:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                summary = _benchmark_summary(data)
+                items.append(summary)
+                try:
+                    _write_json_atomic(summary_path, summary)
+                except OSError:
+                    pass
         except Exception:
             continue
-        items.append(
-            {
-                "runId": data.get("runId"),
-                "createdAt": data.get("createdAt"),
-                "rows": len(data.get("rows", [])),
-                "config": data.get("config"),
-            }
-        )
     items.sort(key=lambda item: item.get("createdAt") or "", reverse=True)
     return items
 
@@ -1980,6 +2182,7 @@ async def model(
     name: str | None = None,
     detector: str | None = None,
     recognizer: str | None = None,
+    _: None = Depends(require_token),
 ) -> dict:
     return await run_in_threadpool(_model_info_sync, name, detector, recognizer)
 
@@ -1987,10 +2190,16 @@ async def model(
 @app.get("/api/cache")
 def cache_stats() -> dict:
     files = list(settings.cache_dir.glob("*.json")) if settings.cache_dir.exists() else []
+    total_bytes = 0
+    for path in files:
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            continue
     return {
         "cacheDir": str(settings.cache_dir),
         "entries": len(files),
-        "bytes": sum(path.stat().st_size for path in files),
+        "bytes": total_bytes,
         "crops": len(list(settings.crops_dir.glob("*.jpg"))) if settings.crops_dir.exists() else 0,
     }
 
@@ -2006,7 +2215,7 @@ async def create_person(
     recognizers: list[str] = Form([]),
     _: None = Depends(require_token),
 ) -> dict:
-    raw = [(await image.read(), image.filename) for image in images]
+    raw = [await _read_upload(image) for image in images]
     targets = _resolve_recognizer_ids([*recognizers, recognizer])
     person = await run_in_threadpool(_create_person_sync, name, targets, raw)
     return {"person": person, "state": _public_state()}
@@ -2020,7 +2229,7 @@ async def add_photos(
     recognizers: list[str] = Form([]),
     _: None = Depends(require_token),
 ) -> dict:
-    raw = [(await image.read(), image.filename) for image in images]
+    raw = [await _read_upload(image) for image in images]
     targets = _resolve_recognizer_ids([*recognizers, recognizer])
     person = await run_in_threadpool(_add_photos_sync, person_id, targets, raw)
     return {"person": person, "state": _public_state()}
@@ -2125,11 +2334,37 @@ async def scan(
     accept = accept_threshold if accept_threshold is not None else (
         threshold if threshold is not None else settings.accept_threshold
     )
-    for name, value in (("acceptThreshold", accept), ("reviewThreshold", review_threshold),
-                        ("minMargin", min_margin)):
+    for name, value in (
+        ("acceptThreshold", accept),
+        ("reviewThreshold", review_threshold),
+        ("minMargin", min_margin),
+        ("detThresh", det_thresh),
+        ("nmsThresh", nms_thresh),
+        ("minQuality", min_quality),
+    ):
         if value is not None and not 0.0 <= value <= 1.0:
             raise HTTPException(status_code=422, detail=f"{name} must be between 0 and 1")
-    raw = [(await image.read(), image.filename) for image in images]
+    resolved_tiling = tiling_mode or settings.tiling_mode
+    resolved_assignment = assignment_mode or settings.assignment_mode
+    resolved_template = template_strategy or settings.template_strategy
+    resolved_fusion = fusion_mode or settings.multi_frame_fusion
+    for name, value, allowed in (
+        ("tilingMode", resolved_tiling, ("none", "sahi_upper_band", "sahi_full")),
+        ("assignmentMode", resolved_assignment, ("hungarian", "greedy", "margin")),
+        ("templateStrategy", resolved_template, ("top_k_mean", "max", "mean", "prototype")),
+        (
+            "fusionMode",
+            resolved_fusion,
+            ("k_of_n_voting", "max_with_margin_gate", "quality_weighted_embedding_cluster"),
+        ),
+    ):
+        if value not in allowed:
+            raise HTTPException(status_code=422, detail=f"Invalid {name} '{value}'")
+    resolved_top_k = top_k if top_k is not None else settings.template_top_k
+    resolved_fusion_k = fusion_k if fusion_k is not None else settings.fusion_k
+    if resolved_top_k < 1 or resolved_fusion_k < 1:
+        raise HTTPException(status_code=422, detail="topK and fusionK must be at least 1")
+    raw = [await _read_upload(image) for image in images]
     return await run_in_threadpool(
         _run_scan_sync,
         raw,
@@ -2138,17 +2373,17 @@ async def scan(
         det_size=det_size,
         det_thresh=det_thresh if det_thresh is not None else 0.35,
         nms_thresh=nms_thresh if nms_thresh is not None else 0.45,
-        tiling_mode=tiling_mode or settings.tiling_mode,
+        tiling_mode=resolved_tiling,
         accept_threshold=accept,
         review_threshold=(
             review_threshold if review_threshold is not None else settings.review_threshold
         ),
         min_margin=min_margin if min_margin is not None else settings.min_margin,
-        assignment_mode=assignment_mode or settings.assignment_mode,
-        template_strategy=template_strategy or settings.template_strategy,
-        top_k=top_k if top_k is not None else settings.template_top_k,
-        fusion_mode=fusion_mode or settings.multi_frame_fusion,
-        fusion_k=fusion_k if fusion_k is not None else settings.fusion_k,
+        assignment_mode=resolved_assignment,
+        template_strategy=resolved_template,
+        top_k=resolved_top_k,
+        fusion_mode=resolved_fusion,
+        fusion_k=resolved_fusion_k,
         flip_aug=flip_aug,
         lowres_aug=lowres_aug,
         with_quality=with_quality,
@@ -2297,11 +2532,12 @@ async def create_dataset(
     try:
         present_list = json.loads(present_ids) if present_ids else []
         box_list = json.loads(boxes) if boxes else []
-        assert isinstance(present_list, list) and isinstance(box_list, list)
+        if not isinstance(present_list, list) or not isinstance(box_list, list):
+            raise ValueError("presentIds and boxes must be JSON arrays")
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Invalid ground-truth JSON: {exc}") from exc
 
-    raw = [(await image.read(), image.filename) for image in images]
+    raw = [await _read_upload(image) for image in images]
     try:
         manifest = await run_in_threadpool(
             dataset_store.create_dataset,
@@ -2365,22 +2601,26 @@ def get_benchmark(run_id: str) -> dict:
 # --------------------------------------------------------------------------- #
 @app.post("/api/reset")
 def reset(_: None = Depends(require_token)) -> dict:
-    global _next_number
-    with _state_lock:
-        _people.clear()
-        _next_number = 1
-        _save_state()
-    for folder in (
-        settings.faces_dir,
-        settings.scans_dir,
-        settings.results_dir,
-        settings.crops_dir,
-        settings.cache_dir,
-        settings.datasets_dir,
-        settings.benchmarks_dir,
-    ):
-        shutil.rmtree(folder, ignore_errors=True)
-    settings.ensure_dirs()
+    global _next_number, _MANIFEST_CACHE
+    # model→state order, matching no other nesting in the app, so a concurrent
+    # scan/benchmark cannot race the on-disk wipe.
+    with _model_lock:
+        with _state_lock:
+            _people.clear()
+            _next_number = 1
+            _save_state()
+            for folder in (
+                settings.faces_dir,
+                settings.scans_dir,
+                settings.results_dir,
+                settings.crops_dir,
+                settings.cache_dir,
+                settings.datasets_dir,
+                settings.benchmarks_dir,
+            ):
+                shutil.rmtree(folder, ignore_errors=True)
+            settings.ensure_dirs()
+            _MANIFEST_CACHE = (None, {})
     return {"ok": True, "state": _public_state()}
 
 

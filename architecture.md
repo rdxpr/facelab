@@ -67,9 +67,9 @@ Ignored task/audit guides live at the repo root (`*audit.py`, `*guide.md`,
 - Any other `env` ⇒ **ephemeral**: `data_dir` becomes `ephemeral_dir`
   (`<temp>/facelab`) and is **wiped at process start**.
 - `ephemeral_data` (bool|None) overrides the env-derived behaviour.
-- `prepare_dirs()` runs at import. In ephemeral mode it refuses to wipe unsafe
-  targets (filesystem root, home, temp root, repo root/parent) and `rmtree`s the
-  data dir before recreating directories.
+- `prepare_dirs()` runs in `server.py` before mounts and `_load_state()` (not at
+  `facelab.config` import). In ephemeral mode it refuses to wipe unsafe targets
+  (filesystem root, home, temp root, repo root/parent) and `rmtree`s the data dir.
 - Consequence: never keep user source photos in `.data` if the server may run in
   non-dev mode (the crop helper uses `scripts/incoming/` instead).
 
@@ -281,8 +281,8 @@ present, annotatedBoxes, thumbUrl}`. Dataset ids must match
   round(nms_thresh,4))`; **max 6** (`_MAX_DETECTORS`), LRU eviction +
   `move_to_end` on hit.
 - `_RECOGNIZERS` keyed `(recognizer_id, tuple(provider_list))`.
-- `_QUALITY` / `_POSE` caches; a predictor is cached as `None` if weights are not
-  cached locally (avoids lazy downloads inside requests).
+- `_QUALITY` / `_POSE` caches; missing weights return `None` without negative
+  caching, so weights fetched later take effect without a restart.
 - ONNX-backed model construction uses `_with_cpu_fallback`: when accelerator
   session initialization fails (including GPU-memory exhaustion) it first calls
   `_evict_idle_models`, which drops every cached session except the one being
@@ -560,7 +560,7 @@ count), stratified metrics, and faces detected. Returns `attendance`,
 ## 9. HTTP server (`server.py`)
 
 ### 9.1 Startup
-- `settings.prepare_dirs()` runs at `facelab.config` import.
+- `settings.prepare_dirs()` runs in `server.py` before `StaticFiles` mounts.
 - `_load_state()` runs at module import (bottom of `server.py`).
 - Locks:
   - `_state_lock` (RLock): guards `_people`/`_next_number` and `_save_state`.
@@ -576,7 +576,7 @@ count), stratified metrics, and faces detected. Returns `attendance`,
 `settings.api_token`; no-op when the token is empty. Applied via
 `Depends(require_token)` on **all mutating routes** (people/photos/rename/delete,
 re-embed, scan, result delete, result sweep, dataset create/delete, benchmark
-run/sweep, reset). Read routes are open.
+run/sweep, reset) plus `GET /api/model`. Read routes are open.
 
 ### 9.3 Endpoint catalogue
 
@@ -694,7 +694,8 @@ name, attendance, detection, students, faces}], params}`.
   dominant one and only fails when no face is found.
 - `_add_photos_sync`: same, respects `max_photos_per_person`.
 - `_reembed_sync`: for available recognizers, backfills missing embeddings per
-  photo; **holds `_state_lock` and `_model_lock` for the whole run** (see §15).
+  photo; snapshots work under `_state_lock`, runs inference under `_model_lock`,
+  and merges/saves back under `_state_lock` (never nesting the two locks).
 
 ### 9.8 Retention & reset
 - Results JSON: `results_to_keep` (`_prune_results`).
@@ -884,7 +885,7 @@ No ONNX required; all pure Python.
 - `test_crop_faces.py`: padded-box geometry/clamping/non-square, name sanitizing,
   recursive base names.
 
-Run: `.venv/bin/python -m pytest -q` (currently **47 passing**).
+Run: `.venv/bin/python -m pytest -q` (currently **73+ passing**).
 
 ---
 
@@ -973,12 +974,13 @@ sweeps read cached frames ◄── detector/recognizer/params must match cache 
     when the frame was first analyzed; `cachedFrames`/`fps *` flag it. Use
     `force_fresh` for honest speed numbers (it re-runs and overwrites the cache).
 13. **Benchmark run JSON size** grows with frames × faces. `_list_benchmarks`
-    parses every run JSON in full; watch this on very large datasets.
-14. **Ephemeral storage wipes `.data` at import.** `facelab.config` calls
-    `prepare_dirs()` on import; `server.py` calls `_load_state()` on import.
-15. **Locks.** `_model_lock` is held for a whole scan/benchmark; `_reembed_sync`
-    holds `_state_lock` + `_model_lock` for its entire run (blocks `/api/state`
-    and mutations). Don't hold `_state_lock` across inference in new code.
+    reads lightweight `<runId>.summary.json` sidecars (backfilled on demand).
+14. **Ephemeral storage wipes `.data` at server start.** `server.py` calls
+    `prepare_dirs()` before mounts and `_load_state()` at import; importing
+    `facelab.config` alone never wipes data.
+15. **Locks.** Never nest `_state_lock` and `_model_lock` across inference:
+    snapshot under `_state_lock`, run ONNX under `_model_lock`, then merge
+    under `_state_lock`.
 16. **Largest-face enrolment.** Multiple faces no longer 422; the dominant face is
     chosen. Keep the "no face" error.
 17. **Unknown labels** default to box-only, in both the burned-in JPEG

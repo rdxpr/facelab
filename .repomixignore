@@ -1,40 +1,15 @@
-# Repomix ignore list.
-#
-# Repomix packs the repository into one file for AI review. The full pack
-# exceeded the review model's context window: it was cut off part-way through
-# facelab/face.py, so everything after that (static/app.js, server.py,
-# README.md) was never reviewed.
-#
-# The entries below are the files the previous review already received. Omitting
-# them keeps the next pack small enough that the *remaining* context — the tail
-# of face.py, static/app.js, server.py, README.md — actually fits. Delete an
-# entry to pull that file back into the pack.
-
-# Backend modules already reviewed (plus the package init).
-facelab/__init__.py
-facelab/benchmark.py
-facelab/cache.py
-facelab/config.py
-facelab/datasets.py
-facelab/matching.py
-
-# Frontend files already reviewed.
-static/index.html
-static/styles.css
-
-# Helper scripts and tests already reviewed.
-scripts/
-tests/
-
-# Build/config files already reviewed.
-Dockerfile
-pyproject.toml
-requirements.txt
-.env.example
-.dockerignore
-.gitignore
-run.sh
-
-# Generated pack output and dependency lock (never useful as review input).
-repo-context.md
+# Generated repomix packs & dependency lockfiles
+repo-context*.md
+repomix-output*
 uv.lock
+*.lock
+
+# Runtime data, weights, and local crop helper I/O (also in .gitignore)
+.data/
+models/
+scripts/incoming/
+scripts/face-crops/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
