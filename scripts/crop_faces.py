@@ -228,7 +228,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--det-thresh", type=float, default=0.5,
                         help="Detector confidence threshold.")
     parser.add_argument("--nms-thresh", type=float, default=0.45, help="NMS IoU.")
-    parser.add_argument("--tiling", choices=["none", "sahi_upper_band", "sahi_full"],
+    parser.add_argument("--tiling", choices=["none", "sahi_upper_band", "sahi_mid_band", "sahi_full"],
                         default="none", help="SAHI tiling mode (group photos benefit).")
     parser.add_argument("--padding", type=float, default=0.35,
                         help="Margin as a fraction of the face's larger side.")

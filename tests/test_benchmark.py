@@ -335,3 +335,20 @@ def test_max_impostor_includes_false_positive_present_match():
     )
     assert result["attendance"]["fp"] == 1
     assert result["max_impostor_sim"] == pytest.approx(1.0, abs=1e-3)
+
+
+def test_build_gallery_ensemble_variant_and_probe_embedding():
+    students = {1: make_student(1, [1.0, 0.0, 0.0], flip_avg=[0.0, 1.0, 0.0])}
+    students[1]["photos"][0]["embeddings"]["insightface:w600k_r50"]["lowres_aug"] = [0.0, 0.0, 1.0]
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "ensemble")
+    # raw + flip_avg + lowres_aug stacked for the same student.
+    assert gallery[1].shape == (3, 3)
+    # Ensemble probes stay clean: prefer the flip-averaged vector over raw.
+    detection = {
+        "bbox": [0, 0, 10, 10],
+        "embedding": [0.1, 0.2, 0.3],
+        "embedding_flip_avg": [0.9, 0.0, 0.0],
+    }
+    assert np.allclose(benchmark.select_embedding(detection, "ensemble"), unit(0.9, 0.0, 0.0))
+    # A detector with no embeddings still gets the right dimensionality.
+    assert benchmark.select_embedding({"bbox": [0, 0, 10, 10]}, "ensemble", embedding_dim=4).shape == (4,)

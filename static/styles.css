@@ -2726,3 +2726,38 @@ table.matrix tr.error-row td:first-child {
     transform: none;
   }
 }
+
+/* =============================================================== tooltip == */
+.ui-tooltip {
+  position: fixed;
+  z-index: 55; /* above inspector (50), below toast (60) */
+  max-width: min(320px, calc(100vw - 20px));
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--bg);
+  font-size: 11.5px;
+  line-height: 1.35;
+  box-shadow: 0 12px 30px rgba(23, 20, 15, 0.28);
+  pointer-events: none;
+  opacity: 1;
+  transform: scale(1);
+  transition: transform 125ms var(--ease-out), opacity 125ms var(--ease-out);
+  @starting-style {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+}
+.ui-tooltip[data-instant="true"] {
+  transition-duration: 0ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-tooltip {
+    transition: opacity 125ms ease;
+    transform: none;
+    @starting-style {
+      opacity: 0;
+      transform: none;
+    }
+  }
+}

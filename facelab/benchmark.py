@@ -36,10 +36,12 @@ def build_gallery(
     """Collect L2-normalized templates per student for one recognizer.
 
     ``variant`` selects which stored embedding to use (``raw``, ``flip_avg``,
-    ``lowres_aug``). ``ensemble`` stacks every available variant as extra
-    templates for the same student.
+    ``lowres_aug``, or ``ensemble``). ``ensemble`` stacks every available
+    variant as extra templates for the same student.
     """
     gallery: dict[int, np.ndarray] = {}
+    if variant == "ensemble":
+        ensemble = True
     for student_id, person in students.items():
         vectors: list[np.ndarray] = []
         for photo in person.get("photos", []):
@@ -93,7 +95,7 @@ def select_embedding(
     flip-averaged degraded template, while classroom probes are already
     low-resolution and are scored with the clean/flip vector.
     """
-    if variant == "lowres_aug":
+    if variant in ("lowres_aug", "ensemble"):
         # Classroom probes are already low-resolution; don't degrade them a
         # second time with the low-res augmentation. Use the clean/flip vector.
         keys = ("embedding_flip_avg", "embedding")

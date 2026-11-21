@@ -63,15 +63,15 @@
               <div id="frame-files" class="file-chips"></div>
 
               <div class="field-grid">
-                <label class="stacked">
+                <label class="stacked" data-tip="Detects face boxes. The backbone and input scale set how small a back-row face can be; SCRFD-10G and RetinaFace find the tiniest faces.">
                   <span class="field-label">Detector</span>
                   <select id="detector-select" class="input"></select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Turns each aligned face into an embedding used for matching. Different backbones trade speed for accuracy.">
                   <span class="field-label">Recognizer</span>
                   <select id="recognizer-select" class="input"></select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Detector input size. Larger (1280-1600) resolves tiny back-row faces better but runs slower.">
                   <span class="field-label">Detection resolution</span>
                   <select id="det-size" class="input">
                     <option value="640">640 px</option>
@@ -80,11 +80,12 @@
                     <option value="1600">1600 px</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Splits the frame into overlapping zoomed tiles merged with NMS to catch small back-row faces. Mid band tiles the seated rows tightly (y 20-80%).">
                   <span class="field-label">Tiling (SAHI)</span>
                   <select id="tiling-mode" class="input">
                     <option value="none">Off — full frame</option>
                     <option value="sahi_upper_band">Upper band (back rows)</option>
+                    <option value="sahi_mid_band">Mid band · tight tiles</option>
                     <option value="sahi_full">Full image</option>
                   </select>
                 </label>
@@ -93,29 +94,29 @@
               <details class="advanced compact-advanced">
                 <summary>Detection &amp; augmentations <span class="badge">re-scans</span></summary>
               <div class="controls two-col">
-                <div class="control">
+                <div class="control" data-tip="Minimum detector confidence to keep a face box. Lower catches blurry or angled faces; higher cuts false boxes.">
                   <label for="det-thresh">Detection threshold <output id="det-thresh-value">0.35</output></label>
                   <input id="det-thresh" type="range" min="0.05" max="0.9" step="0.01" value="0.35" />
                 </div>
-                <div class="control">
+                <div class="control" data-tip="Overlap cutoff for merging duplicate boxes on the same face. Lower is stricter about overlaps.">
                   <label for="nms-thresh">NMS IoU <output id="nms-thresh-value">0.45</output></label>
                   <input id="nms-thresh" type="range" min="0.1" max="0.9" step="0.01" value="0.45" />
                 </div>
               </div>
               <div class="toggle-row">
-                <label class="toggle">
+                <label class="toggle" data-tip="Averages each face embedding with its horizontally mirrored twin for pose stability.">
                   <input id="flip-aug" type="checkbox" checked />
                   <span>Flip augmentation</span>
                 </label>
-                <label class="toggle">
+                <label class="toggle" data-tip="Matches classroom probes against 24x24-degraded enrolment templates. Helps when enrolment photos are sharp; can hurt if they are already blurry.">
                   <input id="lowres-aug" type="checkbox" />
                   <span>Low-res augmentation</span>
                 </label>
-                <label class="toggle">
+                <label class="toggle" data-tip="Scores aligned-crop sharpness with eDifFIQA. Optional; unmeasured quality is never treated as 0.">
                   <input id="with-quality" type="checkbox" checked />
                   <span>Quality score</span>
                 </label>
-                <label class="toggle">
+                <label class="toggle" data-tip="Estimates pitch/yaw/roll with the 6D pose model, shown in the face inspector.">
                   <input id="with-pose" type="checkbox" />
                   <span>Head pose</span>
                 </label>
@@ -126,26 +127,26 @@
                 <span class="badge instant">instant · cached</span>
               </div>
               <div class="controls two-col">
-                <div class="control">
+                <div class="control" data-tip="Minimum cosine similarity to mark a student Present. Must also clear the min margin.">
                   <label for="accept-threshold">Accept threshold <output id="accept-threshold-value">0.42</output></label>
                   <input id="accept-threshold" type="range" min="0.10" max="0.95" step="0.01" value="0.42" />
                 </div>
-                <div class="control">
+                <div class="control" data-tip="Lower band: matches above this but below Accept are flagged Needs Review instead of Unknown.">
                   <label for="review-threshold">Review threshold <output id="review-threshold-value">0.34</output></label>
                   <input id="review-threshold" type="range" min="0.05" max="0.90" step="0.01" value="0.34" />
                 </div>
-                <div class="control">
+                <div class="control" data-tip="Required gap between the #1 and #2 candidate scores. Rejects ambiguous look-alikes.">
                   <label for="min-margin">Min top1–top2 margin <output id="min-margin-value">0.04</output></label>
                   <input id="min-margin" type="range" min="0.00" max="0.30" step="0.01" value="0.04" />
                 </div>
-                <div class="control">
+                <div class="control" data-tip="Ignores detections whose measured quality is below this floor during matching and fusion.">
                   <label for="min-quality">Min face quality <output id="min-quality-value">0.00</output></label>
                   <input id="min-quality" type="range" min="0.00" max="1.00" step="0.01" value="0.00" />
                 </div>
               </div>
 
               <div class="field-grid">
-                <label class="stacked">
+                <label class="stacked" data-tip="How faces map to students per frame. Hungarian = globally optimal 1-to-1; Greedy = highest score first 1-to-1; Independent = each face picks its own top match.">
                   <span class="field-label">Assignment</span>
                   <select id="assignment-mode" class="input">
                     <option value="hungarian">Hungarian (one-to-one)</option>
@@ -153,7 +154,7 @@
                     <option value="margin">Independent (per face)</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="How multiple enrolled photos combine. Top-k mean averages the best k; Prototype averages all into one centroid; Max uses the single best photo; Mean averages all.">
                   <span class="field-label">Template strategy</span>
                   <select id="template-strategy" class="input">
                     <option value="top_k_mean">Top-k mean</option>
@@ -162,7 +163,7 @@
                     <option value="prototype">Prototype</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="How a burst of frames merges into attendance. k-of-n needs k frames clearing review + one accept; Max+margin keeps the best gated frame; Cluster groups face tracks across frames first.">
                   <span class="field-label">Multi-frame fusion</span>
                   <select id="fusion-mode" class="input">
                     <option value="k_of_n_voting">k-of-n voting</option>
@@ -170,7 +171,7 @@
                     <option value="quality_weighted_embedding_cluster">Quality-weighted cluster</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="For k-of-n voting: how many frames must clear the review threshold (at least one must also clear Accept).">
                   <span class="field-label">Votes required (k)</span>
                   <input id="fusion-k" class="input" type="number" min="1" max="12" step="1" value="2" />
                 </label>
@@ -282,31 +283,31 @@
             <details class="advanced" open>
               <summary>Parameters</summary>
               <div class="field-grid">
-                <label class="stacked">
+                <label class="stacked" data-tip="Minimum cosine similarity to mark a student Present. Must also clear the min margin. Leave blank to use the calibrated best-F1 threshold.">
                   <span class="field-label">Accept threshold <span id="bench-accept-hint">auto</span></span>
                   <input id="bench-accept" class="input" type="number" min="0.05" max="0.95" step="0.01" placeholder="auto (calibrated)" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Lower band: matches above this but below Accept are flagged Needs Review instead of Unknown.">
                   <span class="field-label">Review threshold</span>
                   <input id="bench-review" class="input" type="number" min="0.05" max="0.9" step="0.01" value="0.34" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Required gap between the #1 and #2 candidate scores. Rejects ambiguous look-alikes.">
                   <span class="field-label">Min margin</span>
                   <input id="bench-margin" class="input" type="number" min="0" max="0.3" step="0.01" value="0.04" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Minimum detector confidence to keep a face box. Lower catches blurry or angled faces; higher cuts false boxes.">
                   <span class="field-label">Detector threshold</span>
                   <input id="bench-det-thresh" class="input" type="number" min="0.05" max="0.9" step="0.01" value="0.35" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Overlap cutoff for merging duplicate boxes on the same face.">
                   <span class="field-label">NMS IoU</span>
                   <input id="bench-nms-thresh" class="input" type="number" min="0.1" max="0.9" step="0.01" value="0.45" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Ignores detections whose measured quality is below this floor during matching and fusion.">
                   <span class="field-label">Min quality</span>
                   <input id="bench-min-quality" class="input" type="number" min="0" max="1" step="0.05" value="0" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="How faces map to students per frame. Hungarian = globally optimal 1-to-1; Greedy = highest score first; Independent = each face picks its own top match.">
                   <span class="field-label">Assignment</span>
                   <select id="bench-assignment" class="input">
                     <option value="hungarian">Hungarian</option>
@@ -314,7 +315,7 @@
                     <option value="margin">Independent</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="How multiple enrolled photos combine. Top-k mean averages the best k; Prototype averages all into one centroid; Max uses the single best photo; Mean averages all.">
                   <span class="field-label">Template strategy</span>
                   <select id="bench-template-strategy" class="input">
                     <option value="top_k_mean">Top-k mean</option>
@@ -323,11 +324,11 @@
                     <option value="prototype">Prototype</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="Number of best enrolled photos averaged by the Top-k mean strategy.">
                   <span class="field-label">Template top-k</span>
                   <input id="bench-top-k" class="input" type="number" min="1" max="12" step="1" value="2" />
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="How a burst of frames merges into attendance. k-of-n needs k frames clearing review + one accept; Max+margin keeps the best gated frame; Cluster groups face tracks across frames first.">
                   <span class="field-label">Fusion</span>
                   <select id="bench-fusion" class="input">
                     <option value="k_of_n_voting">k-of-n voting</option>
@@ -335,18 +336,27 @@
                     <option value="quality_weighted_embedding_cluster">Quality-weighted cluster</option>
                   </select>
                 </label>
-                <label class="stacked">
+                <label class="stacked" data-tip="For k-of-n voting: how many frames must clear the review threshold (at least one must also clear Accept).">
                   <span class="field-label">Votes required (k)</span>
                   <input id="bench-fusion-k" class="input" type="number" min="1" max="60" step="1" value="2" />
                 </label>
+                <label class="stacked" data-tip="Which stored embedding(s) form the gallery. Ensemble stacks raw + flip + low-res templates for the most robust match.">
+                  <span class="field-label">Gallery variant</span>
+                  <select id="bench-variant" class="input">
+                    <option value="">Auto (from augmentations)</option>
+                    <option value="flip_avg">Flip avg</option>
+                    <option value="lowres_aug">Low-res aug</option>
+                    <option value="ensemble">Ensemble (all variants)</option>
+                  </select>
+                </label>
               </div>
               <div class="toggle-row">
-                <label class="toggle"><input id="bench-flip" type="checkbox" checked /><span>Flip avg</span></label>
-                <label class="toggle"><input id="bench-lowres" type="checkbox" /><span>Low-res aug</span></label>
-                <label class="toggle"><input id="bench-quality" type="checkbox" checked /><span>Quality</span></label>
-                <label class="toggle"><input id="bench-pose" type="checkbox" /><span>Pose</span></label>
-                <label class="toggle" title="Bypass the analysis cache so latency/FPS are measured, not replayed"><input id="bench-force-fresh" type="checkbox" /><span>Force fresh inference</span></label>
-                <label class="toggle" title="Write “Unknown” on unmatched faces in the saved annotated JPEG"><input id="bench-label-unknown" type="checkbox" /><span>Label unknown</span></label>
+                <label class="toggle" data-tip="Averages each face embedding with its mirrored twin for pose stability (gallery + probe)."><input id="bench-flip" type="checkbox" checked /><span>Flip avg</span></label>
+                <label class="toggle" data-tip="Adds 24x24-degraded enrolment templates. Helps when enrolment photos are sharp; can hurt if they are already blurry."><input id="bench-lowres" type="checkbox" /><span>Low-res aug</span></label>
+                <label class="toggle" data-tip="Computes eDifFIQA quality scores (adds inference time)."><input id="bench-quality" type="checkbox" checked /><span>Quality</span></label>
+                <label class="toggle" data-tip="Estimates head pose with the 6D model (adds inference time)."><input id="bench-pose" type="checkbox" /><span>Pose</span></label>
+                <label class="toggle" data-tip="Bypasses the analysis cache so latency and FPS are genuinely measured instead of replayed."><input id="bench-force-fresh" type="checkbox" /><span>Force fresh inference</span></label>
+                <label class="toggle" data-tip="Burns “Unknown” text tags onto unmatched red boxes in saved annotated JPEGs."><input id="bench-label-unknown" type="checkbox" /><span>Label unknown</span></label>
               </div>
             </details>
 
@@ -517,6 +527,7 @@
       </div>
     </div>
 
+    <div id="ui-tooltip" class="ui-tooltip" role="tooltip" hidden></div>
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     <script src="/static/app.js"></script>
   </body>

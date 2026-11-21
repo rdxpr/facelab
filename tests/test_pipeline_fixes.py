@@ -322,3 +322,26 @@ def test_detect_with_sahi_preserves_missing_keypoints():
     )
     assert len(detections) == 1
     assert detections[0].kps is None
+
+
+def test_mid_band_tiles_stay_in_band_and_preserve_missing_kps():
+    height, width = 960, 1280
+    # Tight tile size for a 1280x960 classroom frame.
+    assert face._mid_band_tile_size(height, width, 640) == 403
+    band_lo, band_hi = int(height * 0.20), int(height * 0.80)
+    tiles = face.generate_tiles(height, width, tile_size=403, band=(0.20, 0.80))
+    assert tiles
+    for x0, y0, x1, y1 in tiles:
+        assert 0 <= x0 < x1 <= width
+        assert 0 <= y0 < y1 <= height
+        # Every tile overlaps the seated-student band.
+        assert y1 > band_lo and y0 < band_hi
+
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+
+    def fake_detect(_img):
+        return [face.Detection(bbox=np.array([100, 300, 180, 380], dtype=np.float32), score=0.9, kps=None)]
+
+    detections = face.detect_with_sahi(image, fake_detect, tiling_mode="sahi_mid_band")
+    assert detections
+    assert all(det.kps is None for det in detections)

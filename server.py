@@ -69,7 +69,7 @@ _next_number = 1
 # --------------------------------------------------------------------------- #
 # Request models
 # --------------------------------------------------------------------------- #
-TilingMode = Literal["none", "sahi_upper_band", "sahi_full"]
+TilingMode = Literal["none", "sahi_upper_band", "sahi_mid_band", "sahi_full"]
 AssignmentMode = Literal["hungarian", "greedy", "margin"]
 TemplateStrategy = Literal["top_k_mean", "max", "mean", "prototype"]
 FusionMode = Literal[
@@ -2351,7 +2351,7 @@ async def scan(
     resolved_template = template_strategy or settings.template_strategy
     resolved_fusion = fusion_mode or settings.multi_frame_fusion
     for name, value, allowed in (
-        ("tilingMode", resolved_tiling, ("none", "sahi_upper_band", "sahi_full")),
+        ("tilingMode", resolved_tiling, ("none", "sahi_upper_band", "sahi_mid_band", "sahi_full")),
         ("assignmentMode", resolved_assignment, ("hungarian", "greedy", "margin")),
         ("templateStrategy", resolved_template, ("top_k_mean", "max", "mean", "prototype")),
         (

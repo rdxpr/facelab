@@ -203,6 +203,72 @@ function closeStudentsDrawer() {
   $("#students-toggle")?.setAttribute("aria-expanded", "false");
   document.body.classList.remove("drawer-open");
 }
+let tooltipTimer = null;
+let tooltipTrigger = null;
+let tooltipHiddenAt = 0;
+function showTooltip(el) {
+  const tip = $("#ui-tooltip");
+  const text = el?.dataset?.tip;
+  if (!tip || !text) return;
+  tip.textContent = text;
+  tip.hidden = false;
+  tip.dataset.instant = performance.now() - tooltipHiddenAt < 250 ? "true" : "false";
+  positionTooltip(el);
+}
+function hideTooltip() {
+  const tip = $("#ui-tooltip");
+  if (!tip || tip.hidden) return;
+  tip.hidden = true;
+  tooltipHiddenAt = performance.now();
+}
+function positionTooltip(el) {
+  const tip = $("#ui-tooltip");
+  const rect = el.getBoundingClientRect();
+  const tw = tip.offsetWidth;
+  const th = tip.offsetHeight;
+  const margin = 10;
+  const gap = 8;
+  const above = rect.top >= th + gap + margin;
+  const top = above ? rect.top - th - gap : rect.bottom + gap;
+  const left = clamp(rect.left + rect.width / 2 - tw / 2, margin, window.innerWidth - tw - margin);
+  tip.style.top = `${Math.round(top)}px`;
+  tip.style.left = `${Math.round(left)}px`;
+  tip.style.transformOrigin = above ? "bottom center" : "top center";
+}
+function wireTooltips() {
+  document.addEventListener("pointerover", (event) => {
+    if (event.pointerType === "touch") return;
+    const el = event.target.closest?.("[data-tip]");
+    if (!el || el === tooltipTrigger) return;
+    window.clearTimeout(tooltipTimer);
+    tooltipTrigger = el;
+    tooltipTimer = window.setTimeout(() => showTooltip(el), 350);
+  });
+  document.addEventListener("pointerout", (event) => {
+    if (event.pointerType === "touch") return;
+    const el = event.target.closest?.("[data-tip]");
+    if (!el) return;
+    if (event.relatedTarget && el.contains(event.relatedTarget)) return;
+    window.clearTimeout(tooltipTimer);
+    if (tooltipTrigger === el) {
+      hideTooltip();
+      tooltipTrigger = null;
+    }
+  });
+  document.addEventListener("focusin", (event) => {
+    const el = event.target.closest?.("[data-tip]");
+    if (!el) return;
+    window.clearTimeout(tooltipTimer);
+    tooltipTrigger = el;
+    showTooltip(el);
+  });
+  document.addEventListener("focusout", () => {
+    window.clearTimeout(tooltipTimer);
+    tooltipTrigger = null;
+    hideTooltip();
+  });
+  window.addEventListener("scroll", () => { hideTooltip(); tooltipTrigger = null; }, true);
+}
 
 function remember() {
   try {
@@ -1576,6 +1642,7 @@ function renderBenchOptions() {
   $("#bench-tilings").innerHTML = [
     ["none", "Off"],
     ["sahi_upper_band", "Upper band"],
+    ["sahi_mid_band", "Mid band"],
     ["sahi_full", "Full SAHI"],
   ]
     .map(([value, label]) => `<label class="chip"><input type="checkbox" value="${value}" ${on(keep.tile, value, value === "none")}><span>${label}</span></label>`)
@@ -1633,6 +1700,7 @@ async function runBenchmark() {
     fusion_mode: $("#bench-fusion").value,
     k: Math.max(1, Math.round(readNumber("bench-fusion-k", state.settings.fusionK ?? 2))),
     min_quality: readNumber("bench-min-quality", state.settings.minFaceQuality ?? 0),
+    variant: $("#bench-variant")?.value || null,
     force_fresh: $("#bench-force-fresh").checked,
     label_unknown: $("#bench-label-unknown").checked,
   };
@@ -2301,6 +2369,7 @@ function wireEvents() {
     if (document.hidden) pauseToast();
     else resumeToast();
   });
+  wireTooltips();
   $("#inspector-close").addEventListener("click", closeInspector);
 
   $("#people-list").addEventListener("click", handlePeopleClick);
@@ -2417,6 +2486,7 @@ function wireEvents() {
         target.tagName === "SELECT" ||
         target.isContentEditable);
     if (event.key === "Escape") {
+      hideTooltip();
       if (state.inspector) { closeInspector(); return; }
       if (state.lightbox) { closeLightbox(); return; }
       if (state.frameZoom) { resetFrameZoom(); return; }

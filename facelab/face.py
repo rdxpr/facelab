@@ -900,13 +900,33 @@ def _head_pose(model, crop: np.ndarray) -> dict | None:
 # --------------------------------------------------------------------------- #
 # Slicing-Aided Hyper Inference
 # --------------------------------------------------------------------------- #
+def _mid_band_tile_size(image_height: int, image_width: int, requested: int = 640) -> int:
+    """Tight tile size for the mid-band SAHI mode.
+
+    Seated rows occupy roughly the middle of a classroom frame, so a smaller
+    tile (which upscales tiny back-row faces more aggressively) beats the
+    default 640. An explicit non-default tile size is honoured as-is so callers
+    can override it and keep cache keys explicit.
+    """
+    if requested and requested != 640:
+        return int(requested)
+    return min(448, max(320, int(min(image_height, image_width) * 0.42)))
+
+
 def generate_tiles(image_height: int, image_width: int, tile_size: int = 640,
-                   overlap: float = 0.25, upper_band_only: bool = False) -> list[tuple[int, int, int, int]]:
-    y_max_limit = int(image_height * 0.70) if upper_band_only else image_height
+                   overlap: float = 0.25, upper_band_only: bool = False,
+                   band: tuple[float, float] | None = None) -> list[tuple[int, int, int, int]]:
+    if band is not None:
+        row_lo = int(image_height * band[0])
+        row_hi = int(image_height * band[1])
+    elif upper_band_only:
+        row_lo, row_hi = 0, int(image_height * 0.70)
+    else:
+        row_lo, row_hi = 0, image_height
     stride = max(1, int(tile_size * (1.0 - overlap)))
     tiles = []
 
-    y_starts = list(range(0, max(1, y_max_limit - tile_size + stride), stride))
+    y_starts = list(range(row_lo, max(row_lo + 1, row_hi - tile_size + stride), stride))
     x_starts = list(range(0, max(1, image_width - tile_size + stride), stride))
 
     for y0 in y_starts:
@@ -1019,8 +1039,9 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
     """Detect on the full frame plus overlapping tiles, then merge with NMS.
 
     ``tiling_mode`` is ``none`` (full frame only), ``sahi_upper_band`` (tiles the
-    back two-thirds of the room), or ``sahi_full``. Tile detections clipped by an
-    internal tile border are ranked below complete detections during the merge.
+    back two-thirds of the room), ``sahi_mid_band`` (tight tiles over the seated
+    rows, y 20%-80%), or ``sahi_full``. Tile detections clipped by an internal
+    tile border are ranked below complete detections during the merge.
 
     ``tile_detect_fn`` overrides the per-tile detector (the full-frame pass still
     uses ``detect_fn``); SCRFD uses it to skip the close-up recovery pass on
@@ -1029,9 +1050,16 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
     if tiling_mode in ("none", None, ""):
         return detect_fn(image)
 
-    tile_fn = tile_detect_fn or detect_fn
     height, width = image.shape[:2]
-    upper_band_only = tiling_mode == "sahi_upper_band"
+    if tiling_mode == "sahi_mid_band":
+        tile_size = _mid_band_tile_size(height, width, tile_size)
+        band: tuple[float, float] | None = (0.20, 0.80)
+        upper_band_only = False
+    else:
+        band = None
+        upper_band_only = tiling_mode == "sahi_upper_band"
+
+    tile_fn = tile_detect_fn or detect_fn
     margin = max(2.0, tile_size * 0.02)
 
     all_boxes: list[np.ndarray] = []
@@ -1051,7 +1079,8 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
         truncated.append(False)
 
     for x0, y0, x1, y1 in generate_tiles(
-        height, width, tile_size=tile_size, overlap=overlap, upper_band_only=upper_band_only
+        height, width, tile_size=tile_size, overlap=overlap,
+        upper_band_only=upper_band_only, band=band,
     ):
         crop = image[y0:y1, x0:x1]
         if crop.size == 0:
