@@ -398,7 +398,7 @@ class Settings(BaseSettings):
     def provider_list(self) -> list[str]:
         """Resolve the ONNX Runtime execution-provider preference list.
 
-        ``FACELAB_PROVIDERS`` wins when set. Otherwise prefer CUDA, then CoreML,
+        ``FACELAB_ONNX_PROVIDERS`` wins when set. Otherwise prefer CUDA, then CoreML,
         then CPU, filtered to providers the installed onnxruntime can actually
         create.
         """
@@ -500,4 +500,3 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
-settings.prepare_dirs()

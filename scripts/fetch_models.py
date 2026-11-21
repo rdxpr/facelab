@@ -191,6 +191,8 @@ def download(url: str, destination: Path, retries: int = 3) -> None:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last_error = exc
             print(f"[fetch_models]   retry needed: {exc}", file=sys.stderr)
+            if attempt < retries:
+                time.sleep(min(2 ** attempt, 10))
     partial.unlink(missing_ok=True)
     raise SystemExit(f"[fetch_models] could not download {url}: {last_error}")
 
@@ -289,7 +291,7 @@ def fetch_yunet(models_dir: Path, force: bool) -> bool:
 
 def fetch_uniface(names: list[str], force: bool) -> bool:
     try:
-        from uniface.model_store import download_models
+        from uniface.model_store import download_models, get_cache_dir
         from uniface import constants
         import enum as _enum
     except Exception as exc:
@@ -331,6 +333,14 @@ def fetch_uniface(names: list[str], force: bool) -> bool:
             continue
         seen.add(item)
         unique.append(item)
+    if force:
+        # ``force`` used to be accepted and ignored. Clear the cached weight
+        # files so ``download_models`` actually re-fetches them.
+        cache_dir = Path(get_cache_dir())
+        if cache_dir.is_dir():
+            for item in unique:
+                for stale in cache_dir.glob(f"{item.value}.*"):
+                    stale.unlink(missing_ok=True)
     print(f"[fetch_models] fetching {len(unique)} UniFace weight files...")
     results = download_models(unique)
     for item, path in results.items():
@@ -362,7 +372,37 @@ def write_manifest(models_dir: Path, data_dir: Path) -> Path:
                 "license": license_by_file.get(path.name, "unknown"),
             }
         )
-    manifest = {"models_dir": str(models_dir), "models": models}
+
+    # UniFace keeps its weights in a separate cache dir (``~/.uniface/models``),
+    # so hash them too; otherwise those models have no recorded SHA-256 in a
+    # benchmark run.
+    uniface_models = []
+    try:
+        from uniface.model_store import get_cache_dir
+
+        cache_dir = Path(get_cache_dir())
+        if cache_dir.is_dir():
+            license_by_weight = {
+                entry["uniface_weights"]: entry.get("license", "unknown")
+                for entry in list(KNOWN_DETECTORS.values()) + list(KNOWN_RECOGNIZERS.values())
+                if entry.get("uniface_weights")
+            }
+            for path in sorted(cache_dir.glob("*.onnx")):
+                uniface_models.append(
+                    {
+                        "file": path.name,
+                        "size_bytes": path.stat().st_size,
+                        "sha256": sha256_file(path),
+                        "license": license_by_weight.get(path.stem, "unknown"),
+                    }
+                )
+    except Exception:
+        pass
+    manifest = {
+        "models_dir": str(models_dir),
+        "models": models,
+        "uniface_models": uniface_models,
+    }
     data_dir.mkdir(parents=True, exist_ok=True)
     target = data_dir / "models_manifest.json"
     target.write_text(json.dumps(manifest, indent=2), encoding="utf-8")

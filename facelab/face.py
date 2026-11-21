@@ -19,6 +19,8 @@ retained so older callers keep working.
 
 from __future__ import annotations
 
+import contextlib
+import gc
 import inspect
 import io
 import threading
@@ -53,6 +55,109 @@ _DETECTORS: "OrderedDict[tuple, BaseDetector]" = OrderedDict()
 _RECOGNIZERS: dict[tuple, "BaseRecognizer"] = {}
 _QUALITY: dict[str, Any] = {}
 _POSE: dict[str, Any] = {}
+
+
+def _evict_idle_models(keep_ids: set[str]) -> dict[str, int]:
+    """Drop cached models whose id is not in ``keep_ids`` and free native memory.
+
+    Sessions hold CUDA arenas and cuBLAS handles for their whole lifetime, so a
+    cached model keeps its GPU allocation even while idle. Dropping the last
+    Python reference lets ONNX Runtime destroy the session and return that
+    memory, which is what makes room for a newly selected model. ``gc.collect()``
+    is needed because model wrappers can hold reference cycles.
+    """
+    counts = {
+        "detectors": 0,
+        "recognizers": 0,
+        "quality": 0,
+        "pose": 0,
+        "analyzers": 0,
+    }
+    with _ENGINE_LOCK:
+        for key in list(_ANALYZERS):
+            if key not in keep_ids:
+                del _ANALYZERS[key]
+                counts["analyzers"] += 1
+        for key in list(_DETECTORS):
+            if key[0] not in keep_ids:
+                del _DETECTORS[key]
+                counts["detectors"] += 1
+        for key in list(_RECOGNIZERS):
+            if key[0] not in keep_ids:
+                del _RECOGNIZERS[key]
+                counts["recognizers"] += 1
+        for cache, name in ((_QUALITY, "quality"), (_POSE, "pose")):
+            cached = [key for key, value in cache.items() if value is not None]
+            for key in cached:
+                del cache[key]
+            counts[name] = len(cached)
+    if any(counts.values()):
+        gc.collect()
+    counts["total"] = (
+        counts["detectors"]
+        + counts["recognizers"]
+        + counts["quality"]
+        + counts["pose"]
+        + counts["analyzers"]
+    )
+    return counts
+
+
+def unload_other_models(
+    detector_id: str | None = None, recognizer_id: str | None = None
+) -> dict[str, object]:
+    """Free every cached model except the requested detector/recognizer pair.
+
+    The UI calls this when a model is selected. It keeps the active pair warm on
+    the GPU and releases the idle sessions that previously filled its memory.
+    """
+    keep_ids = {value for value in (detector_id, recognizer_id) if value}
+    counts = _evict_idle_models(keep_ids)
+    if counts["total"]:
+        print(
+            f"[facelab] unloaded {counts['total']} idle model(s) "
+            f"(detectors={counts['detectors']}, recognizers={counts['recognizers']}, "
+            f"predictors={counts['quality'] + counts['pose']})"
+        )
+    return {"kept": sorted(keep_ids), **counts}
+
+
+def _with_cpu_fallback(factory, providers: list[str], label: str, *, evict: bool = True):
+    """Create an ONNX-backed model, making room on the GPU before giving up.
+
+    Listing CPU after CUDA in ``InferenceSession(providers=...)`` only provides
+    *operator* fallback. If CUDA itself cannot initialize (for example because
+    other cached models filled the GPU), session creation throws before CPU
+    execution is possible. First evict idle models and retry the accelerator;
+    only if the new model still does not fit does it retry with CPU-only
+    providers, so a newly selected model runs at full speed on the GPU.
+    """
+    if not providers or providers == ["CPUExecutionProvider"]:
+        return factory(providers)
+    try:
+        return factory(providers)
+    except Exception as exc:
+        error = exc
+        released = _evict_idle_models({label}) if evict else {"total": 0}
+        if released["total"]:
+            try:
+                model = factory(providers)
+            except Exception as retry_exc:
+                error = retry_exc
+            else:
+                print(
+                    f"[facelab] {label}: evicted {released['total']} idle model(s); "
+                    f"{providers[0]} initialization succeeded"
+                )
+                return model
+        if "CPUExecutionProvider" not in providers:
+            raise error
+        detail = str(error).strip().splitlines()[0] or error.__class__.__name__
+        print(
+            f"[facelab] {label}: {providers[0]} initialization failed; "
+            f"retrying on CPU ({detail[:400]})"
+        )
+        return factory(["CPUExecutionProvider"])
 
 
 # --------------------------------------------------------------------------- #
@@ -203,8 +308,11 @@ def image_to_bgr(image_input) -> np.ndarray:
         raise ValueError("Image input is None")
 
     if isinstance(image_input, np.ndarray):
-        if len(image_input.shape) == 3 and image_input.shape[2] == 3:
-            return cv2.cvtColor(image_input, cv2.COLOR_RGB2BGR)
+        if len(image_input.shape) == 3:
+            if image_input.shape[2] == 3:
+                return cv2.cvtColor(image_input, cv2.COLOR_RGB2BGR)
+            if image_input.shape[2] == 4:
+                return cv2.cvtColor(image_input, cv2.COLOR_RGBA2BGR)
         return image_input
 
     if hasattr(image_input, "read"):
@@ -214,7 +322,7 @@ def image_to_bgr(image_input) -> np.ndarray:
     elif isinstance(image_input, bytes):
         pil_img = _open_rgb(image_input)
     elif isinstance(image_input, Image.Image):
-        pil_img = image_input.convert("RGB")
+        pil_img = ImageOps.exif_transpose(image_input).convert("RGB")
     else:
         raise TypeError(f"Unsupported image input type: {type(image_input)}")
 
@@ -331,7 +439,11 @@ class InsightFaceDetector(BaseDetector):
             )
         import onnxruntime as ort
 
-        session = ort.InferenceSession(str(path), providers=providers)
+        session = _with_cpu_fallback(
+            lambda active: ort.InferenceSession(str(path), providers=active),
+            providers,
+            detector_id,
+        )
         self.model = SCRFD(model_file=str(path), session=session)
         self.model.prepare(
             ctx_id=0, input_size=det_size, det_thresh=det_thresh, nms_thresh=nms_thresh
@@ -351,6 +463,11 @@ class InsightFaceDetector(BaseDetector):
         self.det_size = det_size
         self.det_thresh = det_thresh
         self.nms_thresh = nms_thresh
+        self.active_providers = (
+            list(session.get_providers())
+            if hasattr(session, "get_providers")
+            else list(providers)
+        )
 
     def _detect_at(self, image_bgr: np.ndarray, size: int) -> list[Detection]:
         boxes, kps = self.model.detect(image_bgr, input_size=(size, size))
@@ -365,19 +482,29 @@ class InsightFaceDetector(BaseDetector):
             )
         return detections
 
-    def detect(self, image_bgr: np.ndarray) -> list[Detection]:
+    def detect(
+        self, image_bgr: np.ndarray, *, allow_empty_recovery: bool = True
+    ) -> list[Detection]:
         detections = self._detect_at(image_bgr, int(self.det_size[0]))
         frame_height = float(image_bgr.shape[0] or 1)
         largest = max((det.height for det in detections), default=0.0)
-        recovery = min(self.RECOVERY_DET_SIZE, int(self.det_size[0]) - 1)
+        # Round the recovery size down to a stride-32 multiple; SCRFD's anchor
+        # grid assumes multiples of 32, and ``det_size - 1`` (127 for 128)
+        # produced an invalid input size.
+        recovery = min(self.RECOVERY_DET_SIZE, ((int(self.det_size[0]) - 1) // 32) * 32)
         if recovery >= 64 and (
-            not detections or largest > self.CLOSEUP_FRACTION * frame_height
+            (allow_empty_recovery and not detections)
+            or largest > self.CLOSEUP_FRACTION * frame_height
         ):
             # The primary pass found nothing or a face that no longer fits the
             # input grid, so re-run cheaply at a small input size where a
             # close-up is back inside the detector's supported scale range.
+            # SAHI tile calls disable the empty-frame path so bare tiles
+            # (walls, desks) don't double their detector forward passes.
             detections = merge_detections(
-                detections, self._detect_at(image_bgr, recovery)
+                detections,
+                self._detect_at(image_bgr, recovery),
+                iou_threshold=getattr(self, "nms_thresh", 0.45),
             )
         return detections
 
@@ -415,10 +542,21 @@ class UnifaceDetector(BaseDetector):
             kwargs["input_size"] = int(det_size[0])
         else:
             kwargs["input_size"] = tuple(det_size)
-        self.model = cls(**kwargs)
+        active_providers: list[str] = []
+
+        def _create(active):
+            active_providers[:] = list(active)
+            return cls(**{**kwargs, "providers": active})
+
+        self.model = _with_cpu_fallback(
+            _create,
+            providers,
+            detector_id,
+        )
         self.id = detector_id
         self.label = entry.get("label", detector_id)
         self.det_size = det_size
+        self.active_providers = active_providers
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         faces = self.model.detect(image_bgr)
@@ -457,6 +595,8 @@ class OpenCVYuNetDetector(BaseDetector):
         self.id = detector_id
         self.label = entry.get("label", detector_id)
         self.det_size = det_size
+        self.active_providers = ["OpenCV"]
+        self._lock = threading.Lock()
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         height, width = image_bgr.shape[:2]
@@ -473,8 +613,9 @@ class OpenCVYuNetDetector(BaseDetector):
         else:
             resized = image_bgr
         resized_height, resized_width = resized.shape[:2]
-        self.model.setInputSize((resized_width, resized_height))
-        _, faces = self.model.detect(resized)
+        with getattr(self, "_lock", None) or contextlib.nullcontext():
+            self.model.setInputSize((resized_width, resized_height))
+            _, faces = self.model.detect(resized)
         detections: list[Detection] = []
         if faces is None:
             return detections
@@ -553,11 +694,20 @@ class InsightFaceRecognizer(BaseRecognizer):
 
         import onnxruntime as ort
 
-        session = ort.InferenceSession(str(path), providers=providers)
+        session = _with_cpu_fallback(
+            lambda active: ort.InferenceSession(str(path), providers=active),
+            providers,
+            recognizer_id,
+        )
         self.model = ArcFaceONNX(model_file=str(path), session=session)
         self.id = recognizer_id
         self.label = entry.get("label", recognizer_id)
         self.embedding_dim = int(entry.get("embedding_dim", 512))
+        self.active_providers = (
+            list(session.get_providers())
+            if hasattr(session, "get_providers")
+            else list(providers)
+        )
 
     def embed(self, crops: list[np.ndarray]) -> np.ndarray:
         if not crops:
@@ -584,10 +734,21 @@ class UnifaceRecognizer(BaseRecognizer):
         if class_name is None or not hasattr(module, class_name):
             raise FaceEngineUnavailable(f"UniFace has no recognizer class for {recognizer_id}.")
         cls = getattr(module, class_name)
-        self.model = cls(model_name=_uniface_enum(weights_value), providers=providers)
+        active_providers: list[str] = []
+
+        def _create(active):
+            active_providers[:] = list(active)
+            return cls(model_name=_uniface_enum(weights_value), providers=active)
+
+        self.model = _with_cpu_fallback(
+            _create,
+            providers,
+            recognizer_id,
+        )
         self.id = recognizer_id
         self.label = entry.get("label", recognizer_id)
         self.embedding_dim = int(entry.get("embedding_dim", 512))
+        self.active_providers = active_providers
 
     def embed(self, crops: list[np.ndarray]) -> np.ndarray:
         vectors = []
@@ -638,13 +799,19 @@ def get_quality_predictor():
             return _QUALITY[predictor_id]
         value = predictor_id.split(":", 1)[-1]
         if _uniface_weight_cached(value) is None:
-            # Weights aren't cached; the norm-based fallback keeps working and we
-            # avoid blocking a request on a lazy multi-hundred-MB download.
-            _QUALITY[predictor_id] = None
+            # Weights aren't cached yet. Do not negative-cache: fetching the
+            # weights later should take effect without restarting the server.
             return None
         try:
             module = __import__("uniface.quality", fromlist=["*"])
-            model = module.EDifFIQA(model_name=_uniface_enum(value), providers=settings.provider_list)
+            model = _with_cpu_fallback(
+                lambda active: module.EDifFIQA(
+                    model_name=_uniface_enum(value), providers=active
+                ),
+                settings.provider_list,
+                predictor_id,
+                evict=False,
+            )
         except Exception as exc:
             _QUALITY[predictor_id] = None
             print(f"[facelab] quality predictor unavailable ({exc})")
@@ -664,11 +831,18 @@ def get_head_pose_predictor():
         if value in ("6d", "headpose_6d"):
             value = "headpose_mobilenetv2"
         if _uniface_weight_cached(value) is None:
-            _POSE[predictor_id] = None
+            # Don't negative-cache missing weights (see get_quality_predictor).
             return None
         try:
             module = __import__("uniface.headpose", fromlist=["*"])
-            model = module.HeadPose(model_name=_uniface_enum(value), providers=settings.provider_list)
+            model = _with_cpu_fallback(
+                lambda active: module.HeadPose(
+                    model_name=_uniface_enum(value), providers=active
+                ),
+                settings.provider_list,
+                predictor_id,
+                evict=False,
+            )
         except Exception as exc:
             _POSE[predictor_id] = None
             print(f"[facelab] head-pose predictor unavailable ({exc})")
@@ -822,17 +996,22 @@ def _merge_tiled_detections(
 
 
 def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap: float = 0.25,
-                     iou_threshold: float = 0.45, tiling_mode: str = "sahi_upper_band"
-                     ) -> list[Detection]:
+                     iou_threshold: float = 0.45, tiling_mode: str = "sahi_upper_band",
+                     *, tile_detect_fn=None) -> list[Detection]:
     """Detect on the full frame plus overlapping tiles, then merge with NMS.
 
     ``tiling_mode`` is ``none`` (full frame only), ``sahi_upper_band`` (tiles the
     back two-thirds of the room), or ``sahi_full``. Tile detections clipped by an
     internal tile border are ranked below complete detections during the merge.
+
+    ``tile_detect_fn`` overrides the per-tile detector (the full-frame pass still
+    uses ``detect_fn``); SCRFD uses it to skip the close-up recovery pass on
+    empty tiles.
     """
     if tiling_mode in ("none", None, ""):
         return detect_fn(image)
 
+    tile_fn = tile_detect_fn or detect_fn
     height, width = image.shape[:2]
     upper_band_only = tiling_mode == "sahi_upper_band"
     margin = max(2.0, tile_size * 0.02)
@@ -846,8 +1025,10 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
     for det in base:
         all_boxes.append(det.bbox[None, :])
         all_scores.append(np.array([det.score], dtype=np.float32))
+        # NaN means "no keypoints"; it is restored to ``kps=None`` on the way
+        # out so downstream alignment never runs on fabricated coordinates.
         all_landmarks.append(
-            (det.kps if det.kps is not None else np.zeros((5, 2), dtype=np.float32))[None, :, :]
+            (det.kps if det.kps is not None else np.full((5, 2), np.nan, dtype=np.float32))[None, :, :]
         )
         truncated.append(False)
 
@@ -857,13 +1038,16 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
         crop = image[y0:y1, x0:x1]
         if crop.size == 0:
             continue
-        for det in detect_fn(crop):
+        for det in tile_fn(crop):
             box = det.bbox.copy()
             box[[0, 2]] += x0
             box[[1, 3]] += y0
-            kps = det.kps.copy() if det.kps is not None else np.zeros((5, 2), dtype=np.float32)
-            kps[:, 0] += x0
-            kps[:, 1] += y0
+            if det.kps is not None:
+                kps = det.kps.copy()
+                kps[:, 0] += x0
+                kps[:, 1] += y0
+            else:
+                kps = np.full((5, 2), np.nan, dtype=np.float32)
             all_boxes.append(box[None, :])
             all_scores.append(np.array([det.score], dtype=np.float32))
             all_landmarks.append(kps[None, :, :])
@@ -882,7 +1066,11 @@ def detect_with_sahi(image: np.ndarray, detect_fn, tile_size: int = 640, overlap
         iou_threshold=iou_threshold,
     )
     return [
-        Detection(bbox=merged_boxes[i], score=float(merged_scores[i]), kps=merged_kps[i])
+        Detection(
+            bbox=merged_boxes[i],
+            score=float(merged_scores[i]),
+            kps=None if np.isnan(merged_kps[i]).any() else merged_kps[i],
+        )
         for i in range(len(merged_boxes))
     ]
 
@@ -1048,7 +1236,6 @@ def embed_reference(
             "norm_magnitude": round(float(np.linalg.norm(variants["raw"])), 4),
         }
 
-    primary = recognizers[0]
     quality_score: float | None = None
     quality_source = "unavailable"
     head_pose = None
@@ -1103,6 +1290,11 @@ def analyze_frame(
     timings: dict[str, float] = {}
 
     started = time.perf_counter()
+    tile_fn = (
+        (lambda img: detector.detect(img, allow_empty_recovery=False))
+        if isinstance(detector, InsightFaceDetector)
+        else None
+    )
     detection_list = detect_with_sahi(
         image_bgr,
         lambda img: detector.detect(img),
@@ -1110,6 +1302,7 @@ def analyze_frame(
         overlap=tile_overlap,
         iou_threshold=nms_iou,
         tiling_mode=tiling_mode,
+        tile_detect_fn=tile_fn,
     )
     timings["detect_ms"] = round((time.perf_counter() - started) * 1000, 3)
 
@@ -1132,8 +1325,13 @@ def analyze_frame(
                 name = f"{crop_prefix or 'face'}_det{det_index}.jpg"
                 target = crops_dir / name
                 target.parent.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(target), crop)
-                crop_rel = str(target.relative_to(settings.data_dir))
+                if cv2.imwrite(str(target), crop):
+                    try:
+                        crop_rel = str(target.relative_to(settings.data_dir))
+                    except ValueError:
+                        # A standalone caller may pass a crops_dir outside the
+                        # data dir; keep the absolute path rather than raising.
+                        crop_rel = str(target)
         payloads.append(
             {
                 "det_index": det_index,
@@ -1238,10 +1436,15 @@ def warm_up(detector_id: str | None = None, recognizer_id: str | None = None,
             with_quality=False,
             with_pose=False,
         )
+        # Blank frames normally have no detections, so analyze_frame loads the
+        # recognizer but skips its session.run(). Warm it explicitly: provider
+        # failures must be caught by /api/model selection, not by the first real
+        # classroom frame, and must never be reported as a successful warm-up.
+        get_recognizer(recognizer_id).warm_up()
     except FaceEngineUnavailable:
         raise
-    except Exception:
-        pass
+    except Exception as exc:
+        raise FaceEngineUnavailable(f"Model warm-up failed: {exc}") from exc
     return {"warmup_ms": round((time.perf_counter() - started) * 1000, 3)}
 
 

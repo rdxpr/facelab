@@ -20,7 +20,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.3.4"]
+dev = ["pytest==8.3.4", "ruff>=0.8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Keep the classic default set: pycodestyle errors, plus Pyflakes (unused
+# imports/variables, undefined names). The broad default set in newer Ruff
+# releases flags pre-existing intentional patterns (blind excepts, etc.).
+select = ["E4", "E7", "E9", "F"]
 
 [tool.uv]
 # FaceLab is an application, not a library: sync dependencies only, don't try to

@@ -21,7 +21,7 @@
         </nav>
 
         <div class="top-actions">
-          <div id="model-pill" class="pill loading">
+          <div id="model-pill" class="pill loading" role="status" aria-live="polite">
             <span class="pill-dot"></span>
             <span id="model-status">Loading models…</span>
           </div>
@@ -29,7 +29,7 @@
         </div>
       </header>
 
-      <div id="model-banner" class="banner error" hidden></div>
+      <div id="model-banner" class="banner error" role="alert" hidden></div>
       <div id="ephemeral-banner" class="banner info" hidden>
         Ephemeral storage: enrolled photos, scans, datasets, and results are wiped
         whenever this server restarts.
@@ -227,11 +227,11 @@
                 Matches <b id="scan-recognizer">ArcFace</b> templates only · results are cached for instant sweeps
               </div>
 
-              <div id="scan-status" class="scan-status" hidden>
+              <div id="scan-status" class="scan-status" role="status" aria-live="polite" hidden>
                 <span class="spinner"></span>
                 <span id="scan-status-text">Analyzing…</span>
               </div>
-              <div id="scan-error" class="banner error" hidden></div>
+              <div id="scan-error" class="banner error" role="alert" hidden></div>
               <div id="scan-warnings" class="banner warn" hidden></div>
             </div>
           </div>
@@ -366,11 +366,11 @@
             </details>
 
             <button id="bench-run-btn" class="btn primary scan-btn" type="button">Run benchmark</button>
-            <div id="bench-status" class="scan-status" hidden>
+            <div id="bench-status" class="scan-status" role="status" aria-live="polite" hidden>
               <span class="spinner"></span>
               <span id="bench-status-text">Running…</span>
             </div>
-            <div id="bench-error" class="banner error" hidden></div>
+            <div id="bench-error" class="banner error" role="alert" hidden></div>
           </div>
         </section>
 
@@ -411,8 +411,8 @@
               <label class="field-label" for="dataset-name">Name</label>
               <input id="dataset-name" class="input" type="text" maxlength="120" placeholder="e.g. Room 204 · morning" autocomplete="off" />
 
-              <label class="field-label" for="dataset-present">Present students</label>
-              <div id="dataset-present" class="present-picker"></div>
+              <span id="dataset-present-label" class="field-label">Present students</span>
+              <div id="dataset-present" class="present-picker" role="group" aria-labelledby="dataset-present-label"></div>
 
               <label class="field-label" for="dataset-notes">Notes <span>(optional)</span></label>
               <input id="dataset-notes" class="input" type="text" maxlength="500" placeholder="lighting, camera, row layout…" autocomplete="off" />
@@ -470,7 +470,7 @@
       </div>
     </div>
 
-    <div id="toast" class="toast" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
     <script src="/static/app.js"></script>
   </body>
 </html>

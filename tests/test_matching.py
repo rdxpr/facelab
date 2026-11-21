@@ -339,3 +339,57 @@ def test_annotate_classroom_photo_draws_bbox_only_matches():
     annotated = face_module.annotate_classroom_photo(image, matches)
     assert annotated.shape == image.shape
     assert int(annotated.sum()) > 0
+
+
+def test_k_of_n_voting_counts_unique_frames_in_margin_mode():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    # Two faces in a single frame both match 's' under independent margin mode;
+    # they must count as 1 frame hit, not 2.
+    frames = [
+        _frame([_det([1.0, 0.0, 0.0]), _det([0.99, 0.1, 0.0], bbox=(500, 500, 600, 600))]),
+        _frame([]),
+    ]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="k_of_n_voting",
+        assignment_mode="margin",
+        accept_threshold=0.5,
+        review_threshold=0.4,
+        k=2,
+    )
+    assert fused["students"]["s"]["frames_hit"] == 1
+    assert fused["students"]["s"]["status"] == "needs_review"
+
+
+def test_max_gate_populates_score_and_frames_for_needs_review():
+    gallery = {"s": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([_det([0.45, 0.893, 0.0], quality=0.8)])]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="max_with_margin_gate",
+        accept_threshold=0.6,
+        review_threshold=0.4,
+    )
+    assert fused["students"]["s"]["status"] == "needs_review"
+    assert fused["students"]["s"]["score"] == pytest.approx(0.45, abs=1e-2)
+    assert fused["students"]["s"]["frames_hit"] == 1
+
+
+def test_cluster_mode_respects_min_quality_and_updates_candidates():
+    gallery = {
+        "a": unit([1.0, 0.0, 0.0])[None, :],
+        "b": unit([0.0, 1.0, 0.0])[None, :],
+    }
+    frames = [_frame([_det([1.0, 0.0, 0.0], quality=0.1)])]
+    filtered = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="quality_weighted_embedding_cluster",
+        accept_threshold=0.5,
+        min_quality=0.5,
+    )
+    assert filtered["students"]["a"]["status"] == "absent"
+    assert filtered["per_frame"][0][0]["status"] == "unmatched"
+    assert filtered["per_frame"][0][0]["top_candidates"] == []

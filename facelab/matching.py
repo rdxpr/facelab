@@ -96,18 +96,54 @@ def build_similarity_matrix(
 
     Returns ``(sim_matrix, student_ids)`` where ``sim_matrix[i, j]`` is the
     similarity of face ``i`` to student ``student_ids[j]``.
+
+    Implementation note: every student's templates are stacked into one
+    ``(M, D)`` block and scored with a single matrix multiply, so a sweep over
+    the whole gallery costs one BLAS call instead of a Python double loop.
     """
+    if template_strategy not in ("max", "mean", "top_k_mean", "prototype"):
+        raise ValueError(f"Unknown template strategy: {template_strategy}")
     faces = [np.asarray(vec, dtype=np.float32).reshape(-1) for vec in face_embeddings]
     student_ids = list(student_gallery.keys())
     sim_matrix = np.zeros((len(faces), len(student_ids)), dtype=np.float32)
-    for i, face_vec in enumerate(faces):
-        for j, student_id in enumerate(student_ids):
-            sim_matrix[i, j] = compute_student_similarity(
-                face_vec,
-                student_gallery[student_id],
-                strategy=template_strategy,
-                top_k=top_k,
-            )
+    if not faces or not student_ids:
+        return sim_matrix, student_ids
+
+    face_matrix = np.vstack(faces)
+    dim = face_matrix.shape[1]
+    blocks: list[np.ndarray] = []
+    slices: list[tuple[int, int, int]] = []
+    offset = 0
+    for j, student_id in enumerate(student_ids):
+        templates = np.asarray(student_gallery[student_id], dtype=np.float32)
+        if templates.ndim == 1:
+            templates = templates[None, :]
+        if templates.shape[0] == 0 or templates.shape[1] != dim:
+            continue
+        if template_strategy == "prototype":
+            proto = np.mean(templates, axis=0)
+            norm = float(np.linalg.norm(proto))
+            if norm <= 0:
+                continue
+            templates = (proto / norm)[None, :]
+        blocks.append(templates)
+        end = offset + templates.shape[0]
+        slices.append((j, offset, end))
+        offset = end
+
+    if not blocks:
+        return sim_matrix, student_ids
+
+    all_scores = face_matrix @ np.vstack(blocks).T
+    for j, start, end in slices:
+        sub = all_scores[:, start:end]
+        if template_strategy in ("max", "prototype"):
+            sim_matrix[:, j] = np.max(sub, axis=1)
+        elif template_strategy == "mean":
+            sim_matrix[:, j] = np.mean(sub, axis=1)
+        elif template_strategy == "top_k_mean":
+            k = max(1, min(int(top_k), end - start))
+            sim_matrix[:, j] = np.mean(np.sort(sub, axis=1)[:, -k:], axis=1)
     return sim_matrix, student_ids
 
 
@@ -264,6 +300,9 @@ def fuse_multi_frame(
     top_k: int = 2,
     k: int = 2,
     min_quality: float = 0.0,
+    precomputed_sims: Sequence[np.ndarray] | None = None,
+    precomputed_tracks: list[dict] | None = None,
+    precomputed_track_sim: np.ndarray | None = None,
 ) -> dict:
     """Fuse a burst of frames into one attendance decision.
 
@@ -275,30 +314,40 @@ def fuse_multi_frame(
       top1-top2 margin and face quality pass their gates.
     * ``quality_weighted_embedding_cluster``: group detections across frames into
       tracks, quality-weight each track's centroid, then match once.
+
+    ``precomputed_sims`` / ``precomputed_tracks`` / ``precomputed_track_sim``
+    let a threshold sweep reuse similarities that do not depend on the
+    thresholds being swept (see :func:`facelab.benchmark.threshold_curve_datasets`).
     """
     student_ids = list(student_gallery.keys())
     per_frame: list[list[dict]] = []
     sims: list[np.ndarray] = []
 
-    for frame in frames:
-        detections = frame.get("detections", [])
-        matrix, student_ids = build_similarity_matrix(
-            [det["embedding"] for det in detections],
-            student_gallery,
-            template_strategy,
-            top_k,
-        )
-        sims.append(matrix)
-        per_frame.append(
-            assign_single_frame(
-                matrix,
-                student_ids,
-                accept_threshold=accept_threshold,
-                review_threshold=review_threshold,
-                min_margin=min_margin,
-                assignment_mode=assignment_mode,
+    student_index_map = {sid: idx for idx, sid in enumerate(student_ids)}
+
+    if mode != "quality_weighted_embedding_cluster":
+        for frame_index, frame in enumerate(frames):
+            detections = frame.get("detections", [])
+            if precomputed_sims is not None:
+                matrix = precomputed_sims[frame_index]
+            else:
+                matrix, student_ids = build_similarity_matrix(
+                    [det["embedding"] for det in detections],
+                    student_gallery,
+                    template_strategy,
+                    top_k,
+                )
+            sims.append(matrix)
+            per_frame.append(
+                assign_single_frame(
+                    matrix,
+                    student_ids,
+                    accept_threshold=accept_threshold,
+                    review_threshold=review_threshold,
+                    min_margin=min_margin,
+                    assignment_mode=assignment_mode,
+                )
             )
-        )
 
     num_frames = len(frames)
     student_status: dict[Any, dict] = {
@@ -306,16 +355,16 @@ def fuse_multi_frame(
         for sid in student_ids
     }
 
-    def student_index(student_id: Any) -> int:
-        return student_ids.index(student_id)
-
     if mode == "k_of_n_voting":
         # Vote on the *assigned* decision per frame, not the raw max similarity:
         # otherwise the Hungarian one-to-one assignment, the margin gate and the
         # min_quality filter are all bypassed here.
         required = max(1, min(int(k), num_frames or 1))
-        hits: dict[Any, int] = {sid: 0 for sid in student_ids}
-        present_hits: dict[Any, int] = {sid: 0 for sid in student_ids}
+        # Count a frame at most once per student. Under ``assignment_mode="margin"``
+        # two faces in the *same* frame can independently match one student, and a
+        # naïve counter would treat that as two frames of evidence.
+        hit_frames: dict[Any, set[int]] = {sid: set() for sid in student_ids}
+        present_frames: dict[Any, set[int]] = {sid: set() for sid in student_ids}
         for frame_index, frame in enumerate(frames):
             detections = frame.get("detections", [])
             for det_index, decision in enumerate(per_frame[frame_index]):
@@ -330,20 +379,24 @@ def fuse_multi_frame(
                     continue
                 score = float(decision["score"])
                 if score >= review_threshold:
-                    hits[sid] += 1
+                    hit_frames[sid].add(frame_index)
                     if decision["status"] == "present":
-                        present_hits[sid] += 1
+                        present_frames[sid].add(frame_index)
                 record = student_status[sid]
                 if score > record["score"]:
                     record["score"] = round(score, 4)
+                    record["quality"] = round(float(quality or 0.0), 4)
         for sid, record in student_status.items():
-            record["frames_hit"] = hits[sid]
-            if hits[sid] >= required and present_hits[sid] >= 1:
+            frame_hits = len(hit_frames[sid])
+            record["frames_hit"] = frame_hits
+            if frame_hits >= required and len(present_frames[sid]) >= 1:
                 record["status"] = "present"
-            elif hits[sid] >= 1:
+            elif frame_hits >= 1:
                 record["status"] = "needs_review"
     elif mode == "max_with_margin_gate":
-        review_sids: set = set()
+        accepted_frames: dict[Any, set[int]] = {sid: set() for sid in student_ids}
+        review_frames: dict[Any, set[int]] = {sid: set() for sid in student_ids}
+        review_best: dict[Any, tuple[float, float]] = {}
         for frame_index, frame in enumerate(frames):
             detections = frame.get("detections", [])
             assignments = per_frame[frame_index]
@@ -354,26 +407,62 @@ def fuse_multi_frame(
                 quality = detections[det_index].get("quality")
                 if quality is not None and float(quality) < min_quality:
                     continue
+                score = float(sims[frame_index][det_index, student_index_map[sid]])
                 if decision["status"] != "present" or decision["margin"] < min_margin:
-                    review_sids.add(sid)
+                    # Keep the best review-band score so a student who never
+                    # reaches ``present`` is still reported with real numbers
+                    # instead of ``score: 0.0``.
+                    review_frames[sid].add(frame_index)
+                    prev_score, _ = review_best.get(sid, (-1.0, 0.0))
+                    if score > prev_score:
+                        review_best[sid] = (score, float(quality or 0.0))
                     continue
-                score = float(sims[frame_index][det_index, student_index(sid)])
                 record = student_status[sid]
                 if score > record["score"]:
                     record["score"] = round(score, 4)
                     record["quality"] = round(float(quality or 0.0), 4)
-                record["frames_hit"] += 1
+                accepted_frames[sid].add(frame_index)
         for sid, record in student_status.items():
+            record["frames_hit"] = len(accepted_frames[sid])
             if record["score"] >= accept_threshold:
                 record["status"] = "present"
-            elif record["frames_hit"] or sid in review_sids:
+            elif record["frames_hit"] or review_frames[sid]:
                 record["status"] = "needs_review"
+                if not record["frames_hit"] and sid in review_best:
+                    r_score, r_quality = review_best[sid]
+                    record["score"] = round(r_score, 4)
+                    record["quality"] = round(r_quality, 4)
+                    record["frames_hit"] = len(review_frames[sid])
     elif mode == "quality_weighted_embedding_cluster":
-        tracks = _cluster_tracks(frames)
-        track_embeddings = [track["embedding"] for track in tracks]
-        matrix, _ = build_similarity_matrix(
-            track_embeddings, student_gallery, template_strategy, top_k
+        # Cluster mode decides per *track*, not per detection, so every detection
+        # starts unmatched and inherits its track's decision below. Detections
+        # filtered out by ``min_quality`` (or left unclustered) stay unmatched.
+        per_frame = [
+            [
+                {
+                    "det_index": det_index,
+                    "matched_student_id": None,
+                    "status": "unmatched",
+                    "score": 0.0,
+                    "margin": 0.0,
+                    "top_candidates": [],
+                }
+                for det_index in range(len(frame.get("detections", [])))
+            ]
+            for frame in frames
+        ]
+        tracks = (
+            precomputed_tracks
+            if precomputed_tracks is not None
+            else _cluster_tracks(frames, min_quality=min_quality)
         )
+        if precomputed_track_sim is not None:
+            matrix = precomputed_track_sim
+        else:
+            track_embeddings = [track["embedding"] for track in tracks]
+            matrix, _ = build_similarity_matrix(
+                track_embeddings, student_gallery, template_strategy, top_k
+            )
         decisions = assign_single_frame(
             matrix,
             student_ids,
@@ -389,14 +478,16 @@ def fuse_multi_frame(
             record = student_status[sid]
             if decision["score"] > record["score"]:
                 record["score"] = decision["score"]
-                record["quality"] = round(float(tracks[track_index]["quality"]), 4)
+                record["quality"] = round(float(tracks[track_index]["quality"] or 0.0), 4)
             record["frames_hit"] = max(record["frames_hit"], tracks[track_index]["count"])
             if decision["status"] == "present":
                 record["status"] = "present"
             elif decision["status"] == "needs_review" and record["status"] == "absent":
                 record["status"] = "needs_review"
         # Rewrite per-frame decisions so every detection inherits its track's
-        # final status (annotation and UI colours).
+        # final status (annotation and UI colours). ``margin`` and
+        # ``top_candidates`` are copied too, otherwise the UI inspector and
+        # ``evaluate_frames`` read a stale candidate list.
         for track_index, track in enumerate(tracks):
             if track_index >= len(decisions):
                 continue
@@ -405,7 +496,13 @@ def fuse_multi_frame(
                 frame_index, det_index = member
                 frame_decisions = per_frame[frame_index]
                 if det_index < len(frame_decisions):
-                    for field in ("status", "matched_student_id", "score"):
+                    for field in (
+                        "status",
+                        "matched_student_id",
+                        "score",
+                        "margin",
+                        "top_candidates",
+                    ):
                         frame_decisions[det_index][field] = track_decision[field]
     else:
         raise ValueError(f"Unknown multi-frame fusion mode: {mode}")
@@ -417,17 +514,29 @@ def fuse_multi_frame(
     }
 
 
-def _cluster_tracks(frames: list[dict]) -> list[dict]:
-    """Greedy cross-frame track clustering (spatial IoU + cosine >= 0.55)."""
+def _cluster_tracks(frames: list[dict], *, min_quality: float = 0.0) -> list[dict]:
+    """Greedy cross-frame track clustering (spatial IoU + cosine >= 0.55).
+
+    Quality weights each detection's contribution to the track centroid.
+    Unmeasured quality (``None``) is kept distinct and weighted at 1.0, and
+    detections below ``min_quality`` are dropped before clustering. The centroid
+    is maintained as an *unnormalized* weighted sum so the reduced magnitude of
+    non-collinear sums is not discarded (which used to over-weight earlier
+    frames and make clustering order-dependent).
+    """
     tracks: list[dict] = []
     for frame_index, frame in enumerate(frames):
         detections = frame.get("detections", [])
         width = float(frame.get("width") or 0)
         height = float(frame.get("height") or 0)
         for det_index, det in enumerate(detections):
+            raw_quality = det.get("quality")
+            if raw_quality is not None and float(raw_quality) < min_quality:
+                continue
+            quality = float(raw_quality) if raw_quality is not None else None
+            weight = max(quality, 1e-3) if quality is not None else 1.0
             box = _normalized_box(np.asarray(det["bbox"], dtype=np.float32), width, height)
             embedding = l2_normalize(np.asarray(det["embedding"], dtype=np.float32).reshape(-1))
-            quality = float(det.get("quality") or 0.0)
 
             best_track: dict | None = None
             best_score = -1.0
@@ -447,9 +556,11 @@ def _cluster_tracks(frames: list[dict]) -> list[dict]:
             if best_track is None:
                 tracks.append(
                     {
+                        "weighted_sum": embedding * weight,
                         "centroid": embedding.copy(),
-                        "box": box,
-                        "weight": max(quality, 1e-3),
+                        "box_sum": box.copy(),
+                        "box": box.copy(),
+                        "weight": weight,
                         "quality": quality,
                         "count": 1,
                         "members": [(frame_index, det_index)],
@@ -457,17 +568,20 @@ def _cluster_tracks(frames: list[dict]) -> list[dict]:
                     }
                 )
             else:
-                weight = max(quality, 1e-3)
                 best_track["weight"] += weight
-                best_track["centroid"] = l2_normalize(
-                    best_track["centroid"] * (best_track["weight"] - weight)
-                    + embedding * weight
-                )
-                best_track["quality"] = max(best_track["quality"], quality)
+                best_track["weighted_sum"] = best_track["weighted_sum"] + embedding * weight
+                best_track["centroid"] = l2_normalize(best_track["weighted_sum"])
+                if quality is not None:
+                    best_track["quality"] = (
+                        quality
+                        if best_track["quality"] is None
+                        else max(best_track["quality"], quality)
+                    )
                 best_track["count"] += 1
                 best_track["members"].append((frame_index, det_index))
                 best_track["frame_indices"].add(frame_index)
-                best_track["box"] = (best_track["box"] + box) / 2.0
+                best_track["box_sum"] = best_track["box_sum"] + box
+                best_track["box"] = best_track["box_sum"] / best_track["count"]
 
     for track in tracks:
         track["embedding"] = track["centroid"]

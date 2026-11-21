@@ -8,14 +8,17 @@ parameter change never requires re-uploading images.
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import re
 import shutil
+import tempfile
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 
-import cv2
-import numpy as np
+from PIL import Image, ImageOps
 
 from facelab import matching
 from facelab.cache import sha256_bytes
@@ -70,24 +73,41 @@ def create_dataset(
     try:
         frame_records = []
         for index, (data, filename) in enumerate(frames):
-            image = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Frame {filename or index + 1} could not be decoded")
-            height, width = image.shape[:2]
             extension = ".jpg"
             if filename and "." in filename:
                 extension = "." + filename.rsplit(".", 1)[-1].lower()
                 if extension not in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
                     extension = ".jpg"
+            # Decode with the same EXIF-orientation handling as inference
+            # (``face.image_to_bgr``): otherwise manifest width/height and the
+            # browser's rendered image disagree with inference pixel coordinates
+            # on rotated phone photos.
+            try:
+                with Image.open(io.BytesIO(data)) as raw_image:
+                    orientation = raw_image.getexif().get(274, 1)
+                    oriented = ImageOps.exif_transpose(raw_image)
+                    width, height = oriented.size
+                    if orientation != 1:
+                        buffer = io.BytesIO()
+                        fmt = {".png": "PNG", ".webp": "WEBP", ".bmp": "BMP"}.get(
+                            extension, "JPEG"
+                        )
+                        save_kwargs = {"quality": 95} if fmt == "JPEG" else {}
+                        oriented.convert("RGB").save(buffer, format=fmt, **save_kwargs)
+                        stored_bytes = buffer.getvalue()
+                    else:
+                        stored_bytes = data
+            except Exception as exc:
+                raise ValueError(f"Frame {filename or index + 1} could not be decoded") from exc
             frame_id = f"frame_{index + 1:02d}"
             stored_name = f"{frame_id}{extension}"
-            (frames_dir / stored_name).write_bytes(data)
+            (frames_dir / stored_name).write_bytes(stored_bytes)
             frame_records.append(
                 {
                     "frame_id": frame_id,
                     "filename": f"frames/{stored_name}",
                     "original_name": filename,
-                    "sha256": sha256_bytes(data),
+                    "sha256": sha256_bytes(stored_bytes),
                     "width": int(width),
                     "height": int(height),
                 }
@@ -129,7 +149,19 @@ def create_dataset(
                 "annotated_boxes": boxes,
             },
         }
-        manifest_path(identifier).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        m_path = manifest_path(identifier)
+        tmp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=m_path.parent, suffix=".tmp", delete=False
+            ) as handle:
+                tmp_name = handle.name
+                json.dump(manifest, handle, indent=2)
+            os.replace(tmp_name, m_path)
+        except Exception:
+            if tmp_name:
+                Path(tmp_name).unlink(missing_ok=True)
+            raise
     except Exception:
         shutil.rmtree(target, ignore_errors=True)
         raise
@@ -202,10 +234,17 @@ def frame_paths(dataset_id: str, manifest: dict | None = None) -> list[tuple[str
 
 
 def _prune_datasets(keep: int | None = None) -> None:
-    keep = settings.datasets_to_keep if keep is None else keep
+    keep = max(0, int(settings.datasets_to_keep if keep is None else keep))
     if not settings.datasets_dir.exists():
         return
-    folders = [path for path in settings.datasets_dir.iterdir() if path.is_dir()]
-    folders.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for stale in folders[keep:]:
+    folders: list[tuple[float, Path]] = []
+    for path in settings.datasets_dir.iterdir():
+        if not path.is_dir():
+            continue
+        try:
+            folders.append((path.stat().st_mtime, path))
+        except OSError:
+            continue
+    folders.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in folders[keep:]:
         shutil.rmtree(stale, ignore_errors=True)

@@ -290,7 +290,8 @@ most useful ones:
 | `FACELAB_ASSIGNMENT_MODE` | `hungarian` | `hungarian`, `greedy`, `margin` |
 | `FACELAB_MULTI_FRAME_FUSION` | `k_of_n_voting` | Burst fusion strategy |
 | `FACELAB_BENCHMARK_DET_SIZES` | `640,1024,1280` | Sweep resolutions |
-| `FACELAB_ONNX_PROVIDERS` | auto | `CUDAExecutionProvider,CPUExecutionProvider` |
+| `FACELAB_ONNX_PROVIDERS` | auto | `CUDAExecutionProvider,CPUExecutionProvider`; idle models are evicted and the GPU retried before any CPU fallback |
+| `FACELAB_FETCH_STRICT` | `0` | Container entrypoint exits instead of warning when model fetching fails |
 | `FACELAB_API_TOKEN` | *(empty)* | Require a bearer token on writes |
 | `FACELAB_CORS_ORIGINS` | localhost | Comma-separated allowlist |
 

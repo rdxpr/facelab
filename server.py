@@ -47,7 +47,6 @@ from facelab.config import (
     STATIC_DIR,
     default_detector_for_pack,
     default_recognizer_for_pack,
-    detector_registry,
     recognizer_registry,
     settings,
 )
@@ -1297,8 +1296,14 @@ def _model_info_sync(name: str | None = None, detector_id: str | None = None,
         started = time.perf_counter()
         _require_detector(detector_id)
         _require_recognizer(recognizer_id)
+        unloaded = None
         try:
-            engine.warm_up(detector_id, recognizer_id, settings.face_scan_det_size, "none")
+            with _model_lock:
+                # Selection is the natural eviction point: keep only the active
+                # pair on the GPU so the newly chosen model initializes quickly
+                # instead of competing with idle cached sessions for VRAM.
+                unloaded = engine.unload_other_models(detector_id, recognizer_id)
+                engine.warm_up(detector_id, recognizer_id, settings.face_scan_det_size, "none")
         except engine.FaceEngineUnavailable as exc:
             return {"ready": False, "error": str(exc), "detectorId": detector_id,
                     "recognizerId": recognizer_id}
@@ -1309,6 +1314,7 @@ def _model_info_sync(name: str | None = None, detector_id: str | None = None,
             "detector": KNOWN_DETECTORS[detector_id],
             "recognizer": KNOWN_RECOGNIZERS[recognizer_id],
             "providers": settings.provider_list,
+            "unloaded": unloaded,
             "loadMs": round((time.perf_counter() - started) * 1000),
             "python": sys.version.split()[0],
         }
@@ -1909,6 +1915,12 @@ def _run_sweep_sync(request: SweepRequest) -> dict:
 # --------------------------------------------------------------------------- #
 app = FastAPI(title="FaceLab", version="0.3.0")
 
+# Storage directories must exist before the StaticFiles mounts below resolve
+# their directories, and before ``_load_state()`` reads the roster. This used to
+# run as an import side effect of ``facelab.config``, which wiped the ephemeral
+# data dir for *any* process that imported the config (pytest, helper scripts).
+settings.prepare_dirs()
+
 if settings.cors_origin_list:
     app.add_middleware(
         CORSMiddleware,
@@ -2218,7 +2230,9 @@ def sweep_result(
 
     # Attendance ground truth is unknown for ad-hoc scans, so report the
     # per-student decisions and per-face statuses only.
-    fusion_frames = bench._fusion_frames(frames, variant)
+    fusion_frames = bench._fusion_frames(
+        frames, variant, embedding_dim=bench._gallery_dim(gallery)
+    )
     fused = matching.fuse_multi_frame(
         fusion_frames,
         gallery,

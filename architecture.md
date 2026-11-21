@@ -283,6 +283,16 @@ present, annotatedBoxes, thumbUrl}`. Dataset ids must match
 - `_RECOGNIZERS` keyed `(recognizer_id, tuple(provider_list))`.
 - `_QUALITY` / `_POSE` caches; a predictor is cached as `None` if weights are not
   cached locally (avoids lazy downloads inside requests).
+- ONNX-backed model construction uses `_with_cpu_fallback`: when accelerator
+  session initialization fails (including GPU-memory exhaustion) it first calls
+  `_evict_idle_models`, which drops every cached session except the one being
+  built and then `gc.collect()`s so ONNX Runtime releases the idle sessions'
+  CUDA arenas; the accelerator initialization is then retried. Only if the new
+  model still does not fit is it rebuilt with CPU-only providers. A providers
+  list with no CPU entry is never silently downgraded.
+- `unload_other_models(detector_id, recognizer_id)` applies the same eviction at
+  model-selection time (`GET /api/model`), so choosing a model keeps only the
+  active pair warm on the GPU.
 
 ### 5.2 Availability
 - File-backed: `resolve_model_file(entry)` searches `models/<name>` then
@@ -386,8 +396,12 @@ recognizer-independent norm fallback). Pose is optional. Returns
 
 ### 5.9 Warm-up & annotation
 - `warm_up(detector_id, recognizer_id, det_size, tiling_mode, det_thresh,
-  nms_thresh)` runs one throwaway `analyze_frame` (blank 480×640 image) and
-  returns `{warmup_ms}`; it re-raises `FaceEngineUnavailable`, swallows others.
+  nms_thresh)` runs one throwaway `analyze_frame` (blank 480×640 image), then
+  explicitly warms the recognizer because the blank frame has no face crop, and
+  returns `{warmup_ms}`. `GET /api/model` evicts every other cached model and
+  runs this under `_model_lock` before reporting the pair ready. Initialization/
+  inference failures are surfaced as `FaceEngineUnavailable` rather than making
+  an unusable model look ready.
 - `annotate_classroom_photo(image_bgr, matches, label_unknown=False)`: draws a box
   per match (green present / amber review / red unknown), with a filled label tag.
   Present → `Name (score)`, review → `? Name (score)`, unknown → `"Unknown"` only

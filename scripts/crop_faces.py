@@ -255,6 +255,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.max_faces is not None and args.max_faces < 1:
+        raise SystemExit("[crop_faces] --max-faces must be at least 1")
     input_dir = Path(args.input).expanduser().resolve()
     output_dir = Path(args.output).expanduser().resolve()
     if not input_dir.is_dir():
@@ -310,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.dominant:
             faces = faces[:1]
-        if args.max_faces:
+        if args.max_faces is not None:
             faces = faces[: args.max_faces]
         if not faces:
             counts["skipped"] += 1
@@ -337,7 +339,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.dry_run:
                 print(f"[crop_faces] would write {crop_rel}")
             elif args.overwrite or not crop_path.is_file():
-                cv2.imwrite(str(crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, args.quality])
+                if not cv2.imwrite(
+                    str(crop_path), crop, [cv2.IMWRITE_JPEG_QUALITY, args.quality]
+                ):
+                    print(f"[crop_faces] failed to write {crop_rel}", file=sys.stderr)
 
             aligned_rel = None
             if args.aligned and det.kps is not None:
@@ -348,9 +353,10 @@ def main(argv: list[str] | None = None) -> int:
                 if args.dry_run:
                     print(f"[crop_faces] would write {aligned_rel}")
                 elif args.overwrite or not aligned_path.is_file():
-                    cv2.imwrite(
+                    if not cv2.imwrite(
                         str(aligned_path), aligned, [cv2.IMWRITE_JPEG_QUALITY, args.quality]
-                    )
+                    ):
+                        print(f"[crop_faces] failed to write {aligned_rel}", file=sys.stderr)
 
             score = round(float(det.score), 4)
             record = {
@@ -366,7 +372,13 @@ def main(argv: list[str] | None = None) -> int:
             records.append(record)
             flat_rows.append({"source": path.name, "sourceWidth": width,
                               "sourceHeight": height, **record})
-            entries.append({"label": crop_name, "image": crop, "score": score})
+            # Only keep thumbnails when a contact sheet will be written, and
+            # pre-resize now: holding a full-resolution crop per face for a large
+            # photo set used gigabytes of RAM.
+            if args.contact_sheet and not args.dry_run and len(entries) < CONTACT_SHEET_MAX:
+                entries.append(
+                    {"label": crop_name, "image": _fit(crop, 160, 160), "score": score}
+                )
 
         counts["faces"] += len(records)
         manifest_images.append(

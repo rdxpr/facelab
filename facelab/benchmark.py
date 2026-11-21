@@ -75,7 +75,18 @@ _EMBEDDING_FIELDS = {
 }
 
 
-def select_embedding(detection: dict, variant: str = "flip_avg") -> np.ndarray:
+def _gallery_dim(gallery: dict[int, np.ndarray]) -> int:
+    """Embedding dimension inferred from the gallery (512 when it is empty)."""
+    for templates in gallery.values():
+        arr = np.asarray(templates)
+        if arr.size:
+            return int(arr.shape[-1])
+    return 512
+
+
+def select_embedding(
+    detection: dict, variant: str = "flip_avg", embedding_dim: int = 512
+) -> np.ndarray:
     """Pick the detection embedding to score with, falling back to raw.
 
     ``lowres_aug`` is a *gallery-side* augmentation: enrolment stores a
@@ -95,17 +106,19 @@ def select_embedding(detection: dict, variant: str = "flip_avg") -> np.ndarray:
         array = np.asarray(value, dtype=np.float32).reshape(-1)
         if array.size:
             return matching.l2_normalize(array)
-    return np.zeros(512, dtype=np.float32)
+    return np.zeros(embedding_dim, dtype=np.float32)
 
 
-def _fusion_frames(frames: Sequence[dict], variant: str) -> list[dict]:
+def _fusion_frames(
+    frames: Sequence[dict], variant: str, embedding_dim: int = 512
+) -> list[dict]:
     output = []
     for frame in frames:
         detections = []
         for det in frame.get("detections", []):
             detections.append(
                 {
-                    "embedding": select_embedding(det, variant),
+                    "embedding": select_embedding(det, variant, embedding_dim=embedding_dim),
                     "bbox": det.get("bbox"),
                     # Keep None: "not measured" must not be gated like quality 0.
                     "quality": det.get("quality_score"),
@@ -264,9 +277,17 @@ def evaluate_frames(
     k: int = 2,
     min_quality: float = 0.0,
     annotated_boxes: Sequence[dict] | None = None,
+    precomputed_fusion_frames: list[dict] | None = None,
+    precomputed_sims: Sequence[np.ndarray] | None = None,
+    precomputed_tracks: list[dict] | None = None,
+    precomputed_track_sim: np.ndarray | None = None,
 ) -> dict:
     """Score one dataset configuration end to end (pure NumPy, no inference)."""
-    fusion_frames = _fusion_frames(frames, variant)
+    fusion_frames = (
+        precomputed_fusion_frames
+        if precomputed_fusion_frames is not None
+        else _fusion_frames(frames, variant, embedding_dim=_gallery_dim(gallery))
+    )
     fused = matching.fuse_multi_frame(
         fusion_frames,
         gallery,
@@ -279,6 +300,9 @@ def evaluate_frames(
         top_k=top_k,
         k=k,
         min_quality=min_quality,
+        precomputed_sims=precomputed_sims,
+        precomputed_tracks=precomputed_tracks,
+        precomputed_track_sim=precomputed_track_sim,
     )
     predicted = [
         student_id
@@ -293,19 +317,33 @@ def evaluate_frames(
         if record["status"] == "present"
     ]
     # Highest gallery similarity seen on a detection the fusion did NOT call
-    # present. Any non-present decision counts: a stranger sitting in the review
-    # band is the most dangerous impostor and must not be excluded.
+    # present, excluding similarities to genuinely present students who were
+    # missed in that frame (otherwise a high threshold's false negatives are
+    # misreported as impostors). Any other non-present decision counts: a
+    # stranger sitting in the review band is the most dangerous impostor.
+    present_truth = set(present_student_ids)
     max_impostor = 0.0
     for frame_decisions in fused["per_frame"]:
+        matched_in_frame = {
+            dec.get("matched_student_id")
+            for dec in frame_decisions
+            if dec
+            and dec.get("status") == "present"
+            and dec.get("matched_student_id") is not None
+        }
+        missed_genuine = present_truth - matched_in_frame
         for decision in frame_decisions:
             if not decision or decision.get("status") == "present":
                 continue
-            scores = [float(decision.get("score") or 0.0)]
-            scores += [
-                float(item.get("score") or 0.0)
-                for item in (decision.get("top_candidates") or [])
-            ]
-            max_impostor = max(max_impostor, *scores)
+            scores: list[float] = []
+            matched_sid = decision.get("matched_student_id")
+            if matched_sid is not None and matched_sid not in missed_genuine:
+                scores.append(float(decision.get("score") or 0.0))
+            for item in decision.get("top_candidates") or []:
+                if item.get("student_id") not in missed_genuine:
+                    scores.append(float(item.get("score") or 0.0))
+            if scores:
+                max_impostor = max(max_impostor, *scores)
 
     detection = stratified_metrics(frames, fused["per_frame"], annotated_boxes or [])
     return {
@@ -359,7 +397,43 @@ def threshold_curve_datasets(
     Evaluating datasets separately avoids the frame-id collisions and mixed
     present-rosters you get from concatenating every dataset's frames into one
     call.
+
+    Similarity matrices (and cluster tracks) do not depend on the swept
+    thresholds, so they are computed once per dataset up front instead of once
+    per threshold step.
     """
+    if step <= 0:
+        raise ValueError("step must be positive")
+    if low > high:
+        raise ValueError("low must be less than or equal to high")
+
+    dim = _gallery_dim(gallery)
+    prepared = []
+    for frames, present_ids in datasets:
+        f_frames = _fusion_frames(frames, variant, embedding_dim=dim)
+        sims = None
+        tracks = None
+        track_sim = None
+        if fusion_mode == "quality_weighted_embedding_cluster":
+            tracks = matching._cluster_tracks(f_frames, min_quality=min_quality)
+            track_sim, _ = matching.build_similarity_matrix(
+                [track["embedding"] for track in tracks],
+                gallery,
+                template_strategy,
+                top_k,
+            )
+        else:
+            sims = [
+                matching.build_similarity_matrix(
+                    [det["embedding"] for det in frame.get("detections", [])],
+                    gallery,
+                    template_strategy,
+                    top_k,
+                )[0]
+                for frame in f_frames
+            ]
+        prepared.append((frames, present_ids, f_frames, sims, tracks, track_sim))
+
     rows = []
     threshold = low
     while threshold <= high + 1e-9:
@@ -383,8 +457,12 @@ def threshold_curve_datasets(
                 fusion_mode=fusion_mode,
                 k=k,
                 min_quality=min_quality,
+                precomputed_fusion_frames=f_frames,
+                precomputed_sims=sims,
+                precomputed_tracks=tracks,
+                precomputed_track_sim=track_sim,
             )
-            for frames, present_ids in datasets
+            for frames, present_ids, f_frames, sims, tracks, track_sim in prepared
         ]
         rows.append({"threshold": round(threshold, 4), **aggregate_attendance(results)})
         threshold = round(threshold + step, 4)

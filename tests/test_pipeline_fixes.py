@@ -308,3 +308,17 @@ def test_stratified_recall_does_not_depend_on_annotation_order():
 
     assert detected([first, second]) == 2
     assert detected([second, first]) == 2
+
+def test_detect_with_sahi_preserves_missing_keypoints():
+    # 400x400 is smaller than the tile size, so the only tile is the full frame
+    # and the base detection wins the merge with its keypoints intact.
+    image = np.zeros((400, 400, 3), dtype=np.uint8)
+
+    def fake_detect(_img):
+        return [face.Detection(bbox=np.array([10, 10, 90, 90], dtype=np.float32), score=0.9, kps=None)]
+
+    detections = face.detect_with_sahi(
+        image, fake_detect, tile_size=640, tiling_mode="sahi_upper_band"
+    )
+    assert len(detections) == 1
+    assert detections[0].kps is None

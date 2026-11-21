@@ -12,7 +12,8 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/tmp \
     FACELAB_ENV=prod \
     FACELAB_HOST=0.0.0.0 \
-    PORT=8010
+    PORT=8010 \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
@@ -21,11 +22,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --no-cache-dir --upgrade pip \
-    && pip install --no-cache-dir -r requirements.txt
+# Use uv so [tool.uv] override-dependencies keeps the CPU onnxruntime wheel out
+# of the environment that already has onnxruntime-gpu (plain pip ignores
+# pyproject.toml, installing both). --no-dev keeps pytest out of the image.
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv \
+    && uv sync --frozen --no-dev
 
 COPY . .
+RUN useradd -r -u 10001 -d /tmp facelab && chown -R facelab:facelab /app
+USER facelab
 
 EXPOSE 8010
 

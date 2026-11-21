@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -114,9 +116,25 @@ def has_analysis(key: str) -> bool:
 def save_analysis(payload: dict) -> Path:
     path = cache_path(payload["cache_key"])
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".json.tmp")
-    temp.write_text(json.dumps(_encode(payload)), encoding="utf-8")
-    temp.replace(path)
+    # A unique temp file per write: a fixed ``<key>.json.tmp`` let two writers to
+    # the same key clobber each other's partial JSON.
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.stem}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(_encode(payload), handle)
+        os.replace(tmp_name, path)
+    except Exception:
+        if tmp_name:
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -137,17 +155,22 @@ def load_analysis(key: str) -> dict | None:
 
 def prune_cache(keep: int | None = None) -> int:
     """Delete the oldest cached artifacts and their aligned crop JPEGs."""
-    keep = settings.cache_entries_to_keep if keep is None else keep
+    keep = max(0, int(settings.cache_entries_to_keep if keep is None else keep))
     if not settings.cache_dir.exists():
         return 0
-    files = sorted(
-        settings.cache_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    for stale in files[keep:]:
+    entries: list[tuple[float, Path]] = []
+    for path in settings.cache_dir.glob("*.json"):
+        try:
+            entries.append((path.stat().st_mtime, path))
+        except OSError:
+            # The file vanished between glob and stat (e.g. a concurrent reset).
+            continue
+    entries.sort(key=lambda item: item[0], reverse=True)
+    for _, stale in entries[keep:]:
         for crop in settings.crops_dir.glob(f"{stale.stem}_det*.jpg"):
             crop.unlink(missing_ok=True)
         stale.unlink(missing_ok=True)
-    return max(0, len(files) - keep)
+    return max(0, len(entries) - keep)
 
 
 def _encode(payload: dict) -> dict:

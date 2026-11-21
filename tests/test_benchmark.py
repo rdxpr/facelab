@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from facelab import benchmark, matching
+from facelab import benchmark
 
 
 def unit(*values):
@@ -293,3 +293,29 @@ def test_aggregate_detection_sums_buckets():
     assert merged["detected_faces"] == 3
     assert merged["identified_faces"] == 2
     assert merged["buckets"]["large"]["detection_recall"] == 1.0
+
+
+def test_max_impostor_excludes_missed_genuine_student():
+    students = {
+        1: make_student(1, [1.0, 0.0, 0.0]),
+        2: make_student(2, [0.0, 1.0, 0.0]),
+    }
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    # Student 1 is genuinely present but falls below the high threshold (0.85);
+    # student 2 is absent and has 0.30 similarity to the face.
+    frames = [frame("frame_01", [det(unit(0.75, 0.30, 0.59))])]
+    result = benchmark.evaluate_frames(
+        frames, gallery, [1], variant="raw", accept_threshold=0.85, review_threshold=0.4, k=1
+    )
+    assert result["max_impostor_sim"] == pytest.approx(0.30, abs=0.02)
+
+
+def test_evaluate_frames_handles_non_512_missing_embeddings():
+    students = {1: make_student(1, [1.0, 0.0, 0.0])}
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    frames = [frame("frame_01", [{"bbox": [0, 0, 80, 80], "embedding": None}])]
+    result = benchmark.evaluate_frames(
+        frames, gallery, [1], variant="raw", accept_threshold=0.5, review_threshold=0.4, k=1
+    )
+    assert result["attendance"]["fn"] == 1
+    assert result["attendance"]["fp"] == 0
