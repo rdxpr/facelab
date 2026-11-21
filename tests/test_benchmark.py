@@ -319,3 +319,19 @@ def test_evaluate_frames_handles_non_512_missing_embeddings():
     )
     assert result["attendance"]["fn"] == 1
     assert result["attendance"]["fp"] == 0
+
+
+def test_max_impostor_includes_false_positive_present_match():
+    students = {
+        1: make_student(1, [1.0, 0.0, 0.0]),
+        2: make_student(2, [0.0, 1.0, 0.0]),
+    }
+    gallery = benchmark.build_gallery(students, "insightface:w600k_r50", "raw")
+    # Only student 1 is genuinely present; a stranger matches absent student 2
+    # above accept_threshold (false positive) and must still count as an impostor.
+    frames = [frame("frame_01", [det(unit(0.0, 1.0, 0.0))])]
+    result = benchmark.evaluate_frames(
+        frames, gallery, [1], variant="raw", accept_threshold=0.5, review_threshold=0.4, k=1
+    )
+    assert result["attendance"]["fp"] == 1
+    assert result["max_impostor_sim"] == pytest.approx(1.0, abs=1e-3)

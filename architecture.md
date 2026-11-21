@@ -240,7 +240,7 @@ with `.height`. `analyze_frame` expands each detection to a cache payload:
 
 `fused["students"][sid]` (fusion output): `{status: "present"|"needs_review"|
 "absent", score, frames_hit, quality}`. `fused["per_frame"]` is the per-frame
-decision list (cluster mode rewrites status/id/score to the track decision).
+decision list (cluster mode rewrites status/id/score/margin/top_candidates).
 
 ### 4.5 Scans / results
 Saved to `.data/results/<scanId>.json` and frames to `.data/scans/<scanId>/`.
@@ -452,13 +452,15 @@ Builds per-frame decisions + similarity matrices, then per mode:
 - `max_with_margin_gate`: per detection, skip below `min_quality`; a detection
   that is not `present` or fails the margin gate is remembered as `review_sids`;
   otherwise its gallery similarity updates the student's score/quality/frames.
-  Final: present if score ≥ accept, else review if `frames_hit or sid in review_sids`.
+  Final: present if `frames_hit > 0` and score ≥ accept, else review if
+  `frames_hit or sid in review_sids`.
 - `quality_weighted_embedding_cluster`: `_cluster_tracks` greedily groups
-  detections across frames by cosine ≥ 0.55 **and** normalized-box IoU ≥ 0.3,
-  at most one face per frame per track; track centroid is quality-weighted
-  (weights `max(quality, 1e-3)`, so zero-quality seeds are stable). Tracks are
-  matched once; their status/id/score are copied back onto every member detection
-  for UI/annotation consistency.
+  detections passing `min_quality` across frames by cosine ≥ 0.55 **and**
+  normalized-box IoU ≥ 0.3, at most one face per frame per track; track centroid
+  uses an unnormalized quality-weighted sum (unmeasured `None` quality weighted
+  at `1.0`) and a running-mean box. Tracks are matched once; their
+  status/id/score/margin/top_candidates are copied back onto every member
+  detection for UI/annotation consistency.
 
 ### 6.4 Metrics
 `attendance_metrics(predicted_ids, truth_ids)` → `{tp, fp, fn, precision,
@@ -497,8 +499,9 @@ recall, f1}` (rounded 4dp).
 ### 7.3 Evaluation (`evaluate_frames`)
 Builds fusion frames, calls `fuse_multi_frame`, computes attendance metrics,
 `present_sims` (fused scores of present students) and `max_impostor` (highest
-score/top-candidate score on any **non-present** decision — review-band strangers
-count), stratified metrics, and faces detected. Returns `attendance`,
+score/top-candidate score on impostor detections, including false-positive
+present matches to absent students while excluding missed genuine students),
+stratified metrics, and faces detected. Returns `attendance`,
 `present_sim_sum/n`, `mean_present_sim`, `max_impostor_sim`,
 `predicted_student_ids`, `students`, `detection`, `per_frame`, `faces_detected`.
 
@@ -587,7 +590,7 @@ run/sweep, reset) plus `GET /api/model`. Read routes are open.
 | GET | `/api/state` | – | roster, totals, settings, registry |
 | GET | `/api/registry` | – | availability + license table |
 | GET | `/api/models` | – | packs + registry + providers |
-| GET | `/api/model?name=&detector=&recognizer=` | – | warm/check a pair or legacy pack |
+| GET | `/api/model?name=&detector=&recognizer=` | ✔ | warm/check a pair or legacy pack |
 | GET | `/api/cache` | – | cache entry/byte/crop counts |
 | POST | `/api/people` | ✔ | enroll (`images[]`, `name`, `recognizer`, `recognizers[]`) |
 | POST | `/api/people/{id}/photos` | ✔ | add photos |
@@ -885,7 +888,7 @@ No ONNX required; all pure Python.
 - `test_crop_faces.py`: padded-box geometry/clamping/non-square, name sanitizing,
   recursive base names.
 
-Run: `.venv/bin/python -m pytest -q` (currently **73+ passing**).
+Run: `.venv/bin/python -m pytest -q` (currently **82 passing**).
 
 ---
 
@@ -989,8 +992,8 @@ sweeps read cached frames ◄── detector/recognizer/params must match cache 
 18. **Inspector/lightbox layers.** Inspector is fixed at body level (z 50), above
     the lightbox (z 40) and below the toast (z 60). Keep it outside the hidden
     `<main>` panels.
-19. **Auth scope.** Only mutating routes use `require_token`. Sweeps are mutating
-    (they read the gallery and return names) and are guarded.
+19. **Auth scope.** Mutating routes (including sweeps) and `GET /api/model`
+    (evicts/warms GPU models) use `require_token`. Other read routes are open.
 20. **Path guards.** Result/benchmark ids are hex/dash-only; dataset ids match
     `^[A-Za-z0-9_-]{1,80}$`; media is served from dedicated mounts.
 21. **onnxruntime warning** (`{1,512}` vs `{N,512}` for ArcFace output) is benign;

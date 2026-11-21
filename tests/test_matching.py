@@ -393,3 +393,16 @@ def test_cluster_mode_respects_min_quality_and_updates_candidates():
     assert filtered["students"]["a"]["status"] == "absent"
     assert filtered["per_frame"][0][0]["status"] == "unmatched"
     assert filtered["per_frame"][0][0]["top_candidates"] == []
+
+
+def test_max_gate_zero_accept_threshold_does_not_mark_absent_students_present():
+    gallery = {"absent": unit([1.0, 0.0, 0.0])[None, :]}
+    frames = [_frame([])]
+    fused = matching.fuse_multi_frame(
+        frames,
+        gallery,
+        mode="max_with_margin_gate",
+        accept_threshold=0.0,
+        review_threshold=0.0,
+    )
+    assert fused["students"]["absent"]["status"] == "absent"

@@ -316,11 +316,10 @@ def evaluate_frames(
         for record in fused["students"].values()
         if record["status"] == "present"
     ]
-    # Highest gallery similarity seen on a detection the fusion did NOT call
-    # present, excluding similarities to genuinely present students who were
-    # missed in that frame (otherwise a high threshold's false negatives are
-    # misreported as impostors). Any other non-present decision counts: a
-    # stranger sitting in the review band is the most dangerous impostor.
+    # Highest gallery similarity seen on an impostor detection — including
+    # false-positive ``present`` matches to absent students, while excluding
+    # similarities to genuinely present students who were missed in that frame
+    # (otherwise a high threshold's false negatives look like impostors).
     present_truth = set(present_student_ids)
     max_impostor = 0.0
     for frame_decisions in fused["per_frame"]:
@@ -333,10 +332,12 @@ def evaluate_frames(
         }
         missed_genuine = present_truth - matched_in_frame
         for decision in frame_decisions:
-            if not decision or decision.get("status") == "present":
+            if not decision:
+                continue
+            matched_sid = decision.get("matched_student_id")
+            if decision.get("status") == "present" and matched_sid in present_truth:
                 continue
             scores: list[float] = []
-            matched_sid = decision.get("matched_student_id")
             if matched_sid is not None and matched_sid not in missed_genuine:
                 scores.append(float(decision.get("score") or 0.0))
             for item in decision.get("top_candidates") or []:

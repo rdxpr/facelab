@@ -2162,6 +2162,7 @@ function wireEvents() {
   let suppressLightboxClick = false;
   lightboxViewport.addEventListener("pointerdown", (event) => {
     if (!state.lightbox || event.button !== 0) return;
+    suppressLightboxClick = false;
     lightboxDrag = {
       x: event.clientX,
       y: event.clientY,
@@ -2181,7 +2182,16 @@ function wireEvents() {
     applyLightboxTransform();
   });
   window.addEventListener("pointerup", () => {
-    if (lightboxDrag?.moved) suppressLightboxClick = true;
+    if (lightboxDrag?.moved) {
+      suppressLightboxClick = true;
+      // Clear on the next tick so releasing outside the viewport (no click
+      // fired on lightboxViewport) never swallows the next real box click.
+      window.setTimeout(() => { suppressLightboxClick = false; }, 0);
+    }
+    lightboxDrag = null;
+    lightboxViewport.classList.remove("dragging");
+  });
+  window.addEventListener("pointercancel", () => {
     lightboxDrag = null;
     lightboxViewport.classList.remove("dragging");
   });

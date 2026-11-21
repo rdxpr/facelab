@@ -396,12 +396,13 @@ def _public_person(person: dict) -> dict:
 
 def _recognizer_usage() -> dict[str, dict]:
     usage: dict[str, dict] = {}
-    for person in _people.values():
-        for photo in person["photos"]:
-            for recognizer_id in (photo.get("embeddings") or {}):
-                entry = usage.setdefault(recognizer_id, {"templates": 0, "people": set()})
-                entry["templates"] += 1
-                entry["people"].add(person["id"])
+    with _state_lock:
+        for person in _people.values():
+            for photo in person["photos"]:
+                for recognizer_id in (photo.get("embeddings") or {}):
+                    entry = usage.setdefault(recognizer_id, {"templates": 0, "people": set()})
+                    entry["templates"] += 1
+                    entry["people"].add(person["id"])
     return {
         name: {"templates": value["templates"], "people": len(value["people"])}
         for name, value in usage.items()
@@ -510,12 +511,13 @@ def _public_state() -> dict:
     with _state_lock:
         people = [_public_person(person) for person in _people.values()]
         usage = _recognizer_usage()
+        next_number = _next_number
     people.sort(key=lambda item: item["number"])
     total_templates = sum(person["templates"] for person in people)
     return {
         "people": people,
         "students": people,
-        "nextNumber": _next_number,
+        "nextNumber": next_number,
         "totals": {"people": len(people), "templates": total_templates},
         "modelUsage": usage,
         "settings": _settings_payload(),

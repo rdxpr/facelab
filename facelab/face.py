@@ -160,6 +160,24 @@ def _with_cpu_fallback(factory, providers: list[str], label: str, *, evict: bool
         return factory(["CPUExecutionProvider"])
 
 
+def _session_providers(model: object, fallback: list[str]) -> list[str]:
+    """Read actual ORT providers from a wrapper's ``.session`` if exposed.
+
+    UniFace wrappers construct their own session, so the requested provider
+    list can differ from the one ONNX Runtime actually selected (e.g. a silent
+    operator/EP fallback). Prefer the session's answer when available.
+    """
+    session = getattr(model, "session", None)
+    if session is not None and hasattr(session, "get_providers"):
+        try:
+            active = list(session.get_providers())
+            if active:
+                return active
+        except Exception:
+            pass
+    return list(fallback)
+
+
 # --------------------------------------------------------------------------- #
 # Path / availability helpers
 # --------------------------------------------------------------------------- #
@@ -556,7 +574,7 @@ class UnifaceDetector(BaseDetector):
         self.id = detector_id
         self.label = entry.get("label", detector_id)
         self.det_size = det_size
-        self.active_providers = active_providers
+        self.active_providers = _session_providers(self.model, active_providers)
 
     def detect(self, image_bgr: np.ndarray) -> list[Detection]:
         faces = self.model.detect(image_bgr)
@@ -748,7 +766,7 @@ class UnifaceRecognizer(BaseRecognizer):
         self.id = recognizer_id
         self.label = entry.get("label", recognizer_id)
         self.embedding_dim = int(entry.get("embedding_dim", 512))
-        self.active_providers = active_providers
+        self.active_providers = _session_providers(self.model, active_providers)
 
     def embed(self, crops: list[np.ndarray]) -> np.ndarray:
         vectors = []

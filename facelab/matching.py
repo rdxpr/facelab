@@ -424,7 +424,7 @@ def fuse_multi_frame(
                 accepted_frames[sid].add(frame_index)
         for sid, record in student_status.items():
             record["frames_hit"] = len(accepted_frames[sid])
-            if record["score"] >= accept_threshold:
+            if record["frames_hit"] and record["score"] >= accept_threshold:
                 record["status"] = "present"
             elif record["frames_hit"] or review_frames[sid]:
                 record["status"] = "needs_review"
