@@ -28,6 +28,7 @@ const state = {
   // scans
   scan: null,
   selectedFrame: 0,
+  frameZoom: null,
   inspector: null,
   liveSweep: null,
   sweepTimer: null,
@@ -42,7 +43,10 @@ const state = {
   datasetPresent: new Set(),
   datasetBoxes: {},
   busy: false,
+  studentsOpen: false,
   toastTimer: null,
+  toastRemaining: 0,
+  toastDeadline: 0,
   settings: {
     acceptThreshold: 0.42,
     reviewThreshold: 0.34,
@@ -159,13 +163,45 @@ const jsonRequest = (body) => ({
   body: JSON.stringify(body),
 });
 
+function _scheduleToastHide(ms) {
+  window.clearTimeout(state.toastTimer);
+  state.toastRemaining = ms;
+  state.toastDeadline = Date.now() + ms;
+  state.toastTimer = window.setTimeout(() => {
+    $("#toast").hidden = true;
+    state.toastRemaining = 0;
+  }, ms);
+}
+function pauseToast() {
+  if ($("#toast").hidden || !state.toastRemaining) return;
+  window.clearTimeout(state.toastTimer);
+  state.toastRemaining = Math.max(400, state.toastDeadline - Date.now());
+}
+function resumeToast() {
+  if ($("#toast").hidden || !state.toastRemaining || document.hidden) return;
+  _scheduleToastHide(state.toastRemaining);
+}
 function toast(message, kind = "") {
   const element = $("#toast");
   element.textContent = message;
   element.className = `toast ${kind}`.trim();
   element.hidden = false;
-  window.clearTimeout(state.toastTimer);
-  state.toastTimer = window.setTimeout(() => { element.hidden = true; }, 4600);
+  _scheduleToastHide(4600);
+}
+function openStudentsDrawer() {
+  state.studentsOpen = true;
+  $("#students-drawer").hidden = false;
+  $("#drawer-backdrop").hidden = false;
+  $("#students-toggle")?.setAttribute("aria-expanded", "true");
+  document.body.classList.add("drawer-open");
+}
+function closeStudentsDrawer() {
+  if (!state.studentsOpen) return;
+  state.studentsOpen = false;
+  $("#students-drawer").hidden = true;
+  $("#drawer-backdrop").hidden = true;
+  $("#students-toggle")?.setAttribute("aria-expanded", "false");
+  document.body.classList.remove("drawer-open");
 }
 
 function remember() {
@@ -346,6 +382,8 @@ function renderPeople() {
   const list = $("#people-list");
   list.innerHTML = "";
   $("#student-count").textContent = String(state.people.length);
+  const btnCount = $("#students-btn-count");
+  if (btnCount) btnCount.textContent = String(state.people.length);
   const templates = state.people.reduce((total, person) => total + person.templates, 0);
   $("#template-total").textContent = plural(templates, "template");
   renderModelUsage();
@@ -651,6 +689,7 @@ async function runScan() {
     const result = await api("/api/scan", { method: "POST", body: scanForm() });
     state.scan = result;
     state.liveSweep = null;
+    state.frameZoom = null;
     closeInspector();
     state.selectedFrame = result.summary.bestIndex >= 0 ? result.summary.bestIndex : 0;
     renderResults();
@@ -745,9 +784,16 @@ async function liveSweep() {
     scan.summary.fusionMode = payload.fusion_mode;
     scan.summary.fusionK = payload.k;
     scan.summary.minQuality = payload.min_quality;
+    const zoomedPerson = state.frameZoom?.personId ?? null;
     renderSummary();
     renderRoster();
     renderFrame();
+    if (zoomedPerson != null) {
+      const frame = scan.frames[state.selectedFrame];
+      const idx = frame?.faces?.findIndex((f) => Number(f.personId) === Number(zoomedPerson)) ?? -1;
+      if (idx >= 0) zoomFrameToFace(idx, zoomedPerson);
+      else resetFrameZoom();
+    }
     if (state.lightbox && state.lightbox.frames === scan.frames) renderLightbox();
     if (state.inspector) {
       openInspector(state.inspector.faceIndex, state.inspector.frame, state.inspector.scope);
@@ -850,8 +896,12 @@ function renderRoster() {
   }
 
   for (const row of $$(".match-row", list)) {
+    const pid = Number(row.dataset.personId);
+    row.classList.toggle("is-focused", state.frameZoom?.personId === pid);
+    row.title = `${row.title} · click to zoom in frame`;
     row.addEventListener("mouseenter", () => setHighlight(row.dataset.personId));
     row.addEventListener("mouseleave", () => setHighlight(null));
+    row.addEventListener("click", () => focusStudentInFrame(pid));
   }
 
   $("#absent-wrap").innerHTML = absent.length
@@ -874,6 +924,7 @@ function renderFrameTabs() {
     button.innerHTML = `Frame <b>${index + 1}</b> <span>${plural(frame.faces.length, "face")}</span>`;
     button.addEventListener("click", () => {
       state.selectedFrame = index;
+      state.frameZoom = null;
       closeInspector();
       renderFrameTabs();
       renderFrame();
@@ -944,6 +995,8 @@ function renderFrame() {
   const index = clamp(state.selectedFrame, 0, scan.frames.length - 1);
   const frame = scan.frames[index];
   renderFrameInto($("#frame-view"), frame, index);
+  const resetBtn = $("#frame-zoom-reset");
+  if (resetBtn) resetBtn.hidden = true;
 
   $("#frame-meta").textContent =
     `${frame.sourceName || `frame ${index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}` +
@@ -953,7 +1006,107 @@ function renderFrame() {
   link.href = frame.annotatedUrl || "#";
 }
 
+function applyFrameZoom() {
+  const zoom = state.frameZoom;
+  const view = $("#frame-view");
+  const media = view?.querySelector(".frame-media");
+  const frame = state.scan?.frames?.[state.selectedFrame];
+  if (!zoom || !view || !media || !frame) return;
+  const face = frame.faces?.[zoom.faceIndex];
+  if (!face) { resetFrameZoom(); return; }
+  const img = media.querySelector("img");
+  if (!img || !img.complete || !img.naturalWidth || !media.offsetWidth) {
+    img?.addEventListener("load", () => applyFrameZoom(), { once: true });
+    return;
+  }
+  const mw = media.offsetWidth;
+  const mh = media.offsetHeight;
+  const vw = view.clientWidth;
+  const vh = view.clientHeight;
+  const [x1, y1, x2, y2] = face.box;
+  const bw = Math.max(4, ((x2 - x1) / frame.width) * mw);
+  const bh = Math.max(4, ((y2 - y1) / frame.height) * mh);
+  const cx = ((x1 + x2) / 2 / frame.width) * mw;
+  const cy = ((y1 + y2) / 2 / frame.height) * mh;
+  // Fit a 3.2x padded context region around the face so surroundings stay legible.
+  const scale = clamp(Math.min(vw / (bw * 3.2), vh / (bh * 3.2)), 1.5, 6.5);
+  const offX = media.offsetLeft;
+  const offY = media.offsetTop;
+  let tx = vw / 2 - offX - cx * scale;
+  let ty = vh / 2 - offY - cy * scale;
+  if (mw * scale >= vw) tx = clamp(tx, vw - offX - mw * scale, -offX);
+  else tx = (vw - mw * scale) / 2 - offX;
+  if (mh * scale >= vh) ty = clamp(ty, vh - offY - mh * scale, -offY);
+  else ty = (vh - mh * scale) / 2 - offY;
+  view.classList.add("is-zoomed");
+  delete view.dataset.highlight;
+  media.style.setProperty("--inv", String(1 / scale));
+  media.style.transform = `translate(${tx.toFixed(1)}px, ${ty.toFixed(1)}px) scale(${scale.toFixed(3)})`;
+  for (const box of $$(".face-box", media)) {
+    box.classList.toggle("focused", Number(box.dataset.face) === zoom.faceIndex);
+  }
+  for (const row of $$("#matches-list .match-row")) {
+    row.classList.toggle("is-focused", Number(row.dataset.personId) === Number(zoom.personId));
+  }
+  const resetBtn = $("#frame-zoom-reset");
+  if (resetBtn) resetBtn.hidden = false;
+}
+function zoomFrameToFace(faceIndex, personId) {
+  state.frameZoom = { faceIndex, personId: Number(personId) };
+  applyFrameZoom();
+}
+function resetFrameZoom() {
+  state.frameZoom = null;
+  const view = $("#frame-view");
+  const media = view?.querySelector(".frame-media");
+  view?.classList.remove("is-zoomed");
+  if (media) {
+    media.style.transform = "";
+    media.style.setProperty("--inv", "1");
+    for (const box of $$(".face-box", media)) box.classList.remove("focused");
+  }
+  for (const row of $$("#matches-list .match-row")) row.classList.remove("is-focused");
+  const resetBtn = $("#frame-zoom-reset");
+  if (resetBtn) resetBtn.hidden = true;
+}
+function focusStudentInFrame(personId) {
+  const scan = state.scan;
+  if (!scan?.frames?.length) return;
+  if (state.frameZoom && Number(state.frameZoom.personId) === Number(personId)) {
+    resetFrameZoom();
+    return;
+  }
+  const current = scan.frames[state.selectedFrame];
+  let targetFrame = state.selectedFrame;
+  let faceIndex = current?.faces?.findIndex((f) => Number(f.personId) === Number(personId)) ?? -1;
+  if (faceIndex < 0) {
+    // Pick the frame where this student matched with the highest confidence.
+    let bestConf = -1;
+    scan.frames.forEach((frame, fIdx) => {
+      (frame.faces || []).forEach((face, idx) => {
+        if (Number(face.personId) === Number(personId) && (face.confidence ?? 0) > bestConf) {
+          bestConf = face.confidence ?? 0;
+          targetFrame = fIdx;
+          faceIndex = idx;
+        }
+      });
+    });
+  }
+  if (faceIndex < 0) {
+    toast("No face box for this student in the current scan", "");
+    return;
+  }
+  if (targetFrame !== state.selectedFrame) {
+    state.selectedFrame = targetFrame;
+    closeInspector();
+    renderFrameTabs();
+    renderFrame();
+    renderSummary();
+  }
+  zoomFrameToFace(faceIndex, personId);
+}
 function setHighlight(personId) {
+  if (state.frameZoom) return;
   const view = $("#frame-view");
   if (!personId) {
     delete view.dataset.highlight;
@@ -1086,10 +1239,19 @@ function setRosterCollapsed(on) {
   }
 }
 
+function setBenchSetupCollapsed(on) {
+  $("#panel-benchmark")?.classList.toggle("setup-collapsed", on);
+  const button = $("#bench-setup-toggle");
+  if (button) {
+    button.setAttribute("aria-pressed", String(on));
+    button.textContent = on ? "Show setup" : "Hide setup";
+  }
+}
 function applyViewPrefs() {
   const prefs = viewPrefs();
   setUnknownLabels(Boolean(prefs.labelUnknown));
   setRosterCollapsed(Boolean(prefs.rosterCollapsed));
+  setBenchSetupCollapsed(Boolean(prefs.benchSetupCollapsed));
 }
 
 function lightboxFrame() {
@@ -1114,11 +1276,19 @@ function fitLightboxStage() {
   stage.style.height = `${h}px`;
 }
 
-function applyLightboxTransform() {
+// Panning only updates transform; updating --inv on every pointermove would
+// recalculate styles on every child .face-box and .box-label.
+function applyLightboxPan() {
   const lb = state.lightbox;
   const stage = $("#lightbox-stage");
   if (!lb || !stage) return;
   stage.style.transform = `translate(${lb.tx}px, ${lb.ty}px) scale(${lb.scale})`;
+}
+function applyLightboxZoom() {
+  const lb = state.lightbox;
+  const stage = $("#lightbox-stage");
+  if (!lb || !stage) return;
+  applyLightboxPan();
   stage.style.setProperty("--inv", String(1 / lb.scale));
   stage.classList.toggle("zoomed", lb.scale >= 1.9);
 }
@@ -1139,7 +1309,7 @@ function renderLightbox() {
   fitLightboxStage();
   renderFrameInto(stage, frame, lb.index);
   centerLightbox();
-  applyLightboxTransform();
+  applyLightboxZoom();
   $("#lightbox-title").textContent =
     `${frame.sourceName || frame.frameId || `Frame ${lb.index + 1}`} · ${frame.width}×${frame.height} · ${plural(frame.faces.length, "face")}`;
   $("#lightbox-prev").disabled = lb.index <= 0;
@@ -1187,7 +1357,7 @@ function lightboxReset() {
   if (!lb) return;
   lb.scale = 1;
   centerLightbox();
-  applyLightboxTransform();
+  applyLightboxZoom();
 }
 
 function openScanLightbox() {
@@ -1235,6 +1405,7 @@ async function loadResult(scanId) {
     const data = await api(`/api/results/${encodeURIComponent(scanId)}`);
     state.scan = data;
     state.liveSweep = null;
+    state.frameZoom = null;
     closeInspector();
     state.selectedFrame = Number.isInteger(data.summary?.bestIndex) && data.summary.bestIndex >= 0 ? data.summary.bestIndex : 0;
     switchTab("attendance");
@@ -1250,7 +1421,7 @@ async function deleteResult(scanId) {
   try {
     const data = await api(`/api/results/${encodeURIComponent(scanId)}`, { method: "DELETE" });
     state.results = data.results || [];
-    if (state.scan?.scanId === scanId) { state.scan = null; closeInspector(); renderResults(); }
+    if (state.scan?.scanId === scanId) { state.scan = null; state.frameZoom = null; closeInspector(); renderResults(); }
     renderHistory();
     toast("Saved run deleted", "ok");
   } catch (error) { toast(error.message, "error"); }
@@ -1448,7 +1619,7 @@ async function runBenchmark() {
     det_sizes: checkedValues("bench-det-sizes").map(Number),
     tiling_modes: checkedValues("bench-tilings"),
     det_thresh: readNumber("bench-det-thresh", 0.35),
-    nms_thresh: state.settings.nmsThresh ?? 0.45,
+    nms_thresh: readNumber("bench-nms-thresh", state.settings.nmsThresh ?? 0.45),
     flip_aug: $("#bench-flip").checked,
     lowres_aug: $("#bench-lowres").checked,
     with_quality: $("#bench-quality").checked,
@@ -1457,11 +1628,11 @@ async function runBenchmark() {
     review_threshold: readNumber("bench-review", 0.34),
     min_margin: readNumber("bench-margin", 0.04),
     assignment_mode: $("#bench-assignment").value,
-    template_strategy: state.settings.templateStrategy || "top_k_mean",
-    top_k: state.settings.templateTopK ?? 2,
+    template_strategy: $("#bench-template-strategy")?.value || state.settings.templateStrategy || "top_k_mean",
+    top_k: Math.max(1, Math.round(readNumber("bench-top-k", state.settings.templateTopK ?? 2))),
     fusion_mode: $("#bench-fusion").value,
-    k: state.settings.fusionK ?? 2,
-    min_quality: state.settings.minFaceQuality ?? 0,
+    k: Math.max(1, Math.round(readNumber("bench-fusion-k", state.settings.fusionK ?? 2))),
+    min_quality: readNumber("bench-min-quality", state.settings.minFaceQuality ?? 0),
     force_fresh: $("#bench-force-fresh").checked,
     label_unknown: $("#bench-label-unknown").checked,
   };
@@ -1945,6 +2116,8 @@ async function resetEverything() {
     const data = await api("/api/reset", { method: "POST" });
     state.people = data.state.people;
     state.scan = null;
+    state.frameZoom = null;
+    closeStudentsDrawer();
     closeInspector();
     closeLightbox();
     state.results = [];
@@ -2007,8 +2180,13 @@ function applySettings(settings) {
   if ($("#bench-review")) $("#bench-review").value = String(state.settings.reviewThreshold);
   if ($("#bench-margin")) $("#bench-margin").value = String(state.settings.minMargin);
   if ($("#bench-det-thresh")) $("#bench-det-thresh").value = String(state.settings.detThresh);
+  if ($("#bench-nms-thresh")) $("#bench-nms-thresh").value = String(state.settings.nmsThresh);
+  if ($("#bench-min-quality")) $("#bench-min-quality").value = String(state.settings.minFaceQuality);
   if ($("#bench-assignment")) setSelectValue("bench-assignment", state.settings.assignmentMode);
+  if ($("#bench-template-strategy")) setSelectValue("bench-template-strategy", state.settings.templateStrategy);
+  if ($("#bench-top-k")) $("#bench-top-k").value = String(state.settings.templateTopK ?? 2);
   if ($("#bench-fusion")) setSelectValue("bench-fusion", state.settings.fusionMode);
+  if ($("#bench-fusion-k")) $("#bench-fusion-k").value = String(state.settings.fusionK ?? 2);
   for (const id of ["det-thresh", "nms-thresh", "accept-threshold", "review-threshold", "min-margin", "min-quality"]) {
     $(`#${id}`).dispatchEvent(new Event("input"));
   }
@@ -2104,6 +2282,25 @@ function wireEvents() {
   $("#scan-btn").addEventListener("click", runScan);
   $("#reset-btn").addEventListener("click", resetEverything);
   $("#reembed-btn").addEventListener("click", reembedAll);
+  $("#students-toggle").addEventListener("click", () => {
+    if (state.studentsOpen) closeStudentsDrawer();
+    else openStudentsDrawer();
+  });
+  $("#students-close").addEventListener("click", closeStudentsDrawer);
+  $("#drawer-backdrop").addEventListener("click", closeStudentsDrawer);
+  $("#bench-setup-toggle").addEventListener("click", () => {
+    const collapsed = $("#panel-benchmark").classList.contains("setup-collapsed");
+    setBenchSetupCollapsed(!collapsed);
+    saveViewPrefs({ benchSetupCollapsed: !collapsed });
+  });
+  $("#frame-zoom-reset").addEventListener("click", resetFrameZoom);
+  $("#frame-view").addEventListener("dblclick", () => { if (state.frameZoom) resetFrameZoom(); });
+  $("#toast").addEventListener("pointerenter", pauseToast);
+  $("#toast").addEventListener("pointerleave", resumeToast);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) pauseToast();
+    else resumeToast();
+  });
   $("#inspector-close").addEventListener("click", closeInspector);
 
   $("#people-list").addEventListener("click", handlePeopleClick);
@@ -2155,46 +2352,48 @@ function wireEvents() {
     lb.tx = px - (px - lb.tx) * ratio;
     lb.ty = py - (py - lb.ty) * ratio;
     lb.scale = next;
-    applyLightboxTransform();
+    applyLightboxZoom();
   }, { passive: false });
 
   let lightboxDrag = null;
   let suppressLightboxClick = false;
   lightboxViewport.addEventListener("pointerdown", (event) => {
-    if (!state.lightbox || event.button !== 0) return;
+    if (!state.lightbox || event.button !== 0 || lightboxDrag) return;
     suppressLightboxClick = false;
     lightboxDrag = {
+      pointerId: event.pointerId,
       x: event.clientX,
       y: event.clientY,
       tx: state.lightbox.tx,
       ty: state.lightbox.ty,
       moved: false,
     };
+    try { lightboxViewport.setPointerCapture(event.pointerId); } catch { /* ignore */ }
     lightboxViewport.classList.add("dragging");
   });
   window.addEventListener("pointermove", (event) => {
-    if (!lightboxDrag || !state.lightbox) return;
+    if (!lightboxDrag || !state.lightbox || event.pointerId !== lightboxDrag.pointerId) return;
     const dx = event.clientX - lightboxDrag.x;
     const dy = event.clientY - lightboxDrag.y;
     if (!lightboxDrag.moved && Math.hypot(dx, dy) > 4) lightboxDrag.moved = true;
     state.lightbox.tx = lightboxDrag.tx + dx;
     state.lightbox.ty = lightboxDrag.ty + dy;
-    applyLightboxTransform();
+    applyLightboxPan();
   });
-  window.addEventListener("pointerup", () => {
-    if (lightboxDrag?.moved) {
+  const endLightboxDrag = (event, cancelled = false) => {
+    if (!lightboxDrag || event.pointerId !== lightboxDrag.pointerId) return;
+    if (!cancelled && lightboxDrag.moved) {
       suppressLightboxClick = true;
       // Clear on the next tick so releasing outside the viewport (no click
       // fired on lightboxViewport) never swallows the next real box click.
       window.setTimeout(() => { suppressLightboxClick = false; }, 0);
     }
+    try { lightboxViewport.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
     lightboxDrag = null;
     lightboxViewport.classList.remove("dragging");
-  });
-  window.addEventListener("pointercancel", () => {
-    lightboxDrag = null;
-    lightboxViewport.classList.remove("dragging");
-  });
+  };
+  window.addEventListener("pointerup", (event) => endLightboxDrag(event, false));
+  window.addEventListener("pointercancel", (event) => endLightboxDrag(event, true));
   // A pan that ends over a face box must not be treated as a click -> inspector.
   lightboxViewport.addEventListener("click", (event) => {
     if (!suppressLightboxClick) return;
@@ -2204,6 +2403,7 @@ function wireEvents() {
   }, true);
   lightboxViewport.addEventListener("dblclick", lightboxReset);
   window.addEventListener("resize", () => {
+    if (state.frameZoom) applyFrameZoom();
     if (!state.lightbox) return;
     fitLightboxStage();
     lightboxReset();
@@ -2217,8 +2417,10 @@ function wireEvents() {
         target.tagName === "SELECT" ||
         target.isContentEditable);
     if (event.key === "Escape") {
-      if (state.lightbox) { closeLightbox(); return; }
       if (state.inspector) { closeInspector(); return; }
+      if (state.lightbox) { closeLightbox(); return; }
+      if (state.frameZoom) { resetFrameZoom(); return; }
+      if (state.studentsOpen) { closeStudentsDrawer(); return; }
     }
     // Never hijack browser shortcuts (Ctrl/Cmd/Alt+F), and only act on the tab
     // that owns the shortcut.
