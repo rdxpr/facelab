@@ -178,6 +178,12 @@ def assign_single_frame(
     if matrix.ndim == 1:
         matrix = matrix[None, :]
     num_faces, num_students = matrix.shape
+    # A review band wider than the accept band would give pairs in
+    # ``[accept, review)`` the +2.0 accepted bonus during assignment and then
+    # drop them at the voting gate. Keep review at or below accept, matching
+    # ``_run_benchmark_sync`` in ``server.py``.
+    accept_threshold = float(accept_threshold)
+    review_threshold = min(float(review_threshold), accept_threshold)
     results: list[dict] = []
     if num_faces == 0:
         return results
@@ -322,6 +328,10 @@ def fuse_multi_frame(
     student_ids = list(student_gallery.keys())
     per_frame: list[list[dict]] = []
     sims: list[np.ndarray] = []
+    # See ``assign_single_frame``: never let review sit above accept, otherwise
+    # the per-frame assignment and the multi-frame vote disagree.
+    accept_threshold = float(accept_threshold)
+    review_threshold = min(float(review_threshold), accept_threshold)
 
     student_index_map = {sid: idx for idx, sid in enumerate(student_ids)}
 

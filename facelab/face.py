@@ -767,14 +767,55 @@ class UnifaceRecognizer(BaseRecognizer):
         self.label = entry.get("label", recognizer_id)
         self.embedding_dim = int(entry.get("embedding_dim", 512))
         self.active_providers = _session_providers(self.model, active_providers)
+        # ``None`` means "not tried yet"; ``False`` caches a model whose ONNX
+        # graph has a static batch dimension so later calls skip the attempt.
+        self._batch_supported: bool | None = None
+
+    def _batch_embed(self, crops: list[np.ndarray]) -> np.ndarray | None:
+        """Run one ONNX call for the whole crop list, or return ``None``.
+
+        Mirrors ``uniface``'s ``get_embedding(crop, None)``: resize/normalize via
+        the model's own ``preprocess``, concatenate the ``(1, C, H, W)`` blobs
+        into ``(N, C, H, W)``, then return the raw session output. The upstream
+        recognizers do not L2-normalize inside ``get_embedding``, so postprocess
+        here stays identical to one call per crop (just a flatten to ``(N, D)``).
+        """
+        preprocess = getattr(self.model, "preprocess", None)
+        session = getattr(self.model, "session", None)
+        input_name = getattr(self.model, "input_name", None)
+        output_names = getattr(self.model, "output_names", None)
+        if not callable(preprocess) or session is None or input_name is None:
+            self._batch_supported = False
+            return None
+        try:
+            blobs = [np.asarray(preprocess(crop), dtype=np.float32) for crop in crops]
+            batch = np.concatenate(blobs, axis=0)
+            outputs = session.run(output_names, {input_name: batch})
+            features = np.asarray(outputs[0], dtype=np.float32)
+            if features.shape[0] != len(crops):
+                raise ValueError(
+                    f"Batched recognizer returned {features.shape[0]} embeddings "
+                    f"for {len(crops)} crops"
+                )
+        except Exception:
+            # Static batch-1 exports (and test doubles) reject N > 1. Fall back
+            # to the per-crop loop for the rest of this recognizer's lifetime.
+            self._batch_supported = False
+            return None
+        self._batch_supported = True
+        return features.reshape(len(crops), -1)
 
     def embed(self, crops: list[np.ndarray]) -> np.ndarray:
+        if not crops:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        if len(crops) > 1 and self._batch_supported is not False:
+            batched = self._batch_embed(crops)
+            if batched is not None:
+                return batched
         vectors = []
         for crop in crops:
             vector = np.asarray(self.model.get_embedding(crop, None), dtype=np.float32).reshape(-1)
             vectors.append(vector)
-        if not vectors:
-            return np.empty((0, self.embedding_dim), dtype=np.float32)
         return np.vstack(vectors)
 
 

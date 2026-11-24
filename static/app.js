@@ -64,7 +64,7 @@ const state = {
     maxPhotosPerUpload: 8,
     maxPhotosPerPerson: 12,
     templateTopK: 2,
-    benchmarkDetSizes: [640, 1024, 1280],
+    benchmarkDetSizes: [640, 1024, 1280, 1600],
     defaultDetector: "insightface:scrfd_10g_bnkps",
     defaultRecognizer: "insightface:w600k_r50",
   },
@@ -206,16 +206,28 @@ function closeStudentsDrawer() {
 let tooltipTimer = null;
 let tooltipTrigger = null;
 let tooltipHiddenAt = 0;
-function showTooltip(el) {
+let tooltipDescribedBy = null;
+let tooltipPreviousDescribedBy = null;
+function restoreTooltipDescription() {
+  if (!tooltipDescribedBy) return;
+  if (tooltipDescribedBy.getAttribute("aria-describedby") === "ui-tooltip") {
+    if (tooltipPreviousDescribedBy == null) tooltipDescribedBy.removeAttribute("aria-describedby");
+    else tooltipDescribedBy.setAttribute("aria-describedby", tooltipPreviousDescribedBy);
+  }
+  tooltipDescribedBy = null;
+  tooltipPreviousDescribedBy = null;
+}
+function showTooltip(el, instant = false) {
   const tip = $("#ui-tooltip");
   const text = el?.dataset?.tip;
   if (!tip || !text) return;
   tip.textContent = text;
   tip.hidden = false;
-  tip.dataset.instant = performance.now() - tooltipHiddenAt < 250 ? "true" : "false";
+  tip.dataset.instant = instant ? "true" : "false";
   positionTooltip(el);
 }
 function hideTooltip() {
+  restoreTooltipDescription();
   const tip = $("#ui-tooltip");
   if (!tip || tip.hidden) return;
   tip.hidden = true;
@@ -242,7 +254,11 @@ function wireTooltips() {
     if (!el || el === tooltipTrigger) return;
     window.clearTimeout(tooltipTimer);
     tooltipTrigger = el;
-    tooltipTimer = window.setTimeout(() => showTooltip(el), 350);
+    // Re-entering right after a hide should feel immediate rather than paying
+    // the full 350 ms hover delay again.
+    const instant = performance.now() - tooltipHiddenAt < 250;
+    if (instant) showTooltip(el, true);
+    else tooltipTimer = window.setTimeout(() => showTooltip(el, false), 350);
   });
   document.addEventListener("pointerout", (event) => {
     if (event.pointerType === "touch") return;
@@ -260,6 +276,10 @@ function wireTooltips() {
     if (!el) return;
     window.clearTimeout(tooltipTimer);
     tooltipTrigger = el;
+    restoreTooltipDescription();
+    tooltipPreviousDescribedBy = el.getAttribute("aria-describedby");
+    tooltipDescribedBy = el;
+    el.setAttribute("aria-describedby", "ui-tooltip");
     showTooltip(el);
   });
   document.addEventListener("focusout", () => {
@@ -1635,7 +1655,7 @@ function renderBenchOptions() {
     ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.rec, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")
     : `<div class="muted small">No recognizers installed.</div>`;
 
-  const sizes = [...new Set([...(state.settings.benchmarkDetSizes || []), 640, 1024, 1280])].sort((a, b) => a - b);
+  const sizes = [...new Set([...(state.settings.benchmarkDetSizes || []), 640, 1024, 1280, 1600])].sort((a, b) => a - b);
   $("#bench-det-sizes").innerHTML = sizes
     .map((size) => `<label class="chip"><input type="checkbox" value="${size}" ${on(keep.size, size, size === 640 || size === 1280)}><span>${size}px</span></label>`)
     .join("");

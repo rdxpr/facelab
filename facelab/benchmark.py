@@ -140,6 +140,19 @@ def _fusion_frames(
 # --------------------------------------------------------------------------- #
 # Detection / identification recall
 # --------------------------------------------------------------------------- #
+def _bbox_or_zero(obj: dict) -> Sequence[float]:
+    """Return an object's box, falling back to a zero box when missing.
+
+    Decoded cache entries carry NumPy arrays, and ``array or fallback`` raises
+    ``ValueError: The truth value of an array with more than one element is
+    ambiguous``. Check ``None`` / length explicitly instead.
+    """
+    bbox = obj.get("bbox") if obj else None
+    if bbox is None or len(bbox) < 4:
+        return [0, 0, 0, 0]
+    return bbox
+
+
 def _iou(box_a: Sequence[float], box_b: Sequence[float]) -> float:
     ax1, ay1, ax2, ay2 = (float(v) for v in box_a[:4])
     bx1, by1, bx2, by2 = (float(v) for v in box_b[:4])
@@ -168,9 +181,9 @@ def _match_gt_to_detections(
         return []
     overlaps = np.zeros((len(gt_boxes), len(detections)), dtype=np.float32)
     for row, gt in enumerate(gt_boxes):
-        gt_box = gt.get("bbox") or [0, 0, 0, 0]
+        gt_box = _bbox_or_zero(gt)
         for col, det in enumerate(detections):
-            overlaps[row, col] = _iou(gt_box, det.get("bbox") or [0, 0, 0, 0])
+            overlaps[row, col] = _iou(gt_box, _bbox_or_zero(det))
     valid = overlaps >= iou_threshold
     weights = np.where(valid, overlaps + 2.0, -1.0)
     rows, cols = linear_sum_assignment(-weights)
@@ -201,7 +214,7 @@ def stratified_metrics(
         for det in frame.get("detections", []):
             name = det.get("size_bucket")
             if name not in detected_buckets:
-                box = det.get("bbox") or [0, 0, 0, 0]
+                box = _bbox_or_zero(det)
                 name = matching.size_bucket(float(box[3]) - float(box[1]))
             if name not in detected_buckets:
                 name = "medium"

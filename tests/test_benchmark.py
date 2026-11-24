@@ -123,6 +123,32 @@ def test_stratified_metrics_buckets_by_row():
     assert metrics["buckets"]["small"]["detection_recall"] == 0.0
 
 
+def test_stratified_metrics_accepts_numpy_bboxes():
+    # ``cache.py`` decodes boxes to NumPy arrays; the old ``bbox or fallback``
+    # raised ValueError on any array with more than one element.
+    bbox = np.array([100, 100, 180, 180], dtype=np.float32)
+    frames = [
+        frame(
+            "frame_01",
+            [{"bbox": bbox, "embedding": unit(1, 0, 0), "quality_score": 0.9}],
+        )
+    ]
+    decisions = [[{"status": "present", "matched_student_id": 1}]]
+    boxes = [
+        {
+            "frame_id": "frame_01",
+            "bbox": bbox,
+            "student_id": 1,
+            "row_bucket": "large",
+        }
+    ]
+    metrics = benchmark.stratified_metrics(frames, decisions, boxes)
+    assert metrics["gt_faces"] == 1
+    assert metrics["detected_faces"] == 1
+    assert metrics["identified_faces"] == 1
+    assert metrics["detected_buckets"]["large"] == 1
+
+
 def test_aggregate_attendance_sums_confusion():
     results = [
         {"attendance": {"tp": 2, "fp": 1, "fn": 0, "precision": 0, "recall": 0, "f1": 0}},

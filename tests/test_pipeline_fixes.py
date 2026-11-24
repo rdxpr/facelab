@@ -345,3 +345,96 @@ def test_mid_band_tiles_stay_in_band_and_preserve_missing_kps():
     detections = face.detect_with_sahi(image, fake_detect, tiling_mode="sahi_mid_band")
     assert detections
     assert all(det.kps is None for det in detections)
+
+
+class FakeUnifaceSession:
+    """Tiny ONNX-session stand-in that records batch sizes and can reject N>1."""
+
+    def __init__(self, max_batch: int = 1):
+        self.max_batch = max_batch
+        self.attempts: list[int] = []
+
+    def run(self, _output_names, feed):
+        batch = next(iter(feed.values()))
+        size = int(batch.shape[0])
+        self.attempts.append(size)
+        if size > self.max_batch:
+            raise ValueError(f"static batch dimension is {self.max_batch}")
+        flat = batch.reshape(size, -1)
+        return [flat[:, :4].copy()]
+
+
+class FakeUnifaceModel:
+    """Mirrors uniface's ``preprocess`` -> ``session.run`` contract."""
+
+    input_name = "input"
+    output_names = ["output"]
+
+    def __init__(self, max_batch: int = 1):
+        self.session = FakeUnifaceSession(max_batch=max_batch)
+
+    def preprocess(self, crop):
+        values = np.asarray(crop, dtype=np.float32).reshape(-1)
+        blob = np.zeros((1, 3, 4, 4), dtype=np.float32)
+        blob.flat[: min(values.size, blob.size)] = values[: blob.size]
+        return blob
+
+    def get_embedding(self, crop, landmarks=None):
+        assert landmarks is None
+        blob = self.preprocess(crop)
+        return self.session.run(self.output_names, {self.input_name: blob})[0]
+
+
+def make_uniface_recognizer(model):
+    recognizer = face.UnifaceRecognizer.__new__(face.UnifaceRecognizer)
+    recognizer.model = model
+    recognizer.id = "uniface:test"
+    recognizer.label = "test"
+    recognizer.embedding_dim = 4
+    recognizer.active_providers = []
+    recognizer._batch_supported = None
+    return recognizer
+
+
+def uniface_crops(count=5):
+    return [
+        np.full((8, 8, 3), float(index + 1), dtype=np.uint8)
+        for index in range(count)
+    ]
+
+
+def test_uniface_embed_runs_one_batched_session_call():
+    crops = uniface_crops()
+    model = FakeUnifaceModel(max_batch=len(crops))
+    recognizer = make_uniface_recognizer(model)
+
+    batched = recognizer.embed(crops)
+
+    assert batched.shape == (len(crops), 4)
+    assert model.session.attempts == [len(crops)]
+    assert recognizer._batch_supported is True
+
+    reference = make_uniface_recognizer(FakeUnifaceModel(max_batch=1))
+    expected = np.vstack([reference.embed([crop]) for crop in crops])
+    assert np.allclose(batched, expected)
+
+
+def test_uniface_embed_falls_back_when_batch_rejected():
+    crops = uniface_crops()
+    model = FakeUnifaceModel(max_batch=1)
+    recognizer = make_uniface_recognizer(model)
+
+    embeddings = recognizer.embed(crops)
+
+    assert embeddings.shape == (len(crops), 4)
+    assert recognizer._batch_supported is False
+    # One rejected N-sized attempt, then one call per crop.
+    assert model.session.attempts == [len(crops)] + [1] * len(crops)
+
+    reference = make_uniface_recognizer(FakeUnifaceModel(max_batch=1))
+    expected = np.vstack([reference.embed([crop]) for crop in crops])
+    assert np.allclose(embeddings, expected)
+
+    # The failed capability is cached, so later calls go straight to the loop.
+    recognizer.embed(crops)
+    assert model.session.attempts == [len(crops)] + [1] * (2 * len(crops))

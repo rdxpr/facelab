@@ -406,3 +406,27 @@ def test_max_gate_zero_accept_threshold_does_not_mark_absent_students_present():
         review_threshold=0.0,
     )
     assert fused["students"]["absent"]["status"] == "absent"
+
+
+def test_review_threshold_is_clamped_to_accept_threshold():
+    # Sliding accept below review (as the Attendance tab allows) used to give
+    # 0.30 the +2.0 accepted bonus during assignment, then drop it at the
+    # review-band gate. Clamping review to accept keeps the pair accepted.
+    matrix = np.array([[0.30]], dtype=np.float32)
+    decision = matching.assign_single_frame(
+        matrix, ["a"], accept_threshold=0.27, review_threshold=0.34
+    )[0]
+    assert decision["status"] == "present"
+    assert decision["matched_student_id"] == "a"
+
+    gallery = {"a": unit([1.0, 0.0, 0.0])[None, :]}
+    probe = unit([0.30, 0.9539392, 0.0])
+    fused = matching.fuse_multi_frame(
+        [_frame([_det(probe)])],
+        gallery,
+        mode="k_of_n_voting",
+        accept_threshold=0.27,
+        review_threshold=0.34,
+        k=1,
+    )
+    assert fused["students"]["a"]["status"] == "present"
