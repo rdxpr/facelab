@@ -5,6 +5,8 @@ No ONNX weights are required: detector/recognizer collaborators are stubbed.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import cv2
 import numpy as np
 import pytest
@@ -438,3 +440,73 @@ def test_uniface_embed_falls_back_when_batch_rejected():
     # The failed capability is cached, so later calls go straight to the loop.
     recognizer.embed(crops)
     assert model.session.attempts == [len(crops)] + [1] * (2 * len(crops))
+
+
+class StubSFaceModel:
+    """Minimal OpenCV ``FaceRecognizerSF`` double."""
+
+    def __init__(self):
+        self.calls: list[tuple[int, ...]] = []
+
+    def feature(self, crop):
+        self.calls.append(tuple(crop.shape))
+        offset = float(np.asarray(crop, dtype=np.float32).mean())
+        return (np.arange(128, dtype=np.float32) + offset).reshape(1, 128)
+
+
+def test_opencv_sface_embed_returns_128d_vectors(monkeypatch):
+    stub = StubSFaceModel()
+    monkeypatch.setattr(
+        face.cv2,
+        "FaceRecognizerSF_create",
+        lambda *_args, **_kwargs: stub,
+        raising=False,
+    )
+    recognizer = face.OpenCVSFaceRecognizer(
+        "opencv:sface_2021dec",
+        {"label": "SFace", "embedding_dim": 128},
+        Path("stub_sface.onnx"),
+    )
+    crops = [
+        np.zeros((112, 112, 3), dtype=np.uint8),
+        np.full((112, 112, 3), 255, dtype=np.uint8),
+    ]
+
+    embeddings = recognizer.embed(crops)
+
+    assert embeddings.shape == (2, 128)
+    assert embeddings.dtype == np.float32
+    assert recognizer.active_providers == ["OpenCV"]
+    assert len(stub.calls) == 2
+    assert all(shape == (112, 112, 3) for shape in stub.calls)
+
+    empty = recognizer.embed([])
+    assert empty.shape == (0, 128)
+    assert empty.dtype == np.float32
+
+
+def test_build_recognizer_routes_commercial_recognizers(monkeypatch):
+    fake_path = Path("stub_commercial.onnx")
+    monkeypatch.setattr(face, "resolve_model_file", lambda _entry: fake_path)
+    built: list[tuple[str, str, str, Path]] = []
+
+    class StubOpenCV:
+        def __init__(self, recognizer_id, entry, path):
+            built.append(("opencv", recognizer_id, entry["library"], path))
+
+    class StubInsightFace:
+        def __init__(self, recognizer_id, entry, _providers, path):
+            built.append(("insightface", recognizer_id, entry["library"], path))
+
+    monkeypatch.setattr(face, "OpenCVSFaceRecognizer", StubOpenCV)
+    monkeypatch.setattr(face, "InsightFaceRecognizer", StubInsightFace)
+
+    sface = face._build_recognizer("opencv:sface_2021dec")
+    auraface = face._build_recognizer("custom_onnx:auraface_v1")
+
+    assert isinstance(sface, StubOpenCV)
+    assert isinstance(auraface, StubInsightFace)
+    assert built == [
+        ("opencv", "opencv:sface_2021dec", "opencv", fake_path),
+        ("insightface", "custom_onnx:auraface_v1", "custom_onnx", fake_path),
+    ]

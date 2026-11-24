@@ -149,6 +149,53 @@ def test_stratified_metrics_accepts_numpy_bboxes():
     assert metrics["detected_buckets"]["large"] == 1
 
 
+def test_evaluate_frames_supports_128d_embeddings():
+    def student(student_id, vector):
+        return {
+            "id": student_id,
+            "photos": [
+                {
+                    "id": f"ph{student_id}",
+                    "embeddings": {
+                        "opencv:sface_2021dec": {"raw": vector.tolist()}
+                    },
+                }
+            ],
+        }
+
+    one = np.zeros(128, dtype=np.float32)
+    one[0] = 1.0
+    two = np.zeros(128, dtype=np.float32)
+    two[1] = 1.0
+    gallery = benchmark.build_gallery(
+        {1: student(1, one), 2: student(2, two)},
+        "opencv:sface_2021dec",
+        "raw",
+    )
+    assert gallery[1].shape == (1, 128)
+
+    frames = [
+        frame(
+            "frame_01",
+            [
+                det(one, bbox=(100, 100, 180, 180)),
+                det(two, bbox=(600, 600, 680, 680)),
+            ],
+        )
+    ]
+    result = benchmark.evaluate_frames(
+        frames,
+        gallery,
+        [1, 2],
+        variant="raw",
+        accept_threshold=0.5,
+        review_threshold=0.4,
+        k=1,
+    )
+    assert result["attendance"]["f1"] == 1.0
+    assert result["mean_present_sim"] == pytest.approx(1.0)
+
+
 def test_aggregate_attendance_sums_confusion():
     results = [
         {"attendance": {"tp": 2, "fp": 1, "fn": 0, "precision": 0, "recall": 0, "f1": 0}},

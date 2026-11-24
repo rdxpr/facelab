@@ -9,6 +9,8 @@ Two families are supported:
 * **UniFace weights** (RetinaFace, YOLOv8-Face, AdaFace, EdgeFace, SphereFace,
   eDifFIQA, head pose) downloaded into the UniFace cache by the ``uniface``
   package itself.
+* **Commercial-safe ONNX files** (YuNet detector, AuraFace v1 and OpenCV SFace
+  recognizers) downloaded straight into ``models/``.
 
 Every ``.onnx`` file under ``models/`` is hashed and recorded in
 ``.data/models_manifest.json`` so benchmark runs can be tied to exact weights.
@@ -18,6 +20,8 @@ Examples:
     python scripts/fetch_models.py                       # default pack
     python scripts/fetch_models.py --pack buffalo_l --pack antelopev2
     python scripts/fetch_models.py --uniface adaface_ir_101 --uniface retinaface_r50
+    python scripts/fetch_models.py --commercial          # YuNet + AuraFace v1 + SFace
+    python scripts/fetch_models.py --auraface --sface
     python scripts/fetch_models.py --all                 # every pack + YuNet + FaceLab's UniFace weights
     python scripts/fetch_models.py --force               # re-download packs
 
@@ -45,6 +49,11 @@ BASE_URL = "https://github.com/deepinsight/insightface/releases/download/model-z
 YUNET_URL = (
     "https://github.com/opencv/opencv_zoo/raw/main/models/"
     "face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+AURAFACE_URL = "https://huggingface.co/fal/AuraFace-v1/resolve/main/glintr100.onnx"
+SFACE_URL = (
+    "https://huggingface.co/opencv/face_recognition_sface/resolve/main/"
+    "face_recognition_sface_2021dec.onnx"
 )
 
 sys.path.insert(0, str(REPO_ROOT))
@@ -289,6 +298,30 @@ def fetch_yunet(models_dir: Path, force: bool) -> bool:
     return True
 
 
+def fetch_auraface(models_dir: Path, force: bool) -> bool:
+    """Download AuraFace v1 (Apache-2.0, ~261 MB)."""
+    target = models_dir / "auraface" / "auraface_v1.onnx"
+    if target.is_file() and not force:
+        print(f"[fetch_models] auraface: already present at {target}")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    download(AURAFACE_URL, target)
+    print(f"[fetch_models] auraface: ready at {target} ({target.stat().st_size / 1e6:.0f} MB)")
+    return True
+
+
+def fetch_sface(models_dir: Path, force: bool) -> bool:
+    """Download OpenCV SFace (Apache-2.0, ~39 MB)."""
+    target = models_dir / "opencv" / "face_recognition_sface_2021dec.onnx"
+    if target.is_file() and not force:
+        print(f"[fetch_models] sface: already present at {target}")
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    download(SFACE_URL, target)
+    print(f"[fetch_models] sface: ready at {target} ({target.stat().st_size / 1e6:.0f} MB)")
+    return True
+
+
 def fetch_uniface(names: list[str], force: bool) -> bool:
     try:
         from uniface.model_store import download_models, get_cache_dir
@@ -439,18 +472,40 @@ def main() -> None:
         "--yunet", action="store_true",
         help="Fetch the OpenCV Zoo YuNet detector (Apache-2.0, ~230 KB).",
     )
+    parser.add_argument(
+        "--auraface", action="store_true",
+        help="Fetch AuraFace v1 recognizer (Apache-2.0, ~261 MB).",
+    )
+    parser.add_argument(
+        "--sface", action="store_true",
+        help="Fetch OpenCV SFace recognizer (Apache-2.0, ~39 MB).",
+    )
+    parser.add_argument(
+        "--commercial", action="store_true",
+        help=(
+            "Fetch only the commercial-safe stack (YuNet + AuraFace v1 + SFace). "
+            "Add --model/--pack to also fetch specific InsightFace packs."
+        ),
+    )
     args = parser.parse_args()
 
     if args.list:
         for name, spec in sorted(KNOWN_PACKS.items()):
             print(f"  {name:12s} needs: {', '.join(spec['required'])}")
         print("  yunet        needs: face_detection_yunet_2023mar.onnx (--yunet)")
+        print("  auraface     needs: auraface/auraface_v1.onnx (--auraface)")
+        print("  sface        needs: opencv/face_recognition_sface_2021dec.onnx (--sface)")
         print("  uniface weights:", ", ".join(required_uniface_weights()))
         return
 
     if args.all_models:
         packs = sorted(KNOWN_PACKS)
         uniface_names = required_uniface_weights()
+    elif args.commercial:
+        # Commercial mode is opt-in only: never pull a non-commercial pack
+        # unless the caller named one explicitly with --model/--pack.
+        packs = args.packs or []
+        uniface_names = args.uniface
     else:
         packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
         uniface_names = args.uniface
@@ -468,8 +523,12 @@ def main() -> None:
     fetched = False
     for name in packs:
         fetched = fetch_pack(name, models_dir, args.force, args.base_url) or fetched
-    if args.yunet or args.all_models:
+    if args.yunet or args.all_models or args.commercial:
         fetched = fetch_yunet(models_dir, args.force) or fetched
+    if args.auraface or args.all_models or args.commercial:
+        fetched = fetch_auraface(models_dir, args.force) or fetched
+    if args.sface or args.all_models or args.commercial:
+        fetched = fetch_sface(models_dir, args.force) or fetched
     if uniface_names:
         fetched = fetch_uniface(uniface_names, args.force) or fetched
 

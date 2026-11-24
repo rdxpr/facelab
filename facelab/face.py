@@ -734,6 +734,31 @@ class InsightFaceRecognizer(BaseRecognizer):
         return np.asarray(features, dtype=np.float32)
 
 
+class OpenCVSFaceRecognizer(BaseRecognizer):
+    """SFace from OpenCV Zoo; commercial-safe and 128-dimensional."""
+
+    def __init__(self, recognizer_id: str, entry: dict, path: Path):
+        create = getattr(cv2, "FaceRecognizerSF_create", None)
+        if create is None:  # older OpenCV bindings only expose the class method
+            create = cv2.FaceRecognizerSF.create
+        self.model = create(str(path), "")
+        self.id = recognizer_id
+        self.label = entry.get("label", recognizer_id)
+        self.embedding_dim = int(entry.get("embedding_dim", 128))
+        self.active_providers = ["OpenCV"]
+        self._lock = threading.Lock()
+
+    def embed(self, crops: list[np.ndarray]) -> np.ndarray:
+        if not crops:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+        vectors = []
+        for crop in crops:
+            with self._lock:
+                feature = self.model.feature(np.ascontiguousarray(crop))
+            vectors.append(np.asarray(feature, dtype=np.float32).reshape(-1))
+        return np.vstack(vectors)
+
+
 class UnifaceRecognizer(BaseRecognizer):
     _CLASS_HINTS = (
         ("adaface", "AdaFace"),
@@ -832,6 +857,8 @@ def _build_recognizer(recognizer_id: str) -> BaseRecognizer:
             f"Weights for recognizer '{recognizer_id}' were not found. "
             f"Looked in {settings.models_dir}. Run scripts/fetch_models.py."
         )
+    if entry["library"] == "opencv":
+        return OpenCVSFaceRecognizer(recognizer_id, entry, path)
     return InsightFaceRecognizer(recognizer_id, entry, providers, path)
 
 

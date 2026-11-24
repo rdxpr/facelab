@@ -200,6 +200,29 @@ KNOWN_RECOGNIZERS: dict[str, dict] = {
         "embedding_dim": 512,
         "role": "Ultra-fast linear ViT mobile benchmark",
     },
+    "custom_onnx:auraface_v1": {
+        "id": "custom_onnx:auraface_v1",
+        "label": "AuraFace v1 (Apache-2.0)",
+        "library": "custom_onnx",
+        "kind": "recognizer",
+        "file_candidates": ["auraface/auraface_v1.onnx", "auraface_v1.onnx"],
+        "license": "Apache-2.0",
+        "embedding_dim": 512,
+        "role": "Commercial-safe ResNet-100 ArcFace drop-in",
+    },
+    "opencv:sface_2021dec": {
+        "id": "opencv:sface_2021dec",
+        "label": "SFace (2021dec · Apache-2.0)",
+        "library": "opencv",
+        "kind": "recognizer",
+        "file_candidates": [
+            "opencv/face_recognition_sface_2021dec.onnx",
+            "face_recognition_sface_2021dec.onnx",
+        ],
+        "license": "Apache-2.0",
+        "embedding_dim": 128,
+        "role": "Commercial-safe lightweight 128-d recognizer",
+    },
 }
 
 # InsightFace model-zoo archives and the files FaceLab needs from each. The
