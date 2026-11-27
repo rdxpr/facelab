@@ -727,11 +727,26 @@ class InsightFaceRecognizer(BaseRecognizer):
             else list(providers)
         )
 
+    BATCH_SIZE = 16
+
     def embed(self, crops: list[np.ndarray]) -> np.ndarray:
         if not crops:
             return np.empty((0, self.embedding_dim), dtype=np.float32)
-        features = self.model.get_feat(list(crops))
-        return np.asarray(features, dtype=np.float32)
+        crop_list = list(crops)
+        if len(crop_list) <= self.BATCH_SIZE:
+            return np.asarray(self.model.get_feat(crop_list), dtype=np.float32)
+        chunks: list[np.ndarray] = []
+        for start in range(0, len(crop_list), self.BATCH_SIZE):
+            batch = crop_list[start : start + self.BATCH_SIZE]
+            try:
+                feats = np.asarray(self.model.get_feat(batch), dtype=np.float32)
+            except Exception:
+                # Fallback to single-crop inference if a large backbone still hits GPU OOM.
+                feats = np.vstack(
+                    [np.asarray(self.model.get_feat([c]), dtype=np.float32) for c in batch]
+                )
+            chunks.append(feats)
+        return np.vstack(chunks)
 
 
 class OpenCVSFaceRecognizer(BaseRecognizer):
@@ -813,15 +828,20 @@ class UnifaceRecognizer(BaseRecognizer):
             self._batch_supported = False
             return None
         try:
-            blobs = [np.asarray(preprocess(crop), dtype=np.float32) for crop in crops]
-            batch = np.concatenate(blobs, axis=0)
-            outputs = session.run(output_names, {input_name: batch})
-            features = np.asarray(outputs[0], dtype=np.float32)
-            if features.shape[0] != len(crops):
-                raise ValueError(
-                    f"Batched recognizer returned {features.shape[0]} embeddings "
-                    f"for {len(crops)} crops"
-                )
+            chunks: list[np.ndarray] = []
+            for start in range(0, len(crops), 16):
+                sub = crops[start : start + 16]
+                blobs = [np.asarray(preprocess(crop), dtype=np.float32) for crop in sub]
+                batch = np.concatenate(blobs, axis=0)
+                outputs = session.run(output_names, {input_name: batch})
+                part = np.asarray(outputs[0], dtype=np.float32)
+                if part.shape[0] != len(sub):
+                    raise ValueError(
+                        f"Batched recognizer returned {part.shape[0]} embeddings "
+                        f"for {len(sub)} crops"
+                    )
+                chunks.append(part.reshape(len(sub), -1))
+            features = np.vstack(chunks)
         except Exception:
             # Static batch-1 exports (and test doubles) reject N > 1. Fall back
             # to the per-crop loop for the rest of this recognizer's lifetime.

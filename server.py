@@ -101,9 +101,10 @@ class ProposeBoxesRequest(BaseModel):
     detector: str = ""
     recognizer: str = ""
     det_size: int = Field(1280, ge=320, le=2048, alias="detSize")
-    tiling_mode: TilingMode = Field("sahi_mid_band", alias="tilingMode")
-    det_thresh: float = Field(0.30, ge=0.05, le=0.95, alias="detThresh")
+    tiling_mode: TilingMode = Field("none", alias="tilingMode")
+    det_thresh: float = Field(0.45, ge=0.05, le=0.95, alias="detThresh")
     nms_thresh: float = Field(0.45, ge=0.1, le=0.9, alias="nmsThresh")
+    min_face_px: float = Field(14.0, ge=0.0, le=500.0, alias="minFacePx")
     accept_threshold: float = Field(0.38, ge=0.0, le=1.0, alias="acceptThreshold")
 
     model_config = {"populate_by_name": True}
@@ -2664,6 +2665,8 @@ def _propose_boxes_sync(dataset_id: str, request: ProposeBoxesRequest) -> dict:
                 for det, dec in zip(dets, decisions):
                     bbox = [round(float(v), 2) for v in det["bbox"][:4]]
                     height_px = max(0.0, bbox[3] - bbox[1])
+                    if height_px < request.min_face_px:
+                        continue
                     proposed.append(
                         {
                             "frame_id": frame_id,
@@ -2685,6 +2688,8 @@ def _propose_boxes_sync(dataset_id: str, request: ProposeBoxesRequest) -> dict:
                 for det in dets:
                     bbox = [round(float(v), 2) for v in det.bbox[:4]]
                     height_px = max(0.0, bbox[3] - bbox[1])
+                    if height_px < request.min_face_px:
+                        continue
                     proposed.append(
                         {
                             "frame_id": frame_id,

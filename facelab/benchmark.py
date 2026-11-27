@@ -397,7 +397,7 @@ def threshold_curve_datasets(
     gallery: dict[int, np.ndarray],
     *,
     variant: str = "flip_avg",
-    low: float = 0.25,
+    low: float | None = None,
     high: float = 0.75,
     step: float = 0.01,
     review_ratio: float = 0.8,
@@ -421,6 +421,10 @@ def threshold_curve_datasets(
     thresholds, so they are computed once per dataset up front instead of once
     per threshold step.
     """
+    if low is None:
+        # Impostor-centering shifts scores down by ~0.05-0.18; starting at 0.25
+        # pins tau* to the floor. Sweep from 0.05 so auto-calibration is fair.
+        low = 0.05 if score_norm == "impostor_center" else 0.25
     if step <= 0:
         raise ValueError("step must be positive")
     if low > high:

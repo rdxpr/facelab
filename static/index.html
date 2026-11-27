@@ -136,11 +136,11 @@
               <div class="controls two-col">
                 <div class="control" data-tip="Minimum cosine similarity to mark a student Present. Must also clear the min margin.">
                   <label for="accept-threshold">Accept threshold <output id="accept-threshold-value">0.42</output></label>
-                  <input id="accept-threshold" type="range" min="0.10" max="0.95" step="0.01" value="0.42" />
+                  <input id="accept-threshold" type="range" min="0.05" max="0.95" step="0.01" value="0.42" />
                 </div>
                 <div class="control" data-tip="Lower band: matches above this but below Accept are flagged Needs Review instead of Unknown.">
                   <label for="review-threshold">Review threshold <output id="review-threshold-value">0.34</output></label>
-                  <input id="review-threshold" type="range" min="0.05" max="0.90" step="0.01" value="0.34" />
+                  <input id="review-threshold" type="range" min="0.02" max="0.90" step="0.01" value="0.34" />
                 </div>
                 <div class="control" data-tip="Required gap between the #1 and #2 candidate scores. Rejects ambiguous look-alikes.">
                   <label for="min-margin">Min top1–top2 margin <output id="min-margin-value">0.04</output></label>
@@ -561,11 +561,25 @@
     <div id="annotator-modal" class="annotator" hidden role="dialog" aria-modal="true" aria-label="Dataset box annotator">
       <div class="lightbox-bar annotator-bar">
         <span id="annotator-title" class="lightbox-title mono"></span>
-        <span class="lightbox-hint">drag to draw box · click box to label · Del removes · ← → frames · Esc close</span>
+        <div class="ann-seg" role="group" aria-label="Annotator mode">
+          <button id="annotator-mode-inspect" class="ann-seg-btn active" type="button" title="Pan & zoom without drawing boxes (V)">Inspect</button>
+          <button id="annotator-mode-draw" class="ann-seg-btn" type="button" title="Drag on the frame to draw a new box (D)">Draw box</button>
+        </div>
+        <select id="annotator-visibility" class="input ann-select" title="Control which boxes and labels are visible">
+          <option value="boxes" selected>Boxes only</option>
+          <option value="selected">Selected only</option>
+          <option value="all">All labels</option>
+        </select>
+        <div class="ann-zoom-group">
+          <button id="annotator-zoom-out" class="btn ghost small" type="button" title="Zoom out">−</button>
+          <span id="annotator-zoom-readout" class="mono small muted">100%</span>
+          <button id="annotator-zoom-in" class="btn ghost small" type="button" title="Zoom in">+</button>
+          <button id="annotator-zoom-reset" class="btn ghost small" type="button" title="Reset view (0)">Reset</button>
+        </div>
         <button id="annotator-prev" class="btn ghost small" type="button" title="Previous frame">‹</button>
         <span id="annotator-frame-counter" class="mono small muted">1/1</span>
         <button id="annotator-next" class="btn ghost small" type="button" title="Next frame">›</button>
-        <button id="annotator-propose" class="btn ghost small" type="button" title="Run active detector (+ SAHI mid-band) to auto-propose face boxes">Auto-propose</button>
+        <button id="annotator-propose" class="btn ghost small" type="button" title="Run active detector to auto-propose face boxes">Auto-propose</button>
         <label class="inline-check" title="Include every student labelled on a box in the dataset's present roster">
           <input id="annotator-sync-present" type="checkbox" checked />
           <span>Sync present</span>

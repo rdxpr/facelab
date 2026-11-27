@@ -1672,6 +1672,9 @@ async function handleDatasetListClick(event) {
 
 /* ----------------------------------------------------- dataset annotator */
 
+const ANN_MIN_SCALE = 1;
+const ANN_MAX_SCALE = 8;
+
 function sizeBucketFor(heightPx) {
   if (heightPx >= 55) return "large";
   if (heightPx >= 30) return "medium";
@@ -1689,6 +1692,133 @@ function annotatorFrameBoxes() {
   const frame = annotatorCurrentFrame();
   if (!ann || !frame) return [];
   return ann.boxes.filter((box) => box.frame_id === frame.frame_id);
+}
+
+function fitAnnotatorStage() {
+  const ann = state.annotator;
+  const frame = annotatorCurrentFrame();
+  const viewport = $("#annotator-viewport");
+  const stage = $("#annotator-stage");
+  if (!ann || !frame || !viewport || !stage) return;
+  const pad = 20;
+  const vw = Math.max(1, viewport.clientWidth - pad * 2);
+  const vh = Math.max(1, viewport.clientHeight - pad * 2);
+  const aspect = (frame.width || 1) / (frame.height || 1);
+  let w = vw;
+  let h = vw / aspect;
+  if (h > vh) { h = vh; w = vh * aspect; }
+  ann.fit = { w, h };
+  stage.style.width = `${w}px`;
+  stage.style.height = `${h}px`;
+}
+
+function centerAnnotator() {
+  const ann = state.annotator;
+  const viewport = $("#annotator-viewport");
+  if (!ann || !ann.fit || !viewport) return;
+  ann.tx = (viewport.clientWidth - ann.fit.w * ann.scale) / 2;
+  ann.ty = (viewport.clientHeight - ann.fit.h * ann.scale) / 2;
+}
+
+function applyAnnotatorTransform() {
+  const ann = state.annotator;
+  const stage = $("#annotator-stage");
+  if (!ann || !stage) return;
+  stage.style.transform = `translate3d(${ann.tx}px, ${ann.ty}px, 0) scale(${ann.scale})`;
+  stage.style.setProperty("--ann-scale", String(ann.scale));
+  const readout = $("#annotator-zoom-readout");
+  if (readout) readout.textContent = `${Math.round(ann.scale * 100)}%`;
+}
+
+function annotatorResetZoom() {
+  const ann = state.annotator;
+  if (!ann) return;
+  fitAnnotatorStage();
+  ann.scale = 1;
+  centerAnnotator();
+  applyAnnotatorTransform();
+}
+
+function annotatorZoomAt(factor, clientX = null, clientY = null) {
+  const ann = state.annotator;
+  const viewport = $("#annotator-viewport");
+  if (!ann || !viewport) return;
+  const rect = viewport.getBoundingClientRect();
+  const px = clientX != null ? clientX - rect.left : rect.width / 2;
+  const py = clientY != null ? clientY - rect.top : rect.height / 2;
+  const next = clamp(ann.scale * factor, ANN_MIN_SCALE, ANN_MAX_SCALE);
+  const ratio = next / ann.scale;
+  ann.tx = px - (px - ann.tx) * ratio;
+  ann.ty = py - (py - ann.ty) * ratio;
+  ann.scale = next;
+  applyAnnotatorTransform();
+}
+
+function annotatorZoomToBox(box) {
+  const ann = state.annotator;
+  const frame = annotatorCurrentFrame();
+  const viewport = $("#annotator-viewport");
+  if (!ann || !box || !frame || !viewport) return;
+  if (!ann.fit) fitAnnotatorStage();
+  const [x1, y1, x2, y2] = box.bbox;
+  const cx = ((x1 + x2) / 2) / (frame.width || 1) * ann.fit.w;
+  const cy = ((y1 + y2) / 2) / (frame.height || 1) * ann.fit.h;
+  const boxFitH = Math.max(8, ((y2 - y1) / (frame.height || 1)) * ann.fit.h);
+  // Zoom so even a 22px back-row face fills ~170px in the viewport (clamped 2.5x..7x).
+  const targetScale = clamp(170 / boxFitH, 2.5, 7);
+  ann.scale = targetScale;
+  ann.tx = viewport.clientWidth / 2 - cx * targetScale;
+  ann.ty = viewport.clientHeight / 2 - cy * targetScale;
+  applyAnnotatorTransform();
+}
+
+function setAnnotatorMode(mode) {
+  const ann = state.annotator;
+  if (!ann) return;
+  ann.mode = mode === "draw" ? "draw" : "inspect";
+  $("#annotator-mode-inspect")?.classList.toggle("active", ann.mode === "inspect");
+  $("#annotator-mode-draw")?.classList.toggle("active", ann.mode === "draw");
+  const vp = $("#annotator-viewport");
+  if (vp) {
+    vp.classList.toggle("mode-inspect", ann.mode === "inspect");
+    vp.classList.toggle("mode-draw", ann.mode === "draw");
+  }
+}
+
+function setAnnotatorVisibility(vis) {
+  const ann = state.annotator;
+  if (!ann) return;
+  ann.visibility = vis;
+  const overlay = $("#annotator-overlay");
+  if (overlay) {
+    overlay.classList.remove("vis-boxes", "vis-selected", "vis-all");
+    overlay.classList.add(`vis-${vis}`);
+  }
+}
+
+function drawSelectedCropPreview(box) {
+  const canvas = $("#ann-crop-canvas");
+  const img = $("#annotator-img");
+  const frame = annotatorCurrentFrame();
+  if (!canvas || !img || !frame || !box) return;
+  const draw = () => {
+    if (!img.naturalWidth || !img.naturalHeight) return;
+    const ctx = canvas.getContext("2d");
+    const [x1, y1, x2, y2] = box.bbox;
+    const bw = Math.max(1, x2 - x1);
+    const bh = Math.max(1, y2 - y1);
+    const side = Math.max(bw, bh) * 1.6;
+    const cx = (x1 + x2) / 2;
+    const cy = (y1 + y2) / 2;
+    const sx = clamp(cx - side / 2, 0, Math.max(0, img.naturalWidth - 1));
+    const sy = clamp(cy - side / 2, 0, Math.max(0, img.naturalHeight - 1));
+    const sw = clamp(side, 1, img.naturalWidth - sx);
+    const sh = clamp(side, 1, img.naturalHeight - sy);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
+  };
+  if (img.complete && img.naturalWidth) draw();
+  else img.addEventListener("load", draw, { once: true });
 }
 
 async function openAnnotator(datasetId) {
@@ -1712,11 +1842,20 @@ async function openAnnotator(datasetId) {
       frameIndex: 0,
       boxes,
       selectedUid: boxes[0]?._uid || null,
+      mode: "inspect",
+      visibility: $("#annotator-visibility")?.value || "boxes",
+      scale: 1,
+      tx: 0,
+      ty: 0,
+      fit: null,
       dirty: false,
     };
     document.body.classList.add("lightbox-open");
     $("#annotator-modal").hidden = false;
+    setAnnotatorMode("inspect");
+    setAnnotatorVisibility(state.annotator.visibility);
     renderAnnotator();
+    window.requestAnimationFrame(() => annotatorResetZoom());
   } catch (error) {
     toast(error.message, "error");
   }
@@ -1740,6 +1879,7 @@ function annotatorStep(delta) {
   const frameBoxes = annotatorFrameBoxes();
   ann.selectedUid = frameBoxes[0]?._uid || null;
   renderAnnotator();
+  annotatorResetZoom();
 }
 
 function renderAnnotator() {
@@ -1766,6 +1906,8 @@ function renderAnnotator() {
   const w = frame.width || 1;
   const h = frame.height || 1;
   const overlay = $("#annotator-overlay");
+  overlay.classList.remove("vis-boxes", "vis-selected", "vis-all");
+  overlay.classList.add(`vis-${ann.visibility || "boxes"}`);
   overlay.innerHTML = frameBoxes
     .map((box, index) => {
       const [x1, y1, x2, y2] = box.bbox;
@@ -1786,7 +1928,7 @@ function renderAnnotatorSidebar(frameBoxes) {
   const editor = $("#annotator-selected");
   const selected = frameBoxes.find((b) => b._uid === ann.selectedUid) || null;
   if (!selected) {
-    editor.innerHTML = `<div class="muted small">Drag on the classroom frame to draw a face box, or click <b>Auto-propose</b> to detect faces automatically.</div>`;
+    editor.innerHTML = `<div class="muted small">Scroll to zoom &amp; drag to pan in <b>Inspect</b> mode. Switch to <b>Draw box (D)</b> to add a face, or click <b>Auto-propose</b>.</div>`;
   } else {
     const bh = Math.round(selected.bbox[3] - selected.bbox[1]);
     const bw = Math.round(selected.bbox[2] - selected.bbox[0]);
@@ -1800,7 +1942,14 @@ function renderAnnotatorSidebar(frameBoxes) {
       .map((b) => `<option value="${b}"${selected.row_bucket === b ? " selected" : ""}>${b}</option>`)
       .join("");
     editor.innerHTML = `
-      <div class="list-head" style="margin:0"><span>Selected box</span><span class="mono small muted">${bw}×${bh}px</span></div>
+      <div class="ann-crop-row">
+        <canvas id="ann-crop-canvas" class="ann-crop-canvas" width="128" height="128"></canvas>
+        <div class="ann-crop-info">
+          <span class="field-label" style="margin:0">Selected box</span>
+          <span class="mono small muted">${bw}×${bh}px · ${esc(selected.row_bucket)}</span>
+          <button id="ann-zoom-box" class="btn ghost small" type="button">Zoom to face</button>
+        </div>
+      </div>
       <label class="stacked">
         <span class="field-label">Student</span>
         <select id="ann-student" class="input">${studentOptions}</select>
@@ -1811,6 +1960,8 @@ function renderAnnotatorSidebar(frameBoxes) {
       </label>
       <button id="ann-delete-box" class="btn ghost small" type="button">Delete box (Del)</button>
     `;
+    drawSelectedCropPreview(selected);
+    $("#ann-zoom-box").addEventListener("click", () => annotatorZoomToBox(selected));
     $("#ann-student").addEventListener("change", (event) => {
       selected.student_id = event.target.value ? Number(event.target.value) : null;
       ann.dirty = true;
@@ -1868,8 +2019,9 @@ async function proposeAnnotatorBoxes() {
         detector: selection.detector,
         recognizer: selection.recognizer,
         detSize: selection.detSize,
-        tilingMode: selection.tilingMode === "none" ? "sahi_mid_band" : selection.tilingMode,
-        detThresh: Math.min(selection.detThresh, 0.30),
+        tilingMode: selection.tilingMode,
+        detThresh: Math.max(selection.detThresh, 0.45),
+        minFacePx: 14,
         nmsThresh: selection.nmsThresh,
         acceptThreshold: selection.acceptThreshold,
       }),
@@ -1941,24 +2093,49 @@ async function saveAnnotatorBoxes() {
 }
 
 function wireAnnotatorCanvas() {
+  const viewport = $("#annotator-viewport");
   const stage = $("#annotator-stage");
   const overlay = $("#annotator-overlay");
   let draft = null;
   let draftEl = null;
+  let pan = null;
 
   const toFrameCoords = (event) => {
     const frame = annotatorCurrentFrame();
     const rect = stage.getBoundingClientRect();
     const rx = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
     const ry = clamp((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1);
-    return { x: rx * (frame?.width || 1), y: ry * (frame?.height || 1), rx, ry };
+    return { x: rx * (frame?.width || 1), y: ry * (frame?.height || 1) };
   };
 
-  stage.addEventListener("pointerdown", (event) => {
-    if (!state.annotator || event.button !== 0) return;
+  viewport.addEventListener("wheel", (event) => {
+    if (!state.annotator) return;
+    event.preventDefault();
+    const factor = event.deltaY < 0 ? 1.18 : 1 / 1.18;
+    annotatorZoomAt(factor, event.clientX, event.clientY);
+  }, { passive: false });
+
+  viewport.addEventListener("pointerdown", (event) => {
+    const ann = state.annotator;
+    if (!ann || event.button !== 0) return;
     const hit = event.target.closest(".ann-box");
+    if (ann.mode === "inspect") {
+      pan = {
+        pointerId: event.pointerId,
+        x: event.clientX,
+        y: event.clientY,
+        tx: ann.tx,
+        ty: ann.ty,
+        moved: false,
+        hitUid: hit?.dataset?.uid || null,
+      };
+      viewport.classList.add("dragging");
+      try { viewport.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+      return;
+    }
+    // Draw mode: clicking an existing box selects it; dragging elsewhere draws a new box.
     if (hit) {
-      state.annotator.selectedUid = hit.dataset.uid;
+      ann.selectedUid = hit.dataset.uid;
       renderAnnotator();
       return;
     }
@@ -1967,60 +2144,114 @@ function wireAnnotatorCanvas() {
     draftEl = document.createElement("div");
     draftEl.className = "ann-box draft";
     overlay.append(draftEl);
-    try { stage.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+    try { viewport.setPointerCapture(event.pointerId); } catch { /* ignore */ }
   });
 
-  stage.addEventListener("pointermove", (event) => {
-    if (!draft || event.pointerId !== draft.pointerId) return;
-    const frame = annotatorCurrentFrame();
-    if (!frame) return;
-    const pt = toFrameCoords(event);
-    draft.x = pt.x;
-    draft.y = pt.y;
-    const x1 = Math.min(draft.startX, draft.x);
-    const y1 = Math.min(draft.startY, draft.y);
-    const x2 = Math.max(draft.startX, draft.x);
-    const y2 = Math.max(draft.startY, draft.y);
-    draftEl.style.left = `${(x1 / frame.width) * 100}%`;
-    draftEl.style.top = `${(y1 / frame.height) * 100}%`;
-    draftEl.style.width = `${((x2 - x1) / frame.width) * 100}%`;
-    draftEl.style.height = `${((y2 - y1) / frame.height) * 100}%`;
+  viewport.addEventListener("pointermove", (event) => {
+    const ann = state.annotator;
+    if (!ann) return;
+    if (pan && event.pointerId === pan.pointerId) {
+      const dx = event.clientX - pan.x;
+      const dy = event.clientY - pan.y;
+      if (!pan.moved && Math.hypot(dx, dy) > 4) pan.moved = true;
+      ann.tx = pan.tx + dx;
+      ann.ty = pan.ty + dy;
+      applyAnnotatorTransform();
+      return;
+    }
+    if (draft && event.pointerId === draft.pointerId) {
+      const frame = annotatorCurrentFrame();
+      if (!frame) return;
+      const pt = toFrameCoords(event);
+      draft.x = pt.x;
+      draft.y = pt.y;
+      const x1 = Math.min(draft.startX, draft.x);
+      const y1 = Math.min(draft.startY, draft.y);
+      const x2 = Math.max(draft.startX, draft.x);
+      const y2 = Math.max(draft.startY, draft.y);
+      draftEl.style.left = `${(x1 / frame.width) * 100}%`;
+      draftEl.style.top = `${(y1 / frame.height) * 100}%`;
+      draftEl.style.width = `${((x2 - x1) / frame.width) * 100}%`;
+      draftEl.style.height = `${((y2 - y1) / frame.height) * 100}%`;
+    }
   });
 
-  const finishDraft = (event) => {
-    if (!draft || event.pointerId !== draft.pointerId) return;
-    const frame = annotatorCurrentFrame();
-    const x1 = Math.min(draft.startX, draft.x);
-    const y1 = Math.min(draft.startY, draft.y);
-    const x2 = Math.max(draft.startX, draft.x);
-    const y2 = Math.max(draft.startY, draft.y);
-    draftEl?.remove();
-    draftEl = null;
-    try { stage.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
-    draft = null;
-    if (!frame || (x2 - x1) < 6 || (y2 - y1) < 6) return;
-    const uid = `d_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-    state.annotator.boxes.push({
-      _uid: uid,
-      frame_id: frame.frame_id,
-      bbox: [Math.round(x1 * 10) / 10, Math.round(y1 * 10) / 10, Math.round(x2 * 10) / 10, Math.round(y2 * 10) / 10],
-      student_id: null,
-      row_bucket: sizeBucketFor(y2 - y1),
-      occlusion: "none",
-    });
-    state.annotator.selectedUid = uid;
-    state.annotator.dirty = true;
-    renderAnnotator();
+  const endPointer = (event, cancelled = false) => {
+    const ann = state.annotator;
+    if (pan && event.pointerId === pan.pointerId) {
+      const wasClick = !cancelled && !pan.moved;
+      const hitUid = pan.hitUid;
+      viewport.classList.remove("dragging");
+      try { viewport.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
+      pan = null;
+      if (wasClick && hitUid && ann) {
+        ann.selectedUid = hitUid;
+        renderAnnotator();
+      }
+      return;
+    }
+    if (draft && event.pointerId === draft.pointerId) {
+      const frame = annotatorCurrentFrame();
+      const x1 = Math.min(draft.startX, draft.x);
+      const y1 = Math.min(draft.startY, draft.y);
+      const x2 = Math.max(draft.startX, draft.x);
+      const y2 = Math.max(draft.startY, draft.y);
+      draftEl?.remove();
+      draftEl = null;
+      try { viewport.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
+      draft = null;
+      if (cancelled || !frame || !ann || (x2 - x1) < 6 || (y2 - y1) < 6) return;
+      const uid = `d_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      ann.boxes.push({
+        _uid: uid,
+        frame_id: frame.frame_id,
+        bbox: [Math.round(x1 * 10) / 10, Math.round(y1 * 10) / 10, Math.round(x2 * 10) / 10, Math.round(y2 * 10) / 10],
+        student_id: null,
+        row_bucket: sizeBucketFor(y2 - y1),
+        occlusion: "none",
+      });
+      ann.selectedUid = uid;
+      ann.dirty = true;
+      renderAnnotator();
+    }
   };
 
-  stage.addEventListener("pointerup", finishDraft);
-  stage.addEventListener("pointercancel", finishDraft);
+  viewport.addEventListener("pointerup", (event) => endPointer(event, false));
+  viewport.addEventListener("pointercancel", (event) => endPointer(event, true));
+  viewport.addEventListener("dblclick", (event) => {
+    if (!state.annotator) return;
+    const hit = event.target.closest(".ann-box");
+    if (hit) {
+      const box = annotatorFrameBoxes().find((b) => b._uid === hit.dataset.uid);
+      if (box) {
+        state.annotator.selectedUid = box._uid;
+        renderAnnotator();
+        annotatorZoomToBox(box);
+      }
+      return;
+    }
+    annotatorResetZoom();
+  });
 
   $("#annotator-list").addEventListener("click", (event) => {
     const row = event.target.closest(".ann-row");
     if (!row || !state.annotator) return;
     state.annotator.selectedUid = row.dataset.uid;
     renderAnnotator();
+    const box = annotatorFrameBoxes().find((b) => b._uid === row.dataset.uid);
+    if (box) annotatorZoomToBox(box);
+  });
+
+  $("#annotator-mode-inspect")?.addEventListener("click", () => setAnnotatorMode("inspect"));
+  $("#annotator-mode-draw")?.addEventListener("click", () => setAnnotatorMode("draw"));
+  $("#annotator-visibility")?.addEventListener("change", (event) => setAnnotatorVisibility(event.target.value));
+  $("#annotator-zoom-in")?.addEventListener("click", () => annotatorZoomAt(1.35));
+  $("#annotator-zoom-out")?.addEventListener("click", () => annotatorZoomAt(1 / 1.35));
+  $("#annotator-zoom-reset")?.addEventListener("click", annotatorResetZoom);
+  window.addEventListener("resize", () => {
+    if (!state.annotator) return;
+    fitAnnotatorStage();
+    applyAnnotatorTransform();
   });
 }
 
@@ -2928,6 +3159,9 @@ function wireEvents() {
       if (state.studentsOpen) { closeStudentsDrawer(); return; }
     }
     if (state.annotator && !typing) {
+      if (event.key === "v" || event.key === "V") { setAnnotatorMode("inspect"); return; }
+      if (event.key === "d" || event.key === "D") { setAnnotatorMode("draw"); return; }
+      if (event.key === "0") { annotatorResetZoom(); return; }
       if (event.key === "ArrowLeft") { annotatorStep(-1); return; }
       if (event.key === "ArrowRight") { annotatorStep(1); return; }
       if (event.key === "Delete" || event.key === "Backspace") {

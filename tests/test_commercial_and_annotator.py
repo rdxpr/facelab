@@ -90,3 +90,27 @@ def test_update_dataset_normalizes_boxes_and_updates_manifest(tmp_path, monkeypa
     assert gt["annotated_boxes"][0]["row_bucket"] == "large"
     assert gt["annotated_boxes"][1]["row_bucket"] == "small"
     assert gt["annotated_boxes"][1]["bbox"] == [500.0, 390.0, 520.0, 410.0]
+
+
+def test_threshold_curve_lowers_floor_for_impostor_center():
+    from facelab import benchmark
+
+    # 3 students so impostor_center activates; student 1 matches at raw 0.34 while
+    # non-top-1 impostors average 0.16 -> shifted genuine score is 0.18 (below 0.25!).
+    def _u(v):
+        a = np.asarray(v, dtype=np.float32)
+        return a / np.linalg.norm(a)
+
+    gallery = {
+        1: _u([1.0, 0.0, 0.0, 0.0])[None, :],
+        2: _u([0.0, 1.0, 0.0, 0.0])[None, :],
+        3: _u([0.0, 0.0, 1.0, 0.0])[None, :],
+    }
+    probe = _u([0.34, 0.16, 0.16, 0.91])
+    frames = [{"frame_id": "f1", "width": 1000, "height": 1000, "detections": [{"bbox": [10, 10, 60, 60], "embedding": probe}]}]
+    curve = benchmark.threshold_curve_datasets(
+        [(frames, [1])], gallery, variant="raw", k=1, score_norm="impostor_center"
+    )
+    assert curve[0]["threshold"] == 0.05
+    best = benchmark.pick_operating_points(curve)["best_f1"]
+    assert best is not None and best["f1"] == 1.0 and best["threshold"] < 0.25
