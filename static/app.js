@@ -42,6 +42,9 @@ const state = {
   datasetFiles: [],
   datasetPresent: new Set(),
   datasetBoxes: {},
+  commercialOnly: false,
+  benchCommercialOnly: false,
+  annotator: null,
   busy: false,
   studentsOpen: false,
   toastTimer: null,
@@ -336,8 +339,10 @@ function readSelection() {
     minQuality: readNumber("min-quality", 0),
     assignmentMode: $("#assignment-mode").value,
     templateStrategy: $("#template-strategy").value,
+    templateTopK: Math.max(1, Math.round(readNumber("template-top-k", state.settings.templateTopK ?? 2))),
     fusionMode: $("#fusion-mode").value,
     fusionK: Math.max(1, Math.round(readNumber("fusion-k", 2))),
+    scoreNorm: $("#score-norm")?.value || "none",
     flipAug: $("#flip-aug").checked,
     lowresAug: $("#lowres-aug").checked,
     withQuality: $("#with-quality").checked,
@@ -390,11 +395,35 @@ function constrainDetSize() {
   }
 }
 
+function licenseBadgeHtml(entry) {
+  if (!entry) return "";
+  const lic = entry.license || "unknown";
+  const ok = Boolean(entry.commercial_safe);
+  const short = ok ? lic : (lic.toLowerCase().includes("agpl") ? "AGPL-3.0" : "Non-Commercial");
+  return `<span class="lic-pill ${ok ? "ok" : "nc"}" title="${esc(lic)}">${esc(short)}</span>`;
+}
+
 function renderModelPickers() {
-  const { detectors, recognizers } = state.registry;
-  fillSelect($("#detector-select"), detectors, state.detector, (entry) => entry.label || entry.id);
-  fillSelect($("#recognizer-select"), recognizers, state.recognizer, (entry) => entry.label || entry.id);
-  const recognizerEntry = recognizers.find((entry) => entry.id === state.recognizer);
+  const filter = (entries) =>
+    state.commercialOnly ? entries.filter((entry) => entry.commercial_safe) : entries;
+  const detectors = filter(state.registry.detectors);
+  const recognizers = filter(state.registry.recognizers);
+  const pickIfNeeded = (list, current) => {
+    if (list.some((entry) => entry.id === current && entry.available !== false)) return current;
+    return list.find((entry) => entry.available !== false)?.id || list[0]?.id || current;
+  };
+  if (state.commercialOnly) {
+    state.detector = pickIfNeeded(detectors, state.detector);
+    state.recognizer = pickIfNeeded(recognizers, state.recognizer);
+  }
+  const labelWithLic = (entry) => {
+    const base = entry.label || entry.id;
+    const tag = entry.commercial_safe ? "" : " [NC]";
+    return `${base}${tag}`;
+  };
+  fillSelect($("#detector-select"), detectors, state.detector, labelWithLic);
+  fillSelect($("#recognizer-select"), recognizers, state.recognizer, labelWithLic);
+  const recognizerEntry = state.registry.recognizers.find((entry) => entry.id === state.recognizer);
   $("#scan-recognizer").textContent = recognizerEntry?.label || state.recognizer;
   constrainDetSize();
 }
@@ -741,8 +770,10 @@ function scanForm() {
   form.append("minQuality", String(selection.minQuality));
   form.append("assignmentMode", selection.assignmentMode);
   form.append("templateStrategy", selection.templateStrategy);
+  form.append("topK", String(selection.templateTopK));
   form.append("fusionMode", selection.fusionMode);
   form.append("fusionK", String(selection.fusionK));
+  form.append("scoreNorm", selection.scoreNorm);
   form.append("flipAug", String(selection.flipAug));
   form.append("lowresAug", String(selection.lowresAug));
   form.append("withQuality", String(selection.withQuality));
@@ -821,10 +852,11 @@ async function liveSweep() {
     min_margin: selection.minMargin,
     assignment_mode: selection.assignmentMode,
     template_strategy: selection.templateStrategy,
-    top_k: scan.summary?.topK ?? state.settings.templateTopK ?? 2,
+    top_k: selection.templateTopK,
     fusion_mode: selection.fusionMode,
     k: Math.round(selection.fusionK),
     min_quality: selection.minQuality,
+    score_norm: selection.scoreNorm,
   };
   try {
     const data = await api(`/api/results/${encodeURIComponent(scan.scanId)}/sweep`, jsonRequest(payload));
@@ -1559,6 +1591,7 @@ function renderDatasets() {
           <div class="history-meta">${plural(dataset.frames, "frame")} · ${dataset.present} labelled present · ${dataset.annotatedBoxes} boxes · ${esc(formatWhen(dataset.createdAt))}</div>
         </div>
         <div class="history-actions">
+          <button class="btn ghost small" type="button" data-action="annotate-dataset">Annotate</button>
           <button class="btn ghost small" type="button" data-action="use-dataset">Benchmark</button>
           <button class="icon-btn" type="button" data-action="delete-dataset" title="Delete dataset">×</button>
         </div>
@@ -1626,11 +1659,369 @@ async function handleDatasetListClick(event) {
     } catch (error) { toast(error.message, "error"); }
     return;
   }
+  if (action === "annotate-dataset") {
+    await openAnnotator(datasetId);
+    return;
+  }
   if (action === "use-dataset") {
     switchTab("benchmark");
     const input = $(`#bench-datasets input[value="${CSS.escape(datasetId)}"]`);
     if (input) input.checked = true;
   }
+}
+
+/* ----------------------------------------------------- dataset annotator */
+
+function sizeBucketFor(heightPx) {
+  if (heightPx >= 55) return "large";
+  if (heightPx >= 30) return "medium";
+  return "small";
+}
+
+function annotatorCurrentFrame() {
+  const ann = state.annotator;
+  if (!ann) return null;
+  return ann.manifest.frames?.[ann.frameIndex] || null;
+}
+
+function annotatorFrameBoxes() {
+  const ann = state.annotator;
+  const frame = annotatorCurrentFrame();
+  if (!ann || !frame) return [];
+  return ann.boxes.filter((box) => box.frame_id === frame.frame_id);
+}
+
+async function openAnnotator(datasetId) {
+  try {
+    const manifest = await api(`/api/datasets/${encodeURIComponent(datasetId)}`);
+    if (!manifest.frames?.length) {
+      toast("This dataset has no frames to annotate", "error");
+      return;
+    }
+    const boxes = (manifest.ground_truth?.annotated_boxes || []).map((b, idx) => ({
+      _uid: `b_${idx}_${Date.now()}`,
+      frame_id: b.frame_id || manifest.frames[0].frame_id,
+      bbox: [...b.bbox],
+      student_id: b.student_id ?? null,
+      row_bucket: b.row_bucket || sizeBucketFor((b.bbox?.[3] || 0) - (b.bbox?.[1] || 0)),
+      occlusion: b.occlusion || "none",
+    }));
+    state.annotator = {
+      datasetId,
+      manifest,
+      frameIndex: 0,
+      boxes,
+      selectedUid: boxes[0]?._uid || null,
+      dirty: false,
+    };
+    document.body.classList.add("lightbox-open");
+    $("#annotator-modal").hidden = false;
+    renderAnnotator();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+}
+
+function closeAnnotator() {
+  if (!state.annotator) return;
+  if (state.annotator.dirty && !window.confirm("Discard unsaved box annotations?")) return;
+  state.annotator = null;
+  document.body.classList.remove("lightbox-open");
+  $("#annotator-modal").hidden = true;
+}
+
+function annotatorStep(delta) {
+  const ann = state.annotator;
+  if (!ann) return;
+  const frames = ann.manifest.frames || [];
+  const next = clamp(ann.frameIndex + delta, 0, Math.max(0, frames.length - 1));
+  if (next === ann.frameIndex) return;
+  ann.frameIndex = next;
+  const frameBoxes = annotatorFrameBoxes();
+  ann.selectedUid = frameBoxes[0]?._uid || null;
+  renderAnnotator();
+}
+
+function renderAnnotator() {
+  const ann = state.annotator;
+  if (!ann) return;
+  const frames = ann.manifest.frames || [];
+  const frame = annotatorCurrentFrame();
+  if (!frame) return;
+
+  $("#annotator-title").textContent = `${ann.manifest.name || ann.datasetId} · ${frame.frame_id} (${frame.width}×${frame.height})`;
+  $("#annotator-frame-counter").textContent = `${ann.frameIndex + 1}/${frames.length}`;
+  $("#annotator-prev").disabled = ann.frameIndex <= 0;
+  $("#annotator-next").disabled = ann.frameIndex >= frames.length - 1;
+
+  const img = $("#annotator-img");
+  const url = `/media/datasets/${encodeURIComponent(ann.datasetId)}/${frame.filename}`;
+  if (img.getAttribute("src") !== url) img.setAttribute("src", url);
+
+  const frameBoxes = annotatorFrameBoxes();
+  if (ann.selectedUid && !frameBoxes.some((b) => b._uid === ann.selectedUid)) {
+    ann.selectedUid = frameBoxes[0]?._uid || null;
+  }
+
+  const w = frame.width || 1;
+  const h = frame.height || 1;
+  const overlay = $("#annotator-overlay");
+  overlay.innerHTML = frameBoxes
+    .map((box, index) => {
+      const [x1, y1, x2, y2] = box.bbox;
+      const person = box.student_id != null ? personById(box.student_id) : null;
+      const label = person ? `#${person.number} ${person.name}` : `Box ${index + 1}`;
+      const cls = `ann-box${person ? " labelled" : ""}${box._uid === ann.selectedUid ? " selected" : ""}`;
+      const style = `left:${(x1 / w) * 100}%;top:${(y1 / h) * 100}%;width:${((x2 - x1) / w) * 100}%;height:${((y2 - y1) / h) * 100}%`;
+      return `<div class="${cls}" data-uid="${esc(box._uid)}" style="${style}"><span class="ann-tag">${esc(label)} · ${esc(box.row_bucket[0].toUpperCase())}</span></div>`;
+    })
+    .join("");
+
+  $("#annotator-box-count").textContent = `${frameBoxes.length} (${ann.boxes.length} total)`;
+  renderAnnotatorSidebar(frameBoxes);
+}
+
+function renderAnnotatorSidebar(frameBoxes) {
+  const ann = state.annotator;
+  const editor = $("#annotator-selected");
+  const selected = frameBoxes.find((b) => b._uid === ann.selectedUid) || null;
+  if (!selected) {
+    editor.innerHTML = `<div class="muted small">Drag on the classroom frame to draw a face box, or click <b>Auto-propose</b> to detect faces automatically.</div>`;
+  } else {
+    const bh = Math.round(selected.bbox[3] - selected.bbox[1]);
+    const bw = Math.round(selected.bbox[2] - selected.bbox[0]);
+    const studentOptions = [
+      `<option value="">(unlabelled / unknown)</option>`,
+      ...state.people.map(
+        (p) => `<option value="${p.id}"${Number(selected.student_id) === p.id ? " selected" : ""}>#${String(p.number).padStart(2, "0")} ${esc(p.name)}</option>`,
+      ),
+    ].join("");
+    const bucketOptions = ["large", "medium", "small"]
+      .map((b) => `<option value="${b}"${selected.row_bucket === b ? " selected" : ""}>${b}</option>`)
+      .join("");
+    editor.innerHTML = `
+      <div class="list-head" style="margin:0"><span>Selected box</span><span class="mono small muted">${bw}×${bh}px</span></div>
+      <label class="stacked">
+        <span class="field-label">Student</span>
+        <select id="ann-student" class="input">${studentOptions}</select>
+      </label>
+      <label class="stacked">
+        <span class="field-label">Size bucket</span>
+        <select id="ann-bucket" class="input">${bucketOptions}</select>
+      </label>
+      <button id="ann-delete-box" class="btn ghost small" type="button">Delete box (Del)</button>
+    `;
+    $("#ann-student").addEventListener("change", (event) => {
+      selected.student_id = event.target.value ? Number(event.target.value) : null;
+      ann.dirty = true;
+      renderAnnotator();
+    });
+    $("#ann-bucket").addEventListener("change", (event) => {
+      selected.row_bucket = event.target.value;
+      ann.dirty = true;
+      renderAnnotator();
+    });
+    $("#ann-delete-box").addEventListener("click", () => deleteSelectedAnnotatorBox());
+  }
+
+  const list = $("#annotator-list");
+  if (!frameBoxes.length) {
+    list.innerHTML = `<div class="muted small">No boxes on this frame yet.</div>`;
+    return;
+  }
+  list.innerHTML = frameBoxes
+    .map((box, idx) => {
+      const person = box.student_id != null ? personById(box.student_id) : null;
+      const name = person ? `#${String(person.number).padStart(2, "0")} ${person.name}` : `Unlabelled #${idx + 1}`;
+      const bh = Math.round(box.bbox[3] - box.bbox[1]);
+      return `
+        <div class="ann-row${box._uid === ann.selectedUid ? " selected" : ""}" data-uid="${esc(box._uid)}">
+          <span>${esc(name)}</span>
+          <span class="ann-row-meta">${esc(box.row_bucket)} · ${bh}px</span>
+        </div>`;
+    })
+    .join("");
+}
+
+function deleteSelectedAnnotatorBox() {
+  const ann = state.annotator;
+  if (!ann || !ann.selectedUid) return;
+  ann.boxes = ann.boxes.filter((b) => b._uid !== ann.selectedUid);
+  ann.selectedUid = annotatorFrameBoxes()[0]?._uid || null;
+  ann.dirty = true;
+  renderAnnotator();
+}
+
+async function proposeAnnotatorBoxes() {
+  const ann = state.annotator;
+  if (!ann) return;
+  const btn = $("#annotator-propose");
+  if (btn.disabled) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Detecting…";
+  try {
+    const selection = readSelection();
+    const data = await api(
+      `/api/datasets/${encodeURIComponent(ann.datasetId)}/propose-boxes`,
+      jsonRequest({
+        detector: selection.detector,
+        recognizer: selection.recognizer,
+        detSize: selection.detSize,
+        tilingMode: selection.tilingMode === "none" ? "sahi_mid_band" : selection.tilingMode,
+        detThresh: Math.min(selection.detThresh, 0.30),
+        nmsThresh: selection.nmsThresh,
+        acceptThreshold: selection.acceptThreshold,
+      }),
+    );
+    const incoming = (data.boxes || []).map((b, idx) => ({
+      _uid: `p_${idx}_${Date.now()}`,
+      frame_id: b.frame_id,
+      bbox: b.bbox,
+      student_id: b.student_id ?? null,
+      row_bucket: b.row_bucket || sizeBucketFor((b.bbox?.[3] || 0) - (b.bbox?.[1] || 0)),
+      occlusion: b.occlusion || "none",
+    }));
+    if (!ann.boxes.length || window.confirm(`Replace ${ann.boxes.length} existing box(es) with ${incoming.length} proposed box(es)?`)) {
+      ann.boxes = incoming;
+      ann.selectedUid = annotatorFrameBoxes()[0]?._uid || null;
+      ann.dirty = true;
+      renderAnnotator();
+      toast(`Proposed ${incoming.length} face boxes via ${data.detector.split(":").pop()} (${data.tilingMode})`, "ok");
+    }
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+async function saveAnnotatorBoxes() {
+  const ann = state.annotator;
+  if (!ann) return;
+  const btn = $("#annotator-save");
+  if (btn.disabled) return;
+  btn.disabled = true;
+  const orig = btn.textContent;
+  btn.textContent = "Saving…";
+  try {
+    const cleanBoxes = ann.boxes.map((b) => ({
+      frame_id: b.frame_id,
+      bbox: b.bbox,
+      student_id: b.student_id,
+      row_bucket: b.row_bucket,
+      occlusion: b.occlusion || "none",
+    }));
+    const payload = { boxes: cleanBoxes };
+    if ($("#annotator-sync-present")?.checked) {
+      const existing = new Set(ann.manifest.ground_truth?.present_student_ids || []);
+      for (const b of cleanBoxes) {
+        if (b.student_id != null) existing.add(Number(b.student_id));
+      }
+      payload.presentIds = [...existing];
+    }
+    const data = await api(`/api/datasets/${encodeURIComponent(ann.datasetId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    ann.manifest = data.dataset;
+    ann.dirty = false;
+    state.datasets = data.datasets || state.datasets;
+    renderDatasets();
+    renderBenchDatasets();
+    toast(`Saved ${cleanBoxes.length} annotated box(es)`, "ok");
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function wireAnnotatorCanvas() {
+  const stage = $("#annotator-stage");
+  const overlay = $("#annotator-overlay");
+  let draft = null;
+  let draftEl = null;
+
+  const toFrameCoords = (event) => {
+    const frame = annotatorCurrentFrame();
+    const rect = stage.getBoundingClientRect();
+    const rx = clamp((event.clientX - rect.left) / Math.max(1, rect.width), 0, 1);
+    const ry = clamp((event.clientY - rect.top) / Math.max(1, rect.height), 0, 1);
+    return { x: rx * (frame?.width || 1), y: ry * (frame?.height || 1), rx, ry };
+  };
+
+  stage.addEventListener("pointerdown", (event) => {
+    if (!state.annotator || event.button !== 0) return;
+    const hit = event.target.closest(".ann-box");
+    if (hit) {
+      state.annotator.selectedUid = hit.dataset.uid;
+      renderAnnotator();
+      return;
+    }
+    const start = toFrameCoords(event);
+    draft = { startX: start.x, startY: start.y, x: start.x, y: start.y, pointerId: event.pointerId };
+    draftEl = document.createElement("div");
+    draftEl.className = "ann-box draft";
+    overlay.append(draftEl);
+    try { stage.setPointerCapture(event.pointerId); } catch { /* ignore */ }
+  });
+
+  stage.addEventListener("pointermove", (event) => {
+    if (!draft || event.pointerId !== draft.pointerId) return;
+    const frame = annotatorCurrentFrame();
+    if (!frame) return;
+    const pt = toFrameCoords(event);
+    draft.x = pt.x;
+    draft.y = pt.y;
+    const x1 = Math.min(draft.startX, draft.x);
+    const y1 = Math.min(draft.startY, draft.y);
+    const x2 = Math.max(draft.startX, draft.x);
+    const y2 = Math.max(draft.startY, draft.y);
+    draftEl.style.left = `${(x1 / frame.width) * 100}%`;
+    draftEl.style.top = `${(y1 / frame.height) * 100}%`;
+    draftEl.style.width = `${((x2 - x1) / frame.width) * 100}%`;
+    draftEl.style.height = `${((y2 - y1) / frame.height) * 100}%`;
+  });
+
+  const finishDraft = (event) => {
+    if (!draft || event.pointerId !== draft.pointerId) return;
+    const frame = annotatorCurrentFrame();
+    const x1 = Math.min(draft.startX, draft.x);
+    const y1 = Math.min(draft.startY, draft.y);
+    const x2 = Math.max(draft.startX, draft.x);
+    const y2 = Math.max(draft.startY, draft.y);
+    draftEl?.remove();
+    draftEl = null;
+    try { stage.releasePointerCapture(event.pointerId); } catch { /* ignore */ }
+    draft = null;
+    if (!frame || (x2 - x1) < 6 || (y2 - y1) < 6) return;
+    const uid = `d_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    state.annotator.boxes.push({
+      _uid: uid,
+      frame_id: frame.frame_id,
+      bbox: [Math.round(x1 * 10) / 10, Math.round(y1 * 10) / 10, Math.round(x2 * 10) / 10, Math.round(y2 * 10) / 10],
+      student_id: null,
+      row_bucket: sizeBucketFor(y2 - y1),
+      occlusion: "none",
+    });
+    state.annotator.selectedUid = uid;
+    state.annotator.dirty = true;
+    renderAnnotator();
+  };
+
+  stage.addEventListener("pointerup", finishDraft);
+  stage.addEventListener("pointercancel", finishDraft);
+
+  $("#annotator-list").addEventListener("click", (event) => {
+    const row = event.target.closest(".ann-row");
+    if (!row || !state.annotator) return;
+    state.annotator.selectedUid = row.dataset.uid;
+    renderAnnotator();
+  });
 }
 
 /* -------------------------------------------------------------- benchmark */
@@ -1643,17 +2034,18 @@ function renderBenchOptions() {
   const keep = { det: prior("bench-detectors"), rec: prior("bench-recognizers"), size: prior("bench-det-sizes"), tile: prior("bench-tilings") };
   const on = (set, value, fallback) => ((set ? set.has(String(value)) : fallback) ? "checked" : "");
 
-  const detectors = state.registry.detectors.filter((entry) => entry.available);
-  const recognizers = state.registry.recognizers.filter((entry) => entry.available);
+  const commFilter = (entry) => entry.available && (!state.benchCommercialOnly || entry.commercial_safe);
+  const detectors = state.registry.detectors.filter(commFilter);
+  const recognizers = state.registry.recognizers.filter(commFilter);
   $("#bench-detectors").innerHTML = detectors.length
     ? detectors.map((entry) => {
         const note = entry.input_sizes ? ` · ${entry.input_sizes.join("/")}px only` : "";
-        return `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.det, entry.id, true)}><span>${esc(entry.label)}<span class="muted">${esc(note)}</span></span></label>`;
+        return `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.det, entry.id, true)}><span>${esc(entry.label)}${licenseBadgeHtml(entry)}<span class="muted">${esc(note)}</span></span></label>`;
       }).join("")
-    : `<div class="muted small">No detectors installed.</div>`;
+    : `<div class="muted small">No matching detectors installed.</div>`;
   $("#bench-recognizers").innerHTML = recognizers.length
-    ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.rec, entry.id, true)}><span>${esc(entry.label)}</span></label>`).join("")
-    : `<div class="muted small">No recognizers installed.</div>`;
+    ? recognizers.map((entry) => `<label class="check"><input type="checkbox" value="${esc(entry.id)}" ${on(keep.rec, entry.id, true)}><span>${esc(entry.label)}${licenseBadgeHtml(entry)}</span></label>`).join("")
+    : `<div class="muted small">No matching recognizers installed.</div>`;
 
   const sizes = [...new Set([...(state.settings.benchmarkDetSizes || []), 640, 1024, 1280, 1600])].sort((a, b) => a - b);
   $("#bench-det-sizes").innerHTML = sizes
@@ -1720,6 +2112,7 @@ async function runBenchmark() {
     fusion_mode: $("#bench-fusion").value,
     k: Math.max(1, Math.round(readNumber("bench-fusion-k", state.settings.fusionK ?? 2))),
     min_quality: readNumber("bench-min-quality", state.settings.minFaceQuality ?? 0),
+    score_norm: $("#bench-score-norm")?.value || "none",
     variant: $("#bench-variant")?.value || null,
     force_fresh: $("#bench-force-fresh").checked,
     label_unknown: $("#bench-label-unknown").checked,
@@ -1995,6 +2388,9 @@ function applyRecipeToScan(row) {
   setSelectValue("fusion-mode", recipe.fusionMode);
   const fusionK = $("#fusion-k");
   if (fusionK && recipe.fusionK != null) fusionK.value = String(recipe.fusionK);
+  const topKInput = $("#template-top-k");
+  if (topKInput && recipe.topK != null) topKInput.value = String(recipe.topK);
+  if (recipe.scoreNorm) setSelectValue("score-norm", recipe.scoreNorm);
   const setToggle = (id, on) => {
     const element = $(`#${id}`);
     if (element && on !== undefined && on !== null) element.checked = Boolean(on);
@@ -2265,6 +2661,9 @@ function applySettings(settings) {
   setSelectValue("template-strategy", state.settings.templateStrategy);
   setSelectValue("fusion-mode", state.settings.fusionMode);
   $("#fusion-k").value = String(state.settings.fusionK);
+  if ($("#template-top-k")) $("#template-top-k").value = String(state.settings.templateTopK ?? 2);
+  if ($("#score-norm")) setSelectValue("score-norm", state.settings.scoreNorm || "none");
+  if ($("#bench-score-norm")) setSelectValue("bench-score-norm", state.settings.scoreNorm || "none");
   if ($("#bench-review")) $("#bench-review").value = String(state.settings.reviewThreshold);
   if ($("#bench-margin")) $("#bench-margin").value = String(state.settings.minMargin);
   if ($("#bench-det-thresh")) $("#bench-det-thresh").value = String(state.settings.detThresh);
@@ -2350,9 +2749,24 @@ function wireEvents() {
 
   // Detector thresholds change detection itself, so they need a fresh scan;
   // only the embedding-space knobs can be swept from the cache.
-  for (const id of ["accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "assignment-mode", "template-strategy", "fusion-mode"]) {
-    $(`#${id}`).addEventListener("change", scheduleSweep);
+  for (const id of ["accept-threshold", "review-threshold", "min-margin", "min-quality", "fusion-k", "template-top-k", "score-norm", "assignment-mode", "template-strategy", "fusion-mode"]) {
+    $(`#${id}`)?.addEventListener("change", scheduleSweep);
   }
+  $("#commercial-only")?.addEventListener("change", (event) => {
+    state.commercialOnly = event.target.checked;
+    renderModelPickers();
+    refreshModelStatus();
+  });
+  $("#bench-commercial-only")?.addEventListener("change", (event) => {
+    state.benchCommercialOnly = event.target.checked;
+    renderBenchOptions();
+  });
+  $("#annotator-close")?.addEventListener("click", closeAnnotator);
+  $("#annotator-prev")?.addEventListener("click", () => annotatorStep(-1));
+  $("#annotator-next")?.addEventListener("click", () => annotatorStep(1));
+  $("#annotator-propose")?.addEventListener("click", proposeAnnotatorBoxes);
+  $("#annotator-save")?.addEventListener("click", saveAnnotatorBoxes);
+  wireAnnotatorCanvas();
 
   $("#detector-select").addEventListener("change", () => {
     state.detector = $("#detector-select").value;
@@ -2507,10 +2921,20 @@ function wireEvents() {
         target.isContentEditable);
     if (event.key === "Escape") {
       hideTooltip();
+      if (state.annotator) { closeAnnotator(); return; }
       if (state.inspector) { closeInspector(); return; }
       if (state.lightbox) { closeLightbox(); return; }
       if (state.frameZoom) { resetFrameZoom(); return; }
       if (state.studentsOpen) { closeStudentsDrawer(); return; }
+    }
+    if (state.annotator && !typing) {
+      if (event.key === "ArrowLeft") { annotatorStep(-1); return; }
+      if (event.key === "ArrowRight") { annotatorStep(1); return; }
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteSelectedAnnotatorBox();
+        return;
+      }
     }
     // Never hijack browser shortcuts (Ctrl/Cmd/Alt+F), and only act on the tab
     // that owns the shortcut.

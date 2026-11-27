@@ -77,6 +77,7 @@ FusionMode = Literal[
     "max_with_margin_gate",
     "quality_weighted_embedding_cluster",
 ]
+ScoreNormMode = Literal["none", "impostor_center"]
 
 
 class RenameRequest(BaseModel):
@@ -85,6 +86,27 @@ class RenameRequest(BaseModel):
 
 class ReEmbedRequest(BaseModel):
     recognizer_ids: list[str] = []
+
+
+class DatasetUpdateRequest(BaseModel):
+    name: str | None = None
+    notes: str | None = None
+    present_ids: list[int] | None = Field(default=None, alias="presentIds")
+    boxes: list[dict] | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class ProposeBoxesRequest(BaseModel):
+    detector: str = ""
+    recognizer: str = ""
+    det_size: int = Field(1280, ge=320, le=2048, alias="detSize")
+    tiling_mode: TilingMode = Field("sahi_mid_band", alias="tilingMode")
+    det_thresh: float = Field(0.30, ge=0.05, le=0.95, alias="detThresh")
+    nms_thresh: float = Field(0.45, ge=0.1, le=0.9, alias="nmsThresh")
+    accept_threshold: float = Field(0.38, ge=0.0, le=1.0, alias="acceptThreshold")
+
+    model_config = {"populate_by_name": True}
 
 
 class BenchmarkRunRequest(BaseModel):
@@ -109,6 +131,7 @@ class BenchmarkRunRequest(BaseModel):
     fusion_mode: FusionMode = "k_of_n_voting"
     k: int = Field(2, ge=1, le=60)
     min_quality: float = Field(0.0, ge=0.0, le=1.0)
+    score_norm: ScoreNormMode = "none"
     force_fresh: bool = False
     label_unknown: bool = False
 
@@ -135,6 +158,7 @@ class SweepRequest(BaseModel):
     fusion_mode: FusionMode = "k_of_n_voting"
     k: int = Field(2, ge=1, le=60)
     min_quality: float = Field(0.0, ge=0.0, le=1.0)
+    score_norm: ScoreNormMode = "none"
 
 
 # --------------------------------------------------------------------------- #
@@ -490,6 +514,7 @@ def _settings_payload() -> dict:
         "fusionMode": settings.multi_frame_fusion,
         "fusionK": settings.fusion_k,
         "minFaceQuality": settings.min_face_quality,
+        "scoreNorm": settings.score_norm,
         "benchmarkDetSizes": settings.benchmark_det_size_list,
         "benchmarkMaxRows": settings.benchmark_max_rows,
         "maxFrames": settings.face_scan_max_frames,
@@ -1182,6 +1207,7 @@ def _run_scan_sync(
     with_pose: bool,
     min_quality: float,
     label_unknown: bool = False,
+    score_norm: str = "none",
 ) -> dict:
     _require_detector(detector_id)
     _require_recognizer(recognizer_id)
@@ -1275,6 +1301,7 @@ def _run_scan_sync(
         top_k=top_k,
         k=fusion_k,
         min_quality=min_quality,
+        score_norm=score_norm,
     )
     match_ms = (time.perf_counter() - match_started) * 1000
 
@@ -1388,6 +1415,7 @@ def _run_scan_sync(
             "reviewThreshold": round(review_threshold, 4),
             "minMargin": round(min_margin, 4),
             "assignmentMode": assignment_mode,
+            "scoreNorm": score_norm,
             "templateStrategy": template_strategy,
             "topK": top_k,
             "minQuality": min_quality,
@@ -1776,6 +1804,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                 top_k=request.top_k,
                 fusion_mode=request.fusion_mode,
                 k=request.k,
+                score_norm=request.score_norm,
             )
             points = bench.pick_operating_points(curve)
             chosen_threshold = (
@@ -1804,6 +1833,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                     fusion_mode=request.fusion_mode,
                     k=request.k,
                     min_quality=request.min_quality,
+                    score_norm=request.score_norm,
                     annotated_boxes=dataset_boxes,
                 )
                 for frames, present_ids, dataset_boxes in dataset_inputs
@@ -1863,6 +1893,7 @@ def _run_benchmark_sync(request: BenchmarkRunRequest) -> dict:
                         "topK": request.top_k,
                         "fusionMode": request.fusion_mode,
                         "fusionK": request.k,
+                        "scoreNorm": request.score_norm,
                         "flipAug": request.flip_aug,
                         "lowresAug": request.lowres_aug,
                         "withQuality": request.with_quality,
@@ -1995,6 +2026,7 @@ def _sweep_dataset(
     fusion_mode: str,
     fusion_k: int,
     min_quality: float,
+    score_norm: str = "none",
 ) -> dict:
     snapshot = _student_snapshot()
     gallery = bench.build_gallery(snapshot, recognizer_id, variant)
@@ -2034,6 +2066,7 @@ def _sweep_dataset(
             fusion_mode=fusion_mode,
             k=fusion_k,
             min_quality=min_quality,
+            score_norm=score_norm,
             annotated_boxes=gt.get("annotated_boxes", []),
         )
         total_tp += evaluation["attendance"]["tp"]
@@ -2111,6 +2144,7 @@ def _run_sweep_sync(request: SweepRequest) -> dict:
         request.flip_aug, variant, request.accept_threshold, request.review_threshold,
         request.min_margin, request.assignment_mode, request.template_strategy,
         request.top_k, request.fusion_mode, request.k, request.min_quality,
+        request.score_norm,
     )
 
 
@@ -2314,6 +2348,7 @@ async def scan(
     with_quality: bool = Form(True, alias="withQuality"),
     with_pose: bool = Form(True, alias="withPose"),
     min_quality: float | None = Form(None, alias="minQuality"),
+    score_norm: str = Form("", alias="scoreNorm"),
     label_unknown: bool = Form(False, alias="labelUnknown"),
     _: None = Depends(require_token),
 ) -> dict:
@@ -2350,6 +2385,9 @@ async def scan(
     resolved_assignment = assignment_mode or settings.assignment_mode
     resolved_template = template_strategy or settings.template_strategy
     resolved_fusion = fusion_mode or settings.multi_frame_fusion
+    resolved_score_norm = score_norm or settings.score_norm
+    if resolved_score_norm not in ("none", "impostor_center"):
+        raise HTTPException(status_code=422, detail=f"Invalid scoreNorm '{resolved_score_norm}'")
     for name, value, allowed in (
         ("tilingMode", resolved_tiling, ("none", "sahi_upper_band", "sahi_mid_band", "sahi_full")),
         ("assignmentMode", resolved_assignment, ("hungarian", "greedy", "margin")),
@@ -2392,6 +2430,7 @@ async def scan(
         with_pose=with_pose,
         min_quality=min_quality if min_quality is not None else settings.min_face_quality,
         label_unknown=label_unknown,
+        score_norm=resolved_score_norm,
     )
 
 
@@ -2482,6 +2521,7 @@ def sweep_result(
         top_k=payload.top_k,
         k=payload.k,
         min_quality=payload.min_quality,
+        score_norm=payload.score_norm,
     )
     faces = [
         [
@@ -2561,6 +2601,131 @@ def get_dataset(dataset_id: str) -> dict:
     if manifest is None:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return manifest
+
+
+def _propose_boxes_sync(dataset_id: str, request: ProposeBoxesRequest) -> dict:
+    manifest = dataset_store.load_manifest(dataset_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    detector_id = request.detector or _pick_detector()
+    _require_detector(detector_id)
+    det_size = _warmup_size_for(detector_id, int(request.det_size))
+
+    recognizer_id = request.recognizer or ""
+    gallery: dict[int, np.ndarray] = {}
+    if recognizer_id and engine.recognizer_availability(recognizer_id)[0]:
+        snapshot = _student_snapshot()
+        gallery = bench.build_gallery(snapshot, recognizer_id, "flip_avg")
+    else:
+        recognizer_id = ""
+
+    proposed: list[dict] = []
+    with _model_lock:
+        detector = engine.get_detector(
+            detector_id, det_size, request.det_thresh, request.nms_thresh
+        )
+        tile_fn = (
+            (lambda img: detector.detect(img, allow_empty_recovery=False))
+            if isinstance(detector, engine.InsightFaceDetector)
+            else None
+        )
+        for frame_id, frame_path in dataset_store.frame_paths(dataset_id, manifest):
+            if not frame_path.is_file():
+                continue
+            image_bgr = engine.image_to_bgr(frame_path.read_bytes())
+            if recognizer_id and gallery:
+                analysis = engine.analyze_frame(
+                    image_bgr,
+                    detector_id=detector_id,
+                    recognizer_id=recognizer_id,
+                    det_size=det_size,
+                    det_thresh=request.det_thresh,
+                    nms_thresh=request.nms_thresh,
+                    tiling_mode=request.tiling_mode,
+                    nms_iou=request.nms_thresh,
+                    flip_aug=True,
+                    with_quality=False,
+                    with_pose=False,
+                )
+                dets = analysis.get("detections", [])
+                embeddings = [
+                    bench.select_embedding(det, "flip_avg", embedding_dim=bench._gallery_dim(gallery))
+                    for det in dets
+                ]
+                sim, sids = matching.build_similarity_matrix(embeddings, gallery, "top_k_mean", 2)
+                decisions = matching.assign_single_frame(
+                    sim,
+                    sids,
+                    accept_threshold=request.accept_threshold,
+                    review_threshold=request.accept_threshold,
+                    min_margin=0.03,
+                    assignment_mode="hungarian",
+                )
+                for det, dec in zip(dets, decisions):
+                    bbox = [round(float(v), 2) for v in det["bbox"][:4]]
+                    height_px = max(0.0, bbox[3] - bbox[1])
+                    proposed.append(
+                        {
+                            "frame_id": frame_id,
+                            "bbox": bbox,
+                            "student_id": dec["matched_student_id"] if dec["status"] == "present" else None,
+                            "row_bucket": matching.size_bucket(height_px),
+                            "occlusion": "none",
+                            "score": round(float(det.get("det_score") or 0.0), 3),
+                        }
+                    )
+            else:
+                dets = engine.detect_with_sahi(
+                    image_bgr,
+                    lambda img: detector.detect(img),
+                    iou_threshold=request.nms_thresh,
+                    tiling_mode=request.tiling_mode,
+                    tile_detect_fn=tile_fn,
+                )
+                for det in dets:
+                    bbox = [round(float(v), 2) for v in det.bbox[:4]]
+                    height_px = max(0.0, bbox[3] - bbox[1])
+                    proposed.append(
+                        {
+                            "frame_id": frame_id,
+                            "bbox": bbox,
+                            "student_id": None,
+                            "row_bucket": matching.size_bucket(height_px),
+                            "occlusion": "none",
+                            "score": round(float(det.score), 3),
+                        }
+                    )
+    return {
+        "datasetId": dataset_id,
+        "detector": detector_id,
+        "recognizer": recognizer_id or None,
+        "detSize": det_size,
+        "tilingMode": request.tiling_mode,
+        "boxes": proposed,
+    }
+
+
+@app.patch("/api/datasets/{dataset_id}")
+def update_dataset(
+    dataset_id: str, payload: DatasetUpdateRequest, _: None = Depends(require_token)
+) -> dict:
+    manifest = dataset_store.update_dataset(
+        dataset_id,
+        present_student_ids=payload.present_ids,
+        annotated_boxes=payload.boxes,
+        name=payload.name,
+        notes=payload.notes,
+    )
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return {"dataset": manifest, "datasets": dataset_store.list_datasets()}
+
+
+@app.post("/api/datasets/{dataset_id}/propose-boxes")
+async def propose_dataset_boxes(
+    dataset_id: str, payload: ProposeBoxesRequest, _: None = Depends(require_token)
+) -> dict:
+    return await run_in_threadpool(_propose_boxes_sync, dataset_id, payload)
 
 
 @app.delete("/api/datasets/{dataset_id}")

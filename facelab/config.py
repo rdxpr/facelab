@@ -118,7 +118,36 @@ KNOWN_DETECTORS: dict[str, dict] = {
         "landmarks_5pt": True,
         "wider_hard": 75.03,
         "license": "Apache-2.0",
+        "commercial_safe": True,
         "role": "Commercial-safe lightweight baseline",
+    },
+    "uniface:centerface": {
+        "id": "uniface:centerface",
+        "label": "CenterFace (MIT · 5pt)",
+        "library": "uniface",
+        "kind": "detector",
+        "uniface_weights": "centerface",
+        "landmarks_5pt": True,
+        "wider_hard": 78.5,
+        "license": "MIT",
+        "commercial_safe": True,
+        "role": "Commercial-friendly anchor-free 5-point detector",
+    },
+    "nvidia:scrfd_10g_fld": {
+        "id": "nvidia:scrfd_10g_fld",
+        "label": "NVIDIA SCRFD-10G FLD (5pt)",
+        "library": "insightface",
+        "kind": "detector",
+        "file_candidates": [
+            "nvidia/scrfd_10g_fld.onnx",
+            "nvidia/fld_scrfd_10g.onnx",
+            "scrfd_10g_fld.onnx",
+        ],
+        "landmarks_5pt": True,
+        "wider_hard": 83.05,
+        "license": "NVIDIA Open Model",
+        "commercial_safe": True,
+        "role": "Commercial SCRFD-10G under NVIDIA Open Model License; drop ONNX in models/nvidia/",
     },
 }
 
@@ -255,9 +284,22 @@ KNOWN_PACKS: dict[str, dict] = {
 }
 
 
+def is_commercial_safe(entry: dict) -> bool:
+    """True when a model entry has a permissive / commercial-ready license."""
+    if "commercial_safe" in entry:
+        return bool(entry["commercial_safe"])
+    lic = str(entry.get("license") or "").lower()
+    if any(bad in lic for bad in ("non-commercial", "agpl", "gpl", "research")):
+        return False
+    return any(ok in lic for ok in ("apache", "mit", "bsd", "cc0", "nvidia open model"))
+
+
 def _registry(kind: str) -> dict[str, dict]:
     source = KNOWN_DETECTORS if kind == "detector" else KNOWN_RECOGNIZERS
-    return {key: dict(value) for key, value in source.items()}
+    return {
+        key: {**value, "commercial_safe": is_commercial_safe(value)}
+        for key, value in source.items()
+    }
 
 
 def detector_registry() -> dict[str, dict]:
@@ -351,6 +393,7 @@ class Settings(BaseSettings):
     multi_frame_fusion: str = "k_of_n_voting"
     fusion_k: int = 2
     min_face_quality: float = 0.0
+    score_norm: str = "none"
 
     # Optional auxiliary predictors (require the uniface package).
     quality_predictor: str = "uniface:ediffiqa_s"

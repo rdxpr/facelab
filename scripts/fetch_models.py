@@ -505,7 +505,7 @@ def main() -> None:
         # Commercial mode is opt-in only: never pull a non-commercial pack
         # unless the caller named one explicitly with --model/--pack.
         packs = args.packs or []
-        uniface_names = args.uniface
+        uniface_names = list(dict.fromkeys([*args.uniface, "centerface"]))
     else:
         packs = args.packs or [os.environ.get("FACELAB_DEFAULT_MODEL") or "buffalo_l"]
         uniface_names = args.uniface

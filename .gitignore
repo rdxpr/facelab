@@ -1,3 +1,4 @@
+*.patch
 repo-context*.md
 repomix-output*
 students

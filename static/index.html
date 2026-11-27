@@ -62,6 +62,13 @@
 
               <div id="frame-files" class="file-chips"></div>
 
+              <div class="toggle-row compact-toggles">
+                <label class="toggle" data-tip="Show only detectors and recognizers with commercial-friendly licenses (Apache-2.0, MIT, NVIDIA Open Model).">
+                  <input id="commercial-only" type="checkbox" />
+                  <span>Commercial-safe only</span>
+                </label>
+              </div>
+
               <div class="field-grid">
                 <label class="stacked" data-tip="Detects face boxes. The backbone and input scale set how small a back-row face can be; SCRFD-10G and RetinaFace find the tiniest faces.">
                   <span class="field-label">Detector</span>
@@ -175,6 +182,17 @@
                   <span class="field-label">Votes required (k)</span>
                   <input id="fusion-k" class="input" type="number" min="1" max="12" step="1" value="2" />
                 </label>
+                <label class="stacked" data-tip="Number of best enrolled photos averaged when Template strategy is Top-k mean.">
+                  <span class="field-label">Template top-k</span>
+                  <input id="template-top-k" class="input" type="number" min="1" max="12" step="1" value="2" />
+                </label>
+                <label class="stacked" data-tip="Impostor-centered subtracts each face's mean similarity against non-top-1 students to suppress noisy/blurry hub false positives.">
+                  <span class="field-label">Score norm</span>
+                  <select id="score-norm" class="input">
+                    <option value="none">Off (raw cosine)</option>
+                    <option value="impostor_center">Impostor-centered</option>
+                  </select>
+                </label>
               </div>
 
               </div>
@@ -270,7 +288,13 @@
             <div class="list-head"><span>Datasets</span><span id="bench-dataset-count" class="muted">0</span></div>
             <div id="bench-datasets" class="check-list"></div>
 
-            <div class="list-head"><span>Detectors</span><span class="muted">installed only</span></div>
+            <div class="list-head">
+              <span>Detectors</span>
+              <label class="inline-check" data-tip="Filter detectors and recognizers to commercial-safe licenses only.">
+                <input id="bench-commercial-only" type="checkbox" />
+                <span>Commercial only</span>
+              </label>
+            </div>
             <div id="bench-detectors" class="check-list"></div>
 
             <div class="list-head"><span>Recognizers</span><span class="muted">installed only</span></div>
@@ -347,6 +371,13 @@
                     <option value="flip_avg">Flip avg</option>
                     <option value="lowres_aug">Low-res aug</option>
                     <option value="ensemble">Ensemble (all variants)</option>
+                  </select>
+                </label>
+                <label class="stacked" data-tip="Impostor-centered subtracts each face's non-top-1 mean similarity to suppress hub false positives on weaker backbones.">
+                  <span class="field-label">Score norm</span>
+                  <select id="bench-score-norm" class="input">
+                    <option value="none">Off (raw cosine)</option>
+                    <option value="impostor_center">Impostor-centered</option>
                   </select>
                 </label>
               </div>
@@ -524,6 +555,39 @@
       </div>
       <div id="lightbox-viewport" class="lightbox-viewport">
         <div id="lightbox-stage" class="lightbox-stage"></div>
+      </div>
+    </div>
+
+    <div id="annotator-modal" class="annotator" hidden role="dialog" aria-modal="true" aria-label="Dataset box annotator">
+      <div class="lightbox-bar annotator-bar">
+        <span id="annotator-title" class="lightbox-title mono"></span>
+        <span class="lightbox-hint">drag to draw box · click box to label · Del removes · ← → frames · Esc close</span>
+        <button id="annotator-prev" class="btn ghost small" type="button" title="Previous frame">‹</button>
+        <span id="annotator-frame-counter" class="mono small muted">1/1</span>
+        <button id="annotator-next" class="btn ghost small" type="button" title="Next frame">›</button>
+        <button id="annotator-propose" class="btn ghost small" type="button" title="Run active detector (+ SAHI mid-band) to auto-propose face boxes">Auto-propose</button>
+        <label class="inline-check" title="Include every student labelled on a box in the dataset's present roster">
+          <input id="annotator-sync-present" type="checkbox" checked />
+          <span>Sync present</span>
+        </label>
+        <button id="annotator-save" class="btn primary small" type="button">Save boxes</button>
+        <button id="annotator-close" class="btn ghost small" type="button" title="Close (Esc)">Close</button>
+      </div>
+      <div class="annotator-body">
+        <div id="annotator-viewport" class="annotator-viewport">
+          <div id="annotator-stage" class="annotator-stage">
+            <img id="annotator-img" alt="" draggable="false" />
+            <div id="annotator-overlay" class="annotator-overlay"></div>
+          </div>
+        </div>
+        <aside class="annotator-side">
+          <div id="annotator-selected" class="annotator-editor"></div>
+          <div class="list-head">
+            <span>Boxes on frame</span>
+            <span id="annotator-box-count" class="muted">0</span>
+          </div>
+          <div id="annotator-list" class="annotator-list"></div>
+        </aside>
       </div>
     </div>
 

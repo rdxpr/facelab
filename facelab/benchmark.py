@@ -291,6 +291,7 @@ def evaluate_frames(
     fusion_mode: str = "k_of_n_voting",
     k: int = 2,
     min_quality: float = 0.0,
+    score_norm: str = "none",
     annotated_boxes: Sequence[dict] | None = None,
     precomputed_fusion_frames: list[dict] | None = None,
     precomputed_sims: Sequence[np.ndarray] | None = None,
@@ -315,6 +316,7 @@ def evaluate_frames(
         top_k=top_k,
         k=k,
         min_quality=min_quality,
+        score_norm=score_norm,
         precomputed_sims=precomputed_sims,
         precomputed_tracks=precomputed_tracks,
         precomputed_track_sim=precomputed_track_sim,
@@ -407,6 +409,7 @@ def threshold_curve_datasets(
     top_k: int = 2,
     fusion_mode: str = "k_of_n_voting",
     k: int = 2,
+    score_norm: str = "none",
 ) -> list[dict]:
     """Sweep ``accept_threshold`` across several datasets, aggregating per step.
 
@@ -437,6 +440,7 @@ def threshold_curve_datasets(
                 gallery,
                 template_strategy,
                 top_k,
+                score_norm=score_norm,
             )
         else:
             sims = [
@@ -445,6 +449,7 @@ def threshold_curve_datasets(
                     gallery,
                     template_strategy,
                     top_k,
+                    score_norm=score_norm,
                 )[0]
                 for frame in f_frames
             ]
@@ -473,6 +478,7 @@ def threshold_curve_datasets(
                 fusion_mode=fusion_mode,
                 k=k,
                 min_quality=min_quality,
+                score_norm=score_norm,
                 precomputed_fusion_frames=f_frames,
                 precomputed_sims=sims,
                 precomputed_tracks=tracks,

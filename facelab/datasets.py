@@ -169,6 +169,94 @@ def create_dataset(
     return manifest
 
 
+def _normalize_boxes(
+    annotated_boxes: list[dict] | None, default_frame_id: str
+) -> list[dict]:
+    boxes: list[dict] = []
+    for box in annotated_boxes or []:
+        try:
+            bbox = [float(value) for value in box["bbox"][:4]]
+        except (KeyError, TypeError, IndexError, ValueError):
+            continue
+        x1, y1, x2, y2 = bbox
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+        if (x2 - x1) < 2.0 or (y2 - y1) < 2.0:
+            continue
+        height_px = y2 - y1
+        row = box.get("row_bucket")
+        if row not in ("large", "medium", "small"):
+            row = matching.size_bucket(height_px)
+        raw_sid = box.get("student_id")
+        student_id = None
+        if raw_sid is not None and str(raw_sid).strip() != "":
+            try:
+                student_id = int(raw_sid)
+            except (TypeError, ValueError):
+                student_id = None
+        boxes.append(
+            {
+                "frame_id": box.get("frame_id") or default_frame_id,
+                "bbox": [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)],
+                "student_id": student_id,
+                "occlusion": box.get("occlusion") or "none",
+                "row_bucket": row,
+            }
+        )
+    return boxes
+
+
+def update_dataset(
+    dataset_id: str,
+    *,
+    present_student_ids: list[int] | None = None,
+    annotated_boxes: list[dict] | None = None,
+    name: str | None = None,
+    notes: str | None = None,
+) -> dict | None:
+    """Update ground-truth boxes, present roster, or metadata on an existing dataset."""
+    manifest = load_manifest(dataset_id)
+    if manifest is None:
+        return None
+    frames = manifest.get("frames", [])
+    default_frame_id = frames[0]["frame_id"] if frames else "frame_01"
+    gt = dict(manifest.get("ground_truth") or {})
+    if annotated_boxes is not None:
+        gt["annotated_boxes"] = _normalize_boxes(annotated_boxes, default_frame_id)
+    if present_student_ids is not None:
+        gt["present_student_ids"] = sorted({int(value) for value in present_student_ids})
+    boxes_list = gt.get("annotated_boxes", [])
+    present_list = gt.get("present_student_ids", [])
+    gt["expected_total_faces"] = int(
+        len(boxes_list) or (len(present_list) * len(frames)) or len(frames)
+    )
+    manifest["ground_truth"] = gt
+    if name is not None:
+        clean = name.strip()[:120]
+        if clean:
+            manifest["name"] = clean
+    if notes is not None:
+        manifest["notes"] = notes.strip()[:500]
+    manifest["updatedAt"] = _now()
+
+    m_path = manifest_path(dataset_id)
+    tmp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=m_path.parent, suffix=".tmp", delete=False
+        ) as handle:
+            tmp_name = handle.name
+            json.dump(manifest, handle, indent=2)
+        os.replace(tmp_name, m_path)
+    except Exception:
+        if tmp_name:
+            Path(tmp_name).unlink(missing_ok=True)
+        raise
+    return manifest
+
+
 def load_manifest(dataset_id: str) -> dict | None:
     if not valid_dataset_id(dataset_id):
         return None

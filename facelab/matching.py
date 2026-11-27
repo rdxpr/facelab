@@ -86,11 +86,35 @@ def compute_student_similarity(
     raise ValueError(f"Unknown template strategy: {strategy}")
 
 
+def apply_score_norm(sim_matrix: np.ndarray, mode: str = "none") -> np.ndarray:
+    """Optional row-wise impostor-mean centering to suppress hubness / noisy probes.
+
+    When ``mode == "impostor_center"`` and there are at least 3 students in the
+    gallery, subtract each face's positive mean similarity across all *non-top-1*
+    candidates. Noisy/blurry impostor faces that score ~0.28 against everyone
+    drop sharply, while genuine matches with low impostor background stay intact
+    and remain on the same [0, 1] threshold scale.
+    """
+    if mode in ("none", "", None):
+        return sim_matrix
+    if mode != "impostor_center":
+        raise ValueError(f"Unknown score normalization mode: {mode}")
+    matrix = np.asarray(sim_matrix, dtype=np.float32)
+    if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[1] < 3:
+        return matrix
+    row_sum = np.sum(matrix, axis=1, keepdims=True)
+    row_max = np.max(matrix, axis=1, keepdims=True)
+    impostor_mean = (row_sum - row_max) / float(matrix.shape[1] - 1)
+    shift = np.maximum(0.0, impostor_mean)
+    return np.clip(matrix - shift, -1.0, 1.0).astype(np.float32)
+
+
 def build_similarity_matrix(
     face_embeddings: Sequence[np.ndarray] | np.ndarray,
     student_gallery: dict[Any, np.ndarray],
     template_strategy: str = "top_k_mean",
     top_k: int = 2,
+    score_norm: str = "none",
 ) -> tuple[np.ndarray, list[Any]]:
     """Compare every face against every student.
 
@@ -144,7 +168,7 @@ def build_similarity_matrix(
         elif template_strategy == "top_k_mean":
             k = max(1, min(int(top_k), end - start))
             sim_matrix[:, j] = np.mean(np.sort(sub, axis=1)[:, -k:], axis=1)
-    return sim_matrix, student_ids
+    return apply_score_norm(sim_matrix, score_norm), student_ids
 
 
 def _top_candidates(
@@ -306,6 +330,8 @@ def fuse_multi_frame(
     top_k: int = 2,
     k: int = 2,
     min_quality: float = 0.0,
+    score_norm: str = "none",
+    cluster_cos_thresh: float = 0.55,
     precomputed_sims: Sequence[np.ndarray] | None = None,
     precomputed_tracks: list[dict] | None = None,
     precomputed_track_sim: np.ndarray | None = None,
@@ -346,6 +372,7 @@ def fuse_multi_frame(
                     student_gallery,
                     template_strategy,
                     top_k,
+                    score_norm=score_norm,
                 )
             sims.append(matrix)
             per_frame.append(
@@ -464,14 +491,20 @@ def fuse_multi_frame(
         tracks = (
             precomputed_tracks
             if precomputed_tracks is not None
-            else _cluster_tracks(frames, min_quality=min_quality)
+            else _cluster_tracks(
+                frames, min_quality=min_quality, cos_thresh=cluster_cos_thresh
+            )
         )
         if precomputed_track_sim is not None:
             matrix = precomputed_track_sim
         else:
             track_embeddings = [track["embedding"] for track in tracks]
             matrix, _ = build_similarity_matrix(
-                track_embeddings, student_gallery, template_strategy, top_k
+                track_embeddings,
+                student_gallery,
+                template_strategy,
+                top_k,
+                score_norm=score_norm,
             )
         decisions = assign_single_frame(
             matrix,
@@ -524,7 +557,7 @@ def fuse_multi_frame(
     }
 
 
-def _cluster_tracks(frames: list[dict], *, min_quality: float = 0.0) -> list[dict]:
+def _cluster_tracks(frames: list[dict], *, min_quality: float = 0.0, cos_thresh: float = 0.55) -> list[dict]:
     """Greedy cross-frame track clustering (spatial IoU + cosine >= 0.55).
 
     Quality weights each detection's contribution to the track centroid.
@@ -555,7 +588,7 @@ def _cluster_tracks(frames: list[dict], *, min_quality: float = 0.0) -> list[dic
                     # One face per frame per track.
                     continue
                 cos = float(np.dot(track["centroid"], embedding))
-                if cos < 0.55:
+                if cos < float(cos_thresh):
                     continue
                 if box_iou(track["box"], box) < 0.3:
                     continue
